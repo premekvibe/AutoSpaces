@@ -1,0 +1,486 @@
+# AutoSpaces – plán stavby aplikace
+
+> Pracovní název: **AutoSpaces**. Dokument je určen k revizi a úpravám. Každé tvrzení je označeno:
+> **[OVĚŘENO]** = prakticky vyzkoušeno na referenčním stroji, **[PŘEVZATO]** = z komunitních zdrojů, neověřeno, **[NEOVĚŘENO]** = předpoklad, nutno ověřit.
+>
+> Referenční stroj: Windows 11 Pro, build 26340.9882 (DisplayVersion 26H2), `twinui.pcshell.dll` 10.0.26100.9949 (= rodina 24H2), PowerShell 7.6, bez .NET SDK.
+
+>
+> **Revize 2** (původní verze: `plan-v1.md`). Změny jsou shrnuté v kap. 0 a zapracované do textu.
+
+---
+
+## 0. Revize 2 – co se změnilo a proč
+
+Nové cíle: **rychlé a plynulé přepínání**, **minimální paměť**, **samoučící seznam aplikací, které nejdou přesunout**.
+
+| # | Změna | Důvod | Kde |
+|---|---|---|---|
+| Z1 | **Rust místo C#/.NET + WinForms**, bez UI knihovny (čisté Win32) | paměť: odhad 2–4 MB místo 40–60 MB; žádný runtime, exe < 1 MB | kap. 3, 4.1 |
+| Z2 | **Zrušen pevný debounce 150 ms** pro maximalizaci; reaguje se hned na první událost se změnou stavu | 150 ms bylo 25× víc než celá operace (naměřeno ~6 ms) | 6.1 |
+| Z3 | **Výchozí přepnutí je okamžité** (`SwitchDesktop`), animované jen volitelně | naměřeno: okamžité 5,6 ms, animované 88 + 354 ms | 6.3, 6.6 |
+| Z4 | **Výstup jedním voláním `RemoveDesktop(plocha, cíl)`** – Windows samy přesunou okno i přepnou | naměřeno 5 ms, méně mezistavů = žádné probliknutí; ověřeno, že okno i pohled skončí na cíli | 6.3 |
+| Z5 | **Kontrola přesunutelnosti PŘED vytvořením plochy** (`GetViewForHwnd` + `CanViewMoveDesktops`, ~1,5 ms) | nepřesunutelné okno nezpůsobí žádné bliknutí ani osiřelou plochu | 6.3 |
+| Z6 | **Vstup jako transakce s ověřením a návratem zpět** | podklad pro učení; po selhání nezůstane nepořádek | 6.3 |
+| Z7 | **Naučený seznam** `learned.json` (proces + třída okna, důvod, počet selhání) | požadavek uživatele | nová kap. 6.7 |
+| Z8 | **Žádná evidence všech oken**; drží se jen spravovaná okna a malá množina „odmítnutých“ | paměť a CPU | 6.1 |
+| Z9 | Varianta rozhraní se vybírá podle **IID a zároveň rozsahu buildů** | sebetest sám nestačí: volání špatného slotu může shodit vlastní proces | 5.1 |
+| Z10 | Doplněna rizika R10 (četnost událostí), R11 (chybné naučení) a výkonnostní cíle | | 7, 9 |
+
+### Výkonnostní cíle (akceptační)
+| Metrika | Cíl | Podklad |
+|---|---|---|
+| Doba od události maximalizace po přepnutí plochy | ≤ 30 ms | operace samy ~6 ms **[OVĚŘENO]** |
+| Doba od zmenšení/zavření po návrat na původní plochu | ≤ 30 ms | ~5 ms **[OVĚŘENO]** |
+| Paměť v klidu (private working set) | ≤ 5 MB | odhad pro Rust **[NEOVĚŘENO]** |
+| CPU v klidu | < 0,1 % | závisí na R10 **[NEOVĚŘENO]** |
+| Velikost exe | < 1,5 MB | odhad **[NEOVĚŘENO]** |
+
+---
+
+## 1. Cíl
+
+Standalone aplikace pro Windows 10/11, která napodobí chování fullscreen „Spaces“ z macOS:
+
+1. Když se okno **maximalizuje**, **přepne do fullscreenu** nebo se **rovnou otevře maximalizované/fullscreen**, vytvoří se **nová virtuální plocha na konci** seznamu, okno se na ni přesune a plocha se zobrazí.
+2. Když se takové okno **zmenší (restore)**, **minimalizuje**, **zavře** nebo **skryje**, vrátí se (pokud ještě existuje) na **původní plochu** – tu, na které bylo před maximalizací.
+3. Pokud na pomocné ploše **nezůstalo žádné jiné okno**, plocha se **automaticky smaže**.
+4. Pokud se uživatel na pomocnou plochu právě dívá, přepne se zpět na původní plochu.
+5. Musí fungovat na **všech verzích Windows s virtuálními plochami** (Windows 10 i 11), s co nejmenší závislostí na konkrétní verzi.
+
+### Upřesněné požadavky uživatele
+- Pořadí ploch je nepodstatné: nová plocha **vždy na konci** (není potřeba `MoveDesktop`).
+- Každé maximalizované okno = vlastní plocha (2 plochy → maximalizace → plocha 3; další maximalizace → plocha 4).
+- Plocha se maže, jen pokud je prázdná.
+
+### Mimo rozsah (v1)
+- Samostatné plochy pro každý monitor (Windows to neumí – viz rizika).
+- Animace přechodů navíc nad rámec systémových.
+- Exkluzivní fullscreen her (DirectX exclusive) – detekce ano, ale defaultně vyloučeno.
+
+---
+
+## 2. Výsledky ověření proveditelnosti
+
+Testovací skripty: `testy/` (`vdtest.ps1`, `run2.ps1`+`VdTest2.cs`, `run3.ps1`+`VdTest3.cs`, `run4.ps1`+`VdTest4.cs`). Spouštět `pwsh -NoProfile -STA -File testy\runX.ps1`.
+
+| # | Ověřovaná věc | Výsledek |
+|---|---|---|
+| 1 | Získání `IVirtualDesktopManagerInternal` přes `ImmersiveShell` + `IServiceProvider::QueryService` | **[OVĚŘENO]** |
+| 2 | Výběr varianty rozhraní zkoušením známých IID (QueryService vrací `E_NOINTERFACE` pro nesprávné) | **[OVĚŘENO]** – prošla jen varianta 24H2 |
+| 3 | `CreateDesktop` (vznikne na konci), `RemoveDesktop(desk, fallback)` | **[OVĚŘENO]** |
+| 4 | Veřejné `IVirtualDesktopManager::MoveWindowToDesktop` na okno cizího procesu | **[OVĚŘENO] – selže `0x80070005` (E_ACCESSDENIED)** |
+| 5 | Interní `MoveViewToDesktop` na okno cizího procesu, tam i zpět | **[OVĚŘENO]** |
+| 6 | `SetWinEventHook` (out-of-context): maximalizace, obnovení, minimalizace, zavření cizího okna | **[OVĚŘENO]** – viz tabulka událostí níže |
+| 7 | Okno spuštěné rovnou maximalizované → `IsZoomed = true` | **[OVĚŘENO]** |
+| 8 | Okno bez rámečku přes celý monitor → `IsZoomed = false`, geometrická detekce fullscreenu = true | **[OVĚŘENO]** |
+| 9 | Počítání „skutečných“ oken na ploše přes veřejné `GetWindowDesktopId` | **[OVĚŘENO]** (1 po přesunu, 0 po návratu) |
+| 10 | Seznam ploch, pořadí a aktuální plocha z registru | **[OVĚŘENO]** |
+| 11 | Záložní přesun okna bez interního API: skrýt → přepnout plochu → zobrazit | **[OVĚŘENO] u Win32 (charmap.exe)**, **selhalo u WinForms okna** (zůstalo skryté) |
+| 12 | Celý scénář se 2 okny (viz kap. 6.4) | **[OVĚŘENO]** |
+| 13 | Klávesové zkratky Win+Ctrl+D / Win+Ctrl+F4 / Win+Ctrl+←/→ přes `SendInput` | **[NEOVĚŘENO]** (záměrně, kvůli zásahu do relace) |
+| 14 | Chování u oken spuštěných jako správce (elevated) | **[NEOVĚŘENO]** |
+| 15 | Jiné verze Windows než 24H2 | **[NEOVĚŘENO]** |
+| 16 | Rychlost volání (ms): `GetViewForHwnd` 0,9 · `CanViewMoveDesktops` 0,6 · `CreateDesktop` 0,35 · `MoveViewToDesktop` 1,1 · `SwitchDesktop` 5,6 · `GetWindowDesktopId` 2,6 · spočítání oken na ploše 3,9 | **[OVĚŘENO]** (`testy/run5.ps1`, jedno měření, řádově) |
+| 17 | Celý vstup (Create + Move + Switch) **5,7 ms**; celý výstup (`RemoveDesktop`) **5,0 ms** | **[OVĚŘENO]** |
+| 18 | `SwitchDesktopWithAnimation` (24H2) funguje: volání 88 ms + `WaitForAnimationToComplete` 354 ms | **[OVĚŘENO]** – tím je potvrzeno i pořadí metod až po konec rozhraní 24H2 (`FindDesktop` vrací shodu) |
+| 19 | `RemoveDesktop(plocha, cíl)` na ploše, na kterou se dívám a kde je okno: okno se přesune na cíl a pohled se přepne na cíl | **[OVĚŘENO]** (vizuální plynulost neposouzena – měřen jen čas a výsledný stav) |
+| 20 | `SwitchDesktopAndMoveForegroundView` (přesun aktivního okna a přepnutí jedním voláním) | **[NEOVĚŘENO]** – kandidát na ještě plynulejší vstup |
+
+### Pozorované sekvence událostí (test 6)
+| Akce | Události (idObject = OBJID_WINDOW) |
+|---|---|
+| maximalizace | `EVENT_OBJECT_LOCATIONCHANGE` → stav maximalizováno |
+| obnovení | `EVENT_OBJECT_LOCATIONCHANGE` → stav normální |
+| minimalizace | `LOCATIONCHANGE` (iconic) + `EVENT_SYSTEM_MINIMIZESTART` |
+| zavření | `EVENT_OBJECT_DESTROY` |
+
+### Implementační poznámky z testů
+- V .NET (Core) **nelze marshalovat `InterfaceIsIInspectable`** → `IApplicationView` deklarovat jako `IUnknown` (metody se nevolají, jen se předává ukazatel). **[OVĚŘENO]**
+- `GetWindowDesktopId` vrací `TYPE_E_ELEMENTNOTFOUND (0x8002802B)` pro skryté okno a krátce po znovuzobrazení → nutný retry/ošetření. **[OVĚŘENO]**
+- Okno spuštěné se `SW_HIDE`/`SW_MINIMIZE` ve STARTUPINFO převezme tento stav (artefakt testu, ne aplikace).
+
+---
+
+## 3. Technologie
+
+| Volba | Rozhodnutí | Důvod |
+|---|---|---|
+| Jazyk | **Rust** (stable, MSVC toolchain), crate `windows-sys` | Žádný runtime ani GC, nejmenší paměť; volání COM přes sloty vtable je v Rustu přirozené |
+| UI | **Bez UI knihovny**: skryté okno pro zprávy, `Shell_NotifyIcon`, `TrackPopupMenu` | Tray ikona + kontextové menu stačí; nastavení se edituje jako JSON (menu „Otevřít nastavení“) |
+| Závislosti | `windows-sys`, `serde` + `serde_json` (nebo `miniserde`), nic dalšího | Malá binárka, rychlý start |
+| Vlákna | **Jedno vlákno** (STA + smyčka zpráv); hooky, COM i logika na něm | Žádné zámky, žádné přepínání kontextu, minimální paměť |
+| Distribuce | `cargo build --release` s `opt-level="z"`, `lto=true`, `panic="abort"`, `strip=true`; x64 + arm64 | Jeden .exe, odhad < 1 MB |
+| Práva | Běží **bez práv správce** | Viz riziko R6 |
+| Autostart | `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` | Bez admin práv |
+| Podpis | Authenticode (OV/EV nebo Azure Trusted Signing) | SmartScreen, antiviry |
+
+Potřebné k sestavení: `rustup` + Visual Studio Build Tools (linker MSVC, Windows SDK).
+
+**Proč ne C#** (revize 2): samostatný .NET + WinForms znamená odhadem 40–60 MB paměti a exe v desítkách MB. C# s NativeAOT a bez WinForms by se dostal na odhadem 8–15 MB – přijatelná záložní volba, pokud by Rust byl překážkou; architektura (kap. 4–6) je na jazyku nezávislá. Odhady paměti jsou **[NEOVĚŘENO]**, změří se ve fázi 0.
+
+---
+
+## 4. Architektura
+
+```
+┌──────────────────────────── autospaces.exe (jedno vlákno STA + smyčka zpráv) ────────────────────────────┐
+│                                                                                                         │
+│  WindowWatcher ──(surové události)──► PostMessage ──(ihned, mimo hook)──► SpaceOrchestrator (stavový stroj)│
+│   SetWinEventHook                                                        │                              │
+│   WindowClassifier                                                       ▼                              │
+│                                                              DesktopBackend (trait)                     │
+│                                                    ┌───────────────┴───────────────┐                    │
+│                                          InternalComBackend                 FallbackBackend             │
+│                                     (varianty z variants.json)     (registr + veřejné API + SendInput)  │
+│                                                                                                         │
+│  state.json   settings.json   learned.json (naučený seznam)   Tray   Log   ExplorerRestartWatcher       │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 4.1 Struktura projektu
+```
+autospaces/                (jeden crate)
+  src/main.rs              start, jedna instance, smyčka zpráv, tray
+  src/core/                orchestrator.rs (stavový stroj), learned.rs, model.rs  – bez Win32 → testovatelné
+  src/windowing/           watcher.rs (hooky), classifier.rs
+  src/desktops/            backend.rs (trait), internal.rs (vtable volání), fallback.rs, registry.rs
+  src/store.rs             settings.json, state.json, learned.json
+  variants.json            popis variant interního API (vložen do exe + přepsatelný souborem vedle exe)
+  tests/                   unit testy stavového stroje s fake backendem
+  testy/                   integrační skripty z fáze ověření
+```
+
+### 4.2 `DesktopBackend`
+```rust
+trait DesktopBackend {
+    fn name(&self) -> &str;                              // "internal:win11-24h2", "fallback"
+    fn desktops(&self) -> Result<Vec<GUID>>;             // v pořadí
+    fn current(&self) -> Result<GUID>;
+    fn can_move(&self, hwnd: HWND) -> Result<bool>;      // levná kontrola PŘED vytvořením plochy
+    fn create(&self) -> Result<GUID>;                    // vždy na konci
+    fn move_window(&self, hwnd: HWND, desk: GUID) -> Result<()>;
+    fn switch(&self, desk: GUID, animated: bool) -> Result<()>;
+    fn remove(&self, desk: GUID, fallback: GUID) -> Result<()>; // přesune zbylá okna na fallback a přepne, pokud se na plochu díváme
+    fn window_desktop(&self, hwnd: HWND) -> Option<GUID>; // veřejné API
+}
+// Chyby rozlišovat: Transient (RPC nedostupné, Explorer se restartuje) × Permanent (HRESULT selhání operace).
+```
+
+---
+
+## 5. Vrstvy nezávislosti na verzi Windows
+
+Klíčový fakt: veřejné API Windows **neumí vytvořit plochu ani přesunout cizí okno** (test 4). Interní API to umí, ale jeho **IID a pořadí metod (vtable) se mění** mezi feature updaty. Za běhu je nelze zjistit – v `HKCR\Interface` ani v `actxprxy.dll`/`twinui*.dll` nejsou názvy rozhraní **[OVĚŘENO]**. Proto tři úrovně:
+
+### 5.1 Úroveň 1 – `InternalComBackend` (plná funkce)
+1. Vytvořit `ImmersiveShell` (CLSID `C2F03A33-21F5-47FA-B4BB-156362A2F239`) → `IServiceProvider` (`6D5140C1-7436-11CE-8034-00AA006009FA`).
+2. Pro každou variantu z `variants.json` zavolat `QueryService(SID C5E0CDCA-7B6E-41B2-9FC4-D93975CC467B, IID varianty)`. **Vybrat podle odezvy, ne podle čísla buildu** (funguje i na Insider buildech sdílejících rozhraní).
+3. **Rozsah buildů jako druhá podmínka** (revize 2): každá varianta má `minBuild`/`maxBuild` (z `RtlGetVersion`, příp. verze `twinui.pcshell.dll`). Když IID projde u více variant (stejné IID, jiný vtable), rozhodne build. Neznámý build + známé IID → zkusit nejnovější variantu s tím IID, ale jen přes sebetest.
+4. **Sebetest před použitím**: `GetCount()` musí odpovídat počtu ploch v registru a `GetCurrentDesktop().GetId()` aktuální ploše z registru. Při nesouladu variantu zamítnout. Pozor: rozhraní žije v `explorer.exe`, voláme ho přes COM proxy – volání špatného slotu Explorer neshodí, ale **může shodit náš proces**. Proto sebetest pouštět jen čtecími metodami a výsledek „varianta X na buildu Y ověřena“ uložit do `state.json`; pád během sebetestu = při dalším startu tuto variantu přeskočit.
+5. Volání metod přes **indexy slotů ve vtable** (surové ukazatele na funkce) → nová verze Windows = úprava `variants.json`, **bez rekompilace**.
+6. Volitelné sloty (pokud je varianta má): `SwitchDesktopWithAnimation`, `WaitForAnimationToComplete`, `SwitchDesktopAndMoveForegroundView`, `SetDesktopName`. Chybějící slot = funkce se tiše nepoužije.
+
+`variants.json` – návrh schématu:
+```json
+{
+  "variants": [
+    {
+      "name": "win11-24h2",
+      "iidManagerInternal": "53F5CA0B-158F-4124-900C-057158060B27",
+      "iidDesktop": "3F07F4BE-B107-441A-AF0F-39D82529072C",
+      "monitorParam": false,
+      "slots": { "GetCount": 3, "MoveViewToDesktop": 4, "GetCurrentDesktop": 6, "GetDesktops": 7,
+                 "SwitchDesktop": 9, "CreateDesktop": 11, "RemoveDesktop": 13 },
+      "desktopSlots": { "GetId": 4 }
+    }
+  ]
+}
+```
+(Sloty počítány včetně 3 metod `IUnknown`. Pro 24H2 odpovídají pořadí ověřenému v testech; ostatní varianty doplnit a ověřit – viz tabulka.)
+
+| Varianta | IVirtualDesktopManagerInternal | IVirtualDesktop | Poznámka | Stav |
+|---|---|---|---|---|
+| Windows 10 (1809–22H2) | `F31574D6-B682-4CDC-BD56-1827860ABEC6` | `FF72FFDD-BE7E-43FC-9C03-AD81681E88E4` | bez `MoveDesktop`, bez názvů ploch | [PŘEVZATO] |
+| Windows 11 21H2 (22000) | `B2F925B9-5A0F-4D2E-9F4D-2B1507593C10` | `536D3495-B208-4CC9-AE26-DE8111275BF8` | metody s parametrem `HWND/HMONITOR` | [PŘEVZATO] |
+| Windows 11 22H2 rané buildy | `B2F925B9-…` (stejné IID!) | `536D3495-…` | **jiný vtable při stejném IID** → nutný sebetest | [PŘEVZATO] |
+| Windows 11 22H2/23H2 (22621.2215+) | `A3175F2D-239C-4BD2-8AA0-EEBA8B0B138E` | `3F07F4BE-B107-441A-AF0F-39D82529072C` | | [PŘEVZATO] |
+| Windows 11 24H2+ (26100+) | `53F5CA0B-158F-4124-900C-057158060B27` | `3F07F4BE-B107-441A-AF0F-39D82529072C` | | **[OVĚŘENO]** |
+| společné | `IApplicationViewCollection` `1841C6D7-4F9D-42C0-AF41-8747538F10E5`, `IApplicationView` `372E1D3B-38D3-42E4-A15B-8AB2B178F513` | | stabilní napříč verzemi | [OVĚŘENO na 24H2] |
+
+Zdroje k převzetí/kontrole layoutů: `MScholtes/VirtualDesktop`, `Ciantic/VirtualDesktopAccessor`, `Slion/VirtualDesktop`. **Před převzetím kódu ověřit licence.**
+
+### 5.2 Úroveň 2 – `FallbackBackend` (jen veřejné prostředky)
+| Operace | Realizace | Stav |
+|---|---|---|
+| seznam/pořadí ploch | registr `HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\VirtualDesktops\VirtualDesktopIDs` (pole 16B GUID) | [OVĚŘENO] |
+| aktuální plocha | tamtéž `CurrentVirtualDesktop`; na Win10 v `…\Explorer\SessionInfo\<id>\VirtualDesktops` | [OVĚŘENO Win11] / [PŘEVZATO Win10] |
+| plocha okna | veřejné `IVirtualDesktopManager::GetWindowDesktopId` | [OVĚŘENO] |
+| vytvoření plochy | `SendInput` Win+Ctrl+D (vytvoří na konci **a přepne**) | [NEOVĚŘENO] |
+| přepnutí na plochu X | rozdíl indexů z registru → Win+Ctrl+←/→ × k, ověřit registrem | [NEOVĚŘENO] |
+| smazání plochy | přepnout na ni → Win+Ctrl+F4 → přepnout na cíl | [NEOVĚŘENO] |
+| přesun okna | `ShowWindow(SW_HIDE)` → přepnout → `ShowWindow(SW_SHOWNA)` → obnovit max. stav | [OVĚŘENO Win32], [SELHALO WinForms] |
+| změny ploch | `RegNotifyChangeKeyValue` na klíči `VirtualDesktops` | [NEOVĚŘENO] |
+
+Omezení fallbacku: viditelné přepínání (víc animací), některé aplikace hide/show nepřežijí (seznam nekompatibilních → okno nepřesouvat, jen nechat být), `SendInput` nefunguje, když je v popředí okno s vyšší integritou nebo zabezpečená plocha UAC.
+
+### 5.3 Úroveň 3 – bez podpory
+Pokud selže úroveň 1 i 2 (např. Windows bez virtuálních ploch, Windows Server bez shellu): notifikace „Nepodporovaná verze“, aplikace zůstane v trayi neaktivní, loguje diagnostiku (build, výsledky QueryService) pro doplnění `variants.json`.
+
+Volba úrovně: automaticky při startu a po restartu Exploreru; v nastavení lze vynutit `auto | internal | fallback`.
+
+---
+
+## 6. Logika aplikace
+
+### 6.1 Sledování oken (`WindowWatcher`)
+- `SetWinEventHook(..., WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS)` pro:
+  `EVENT_OBJECT_LOCATIONCHANGE (0x800B)`, `EVENT_OBJECT_SHOW (0x8002)`, `EVENT_OBJECT_HIDE (0x8003)`, `EVENT_OBJECT_DESTROY (0x8001)`, `EVENT_SYSTEM_MINIMIZESTART (0x16)`, `EVENT_SYSTEM_MOVESIZESTART/END (0x0A/0x0B)`.
+- Filtr v callbacku: `idObject == OBJID_WINDOW (0)`, `idChild == 0`, top-level (`GetAncestor(GA_ROOT) == hwnd`).
+- **Callback musí být extrémně levný**: `EVENT_OBJECT_LOCATIONCHANGE` chodí i pro každý pohyb kurzoru a kurzoru textu. První řádek: `if idObject != OBJID_WINDOW || idChild != 0 { return }`. Teprve pak `IsZoomed`/styl okna. (riziko R10)
+- **V callbacku nevolat COM** – jen `PostMessage` vlastnímu oknu (hwnd, typ události); zpracuje se v dalším kole smyčky zpráv, tj. prakticky ihned, ale mimo callback (re-entrance).
+- **Bez pevného debounce** (revize 2). Maximalizace je diskrétní stav – `IsZoomed` se překlopí jednou, takže se reaguje **hned na první událost**. Krátké ustálení (50–80 ms, časovač) jen pro geometrickou detekci fullscreenu, kde mezistavy při změně velikosti mohou dát falešný poplach.
+- **Zámek přechodu**: během vlastního vstupu/výstupu (a ~50 ms po něm) se události pro dané okno ignorují; po uvolnění se stav jednou přečte znovu.
+- Stav okna: `Normal | Maximized | Fullscreen | Minimized | Hidden | Destroyed`.
+- **Žádný slovník všech oken** (revize 2). Drží se jen: (a) spravovaná okna, (b) malá množina „odmítnutých“ hwnd (okno je maximalizované, ale rozhodli jsme se ho nespravovat – aby se nezkoušelo při každé události; maže se při `DESTROY` nebo když okno přestane být maximalizované). Pravidlo: *maximalizované/fullscreen a není v (a) ani (b)* → vstup.
+- Název procesu se zjišťuje jen při rozhodování o vstupu (`QueryFullProcessImageNameW` s `PROCESS_QUERY_LIMITED_INFORMATION`, funguje i pro procesy správce) a ukládá se k hwnd v (a)/(b).
+- `DESTROY` – hwnd už nejde dotazovat → párovat přes slovník sledovaných oken.
+- Při tažení myší (`MOVESIZESTART` … `END`, např. stažení maximalizovaného okna dolů) akci odložit do `MOVESIZEEND`.
+
+### 6.2 Klasifikace oken (`WindowClassifier`)
+Kandidát na vlastní plochu, pokud:
+- `IsWindowVisible`, má titulek, není `WS_EX_TOOLWINDOW`, není owned (nebo má `WS_EX_APPWINDOW`), není `WS_CHILD`;
+- není shell/systémové okno (třídy `Progman`, `WorkerW`, `Shell_TrayWnd`, `Shell_SecondaryTrayWnd`, `Windows.UI.Core.CoreWindow`, okna Task View / Alt+Tab / Start …);
+- není připnuté „na všech plochách“ (interní `IVirtualDesktopPinnedApps` nebo heuristika: `GetWindowDesktopId` = `Guid.Empty`);
+- proces není v seznamu vyloučených (settings), není to AutoSpaces;
+- UWP: pracovat s `ApplicationFrameWindow` (top-level), ne s `CoreWindow`.
+
+Fullscreen = nemá `WS_CAPTION` **a** obdélník okna pokrývá celý monitor (`MonitorFromWindow` + `GetMonitorInfo().rcMonitor`). **[OVĚŘENO]** Doplňkově lze použít `SHQueryUserNotificationState` (QUNS_RUNNING_D3D_FULL_SCREEN) pro detekci exkluzivních her → defaultně ignorovat.
+
+Pro počítání „oken na ploše“ (rozhodnutí o smazání) použít stejný filtr kromě podmínky na maximalizaci.
+
+### 6.3 Stavový stroj (`SpaceOrchestrator`)
+Model:
+```
+ManagedSpace { Guid DesktopId; IntPtr Hwnd; int Pid; Guid OriginDesktopId; DateTime Created; }
+spaces: Dictionary<Guid DesktopId, ManagedSpace>
+byWindow: Dictionary<IntPtr, Guid DesktopId>
+```
+Přechody okna W:
+
+| Událost | Podmínka | Akce |
+|---|---|---|
+| → Maximized / Fullscreen | W není spravované ani odmítnuté, je kandidát, není v naučeném seznamu (6.7) | `EnterSpace(W)` |
+| → Maximized / Fullscreen | W už je spravované | nic |
+| → Normal / Minimized / Hidden | W je spravované | `ExitSpace(space, closed=false)` |
+| → Destroyed | W je spravované | `ExitSpace(space, closed=true)` |
+| W ručně přesunuto na jinou plochu | zjištěno při kontrole | přestat spravovat W; plochu nechat, pokud není prázdná |
+
+```
+EnterSpace(W):                                   # transakce; cíl ≤ 30 ms, naměřeno ~6 ms
+    proc = název procesu(W); class = třída okna(W)
+    if learned.blocked(proc, class): odmítnuté += W; return
+    if !backend.can_move(W):                     # ~1,5 ms, PŘED vytvořením plochy → žádné bliknutí
+        learned.fail(proc, class, CannotMove, hard); odmítnuté += W; return
+    origin  = window_desktop(W) ?? current()
+    viewing = current() == origin
+    D = create()
+    if move_window(W, D) selže  ||  window_desktop(W) != D:      # ověření výsledku
+        remove(D, origin)                        # návrat do původního stavu
+        learned.fail(proc, class, MoveFailed/MoveNotApplied, hard); odmítnuté += W; return
+    if viewing: switch(D, settings.animated)     # výchozí: okamžitě (5,6 ms)
+    aktivovat W; zapsat ManagedSpace{enteredAt = now}; uložit state
+
+ExitSpace(space, closed):
+    target  = ResolveOrigin(space.Origin)
+    others  = CountWindowsOn(space.DesktopId) - (closed ? 0 : 1)   # jiná okna než W
+    if now - space.enteredAt < 800 ms: learned.fail(proc, class, Flapping, soft)   # viz 6.7
+    if others == 0:
+        remove(space.DesktopId, target)          # JEDNO volání: přesune W, přepne pohled, smaže plochu (~5 ms)
+    else:
+        if !closed: move_window(W, target)
+        if current() == space.DesktopId && settings.switchBackWhenOthersRemain: switch(target)
+        # plocha zůstává jako běžná, už ji nespravujeme
+    smazat záznam; uložit state
+
+ResolveOrigin(o):
+    while o neexistuje v GetDesktops():
+        o = spaces[o]?.OriginDesktopId ?? první plocha
+    return o
+```
+
+Poznámky k plynulosti (revize 2):
+- **Okamžité přepnutí je výchozí.** Animace maximalizace samotného okna (cca 200 ms, dělá ji Windows) doběhne už na nové ploše; uživatel vidí jen to, že okolní okna zmizí. Animované přepnutí (posun ploch jako na macOS) stojí ~440 ms navíc a je volitelné (`switchAnimation`).
+- Pořadí `move_window` → `switch` nechává ~1 ms okno, kdy je vidět původní plocha bez okna – pod hranicí jednoho snímku. Pokud by při testech bylo vidět probliknutí, vyzkoušet `SwitchDesktopAndMoveForegroundView` (jedno volání; test 20).
+- Výstup přes `remove()` má nejméně mezistavů. Vizuální dojem (zda Windows při mazání aktuální plochy nepřehrají animaci) posoudit ve fázi 3 – měřen byl jen čas a výsledný stav.
+- `state.json` zapisovat **po** dokončení přepnutí (mimo kritickou cestu), ne během něj.
+
+Poznámky:
+- Ukládat **GUID ploch, nikdy indexy** – indexy se posouvají při mazání. **[OVĚŘENO v testu 12, krok 4]**
+- Minimalizace z maximalizovaného stavu: Windows při obnovení z hlavního panelu vrátí okno **maximalizované** → znovu vznikne plocha (žádoucí, macOS-like).
+- Okna otevřená z fullscreen aplikace (dialogy) se objeví na pomocné ploše; owned okna se nepočítají, při smazání plochy je Windows přesune na `fallback` plochu.
+- Po `Switch` aktivovat okno (`SetForegroundWindow`); pokud Windows aktivaci odepře, použít `AllowSetForegroundWindow`/trik s `AttachThreadInput` nebo interní `SwitchDesktopAndMoveForegroundView` (je-li ve variantě).
+
+### 6.4 Referenční scénář (akceptační test, [OVĚŘENO] v `testy/run4.ps1`)
+Start: 2 plochy, uživatel na ploše 1.
+1. Maximalizace okna A → 3 plochy, uživatel na ploše 3, A na ploše 3.
+2. Okno B otevřené z plochy 3 → B je na ploše 3.
+3. Maximalizace B → 4 plochy, uživatel na ploše 4.
+4. Zavření A na pozadí → 3 plochy, uživatel zůstává u B (B se posune na pozici 3), **bez přepnutí**.
+5. Obnovení B → B na ploše 1 (původní plocha zanikla → ResolveOrigin), 2 plochy, uživatel na ploše 1.
+6. B znovu maximalizováno, na jeho ploše otevřeno okno C → 2 okna na ploše.
+7. Minimalizace B → plocha s C zůstává, uživatel přepnut na plochu 1.
+
+### 6.5 Robustnost
+- **Restart Exploreru**: `RegisterWindowMessage("TaskbarCreated")` → znovu inicializovat backend (COM objekty jsou neplatné), znovu zvolit variantu, zrekonciliovat stav.
+- **Uživatel ručně smazal pomocnou plochu**: detekovat při každém vyhodnocení (GUID chybí v `GetDesktops`) nebo přes `RegNotifyChangeKeyValue`/`IVirtualDesktopNotification` → odstranit ze stavu.
+- **Pád / ukončení aplikace**: `state.json` v `%LOCALAPPDATA%\AutoSpaces\`. Při startu: pro každý uložený ManagedSpace, který existuje a je prázdný → smazat; neprázdný → převzít, pokud okno (hwnd+pid) stále žije, jinak zapomenout.
+- **Ukončení aplikace z tray**: volba „vrátit okna a uklidit plochy“ vs. „nechat jak je“.
+- **Výjimky z COM**: každé volání obalit; 3 chyby za sebou → přepnout na fallback a notifikovat.
+- **Jedna instance**: pojmenovaný mutex.
+
+### 6.6 Nastavení (`settings.json`)
+| Klíč | Default | Popis |
+|---|---|---|
+| `enabled` | true | globální vypínač (i z tray, příp. klávesová zkratka) |
+| `triggerOnMaximize` | true | |
+| `triggerOnFullscreen` | true | borderless fullscreen |
+| `ignoreExclusiveFullscreenGames` | true | |
+| `excludedProcesses` | `[]` | např. `["vlc.exe"]` |
+| `switchBackWhenOthersRemain` | true | krok 7 scénáře |
+| `nameDesktopsAfterApp` | true | jen pokud varianta umí `SetDesktopName` (Win11) |
+| `backend` | `auto` | `auto/internal/fallback` |
+| `switchAnimation` | false | true = `SwitchDesktopWithAnimation` (+~440 ms), jen kde ho varianta má |
+| `fullscreenSettleMs` | 60 | ustálení jen pro geometrickou detekci fullscreenu |
+| `learning` | true | samoučící seznam (6.7) |
+| `learnedRetryDays` | 30 | po kolika dnech zkusit „měkce“ zablokovanou aplikaci znovu |
+| `logLevel` | `warn` | log do `%LOCALAPPDATA%\AutoSpaces\log.txt`, rotace 1 MB; ve výchozím stavu se v klidu nic nezapisuje |
+
+### 6.7 Naučený seznam nepřesunutelných aplikací (`learned.json`) – revize 2
+
+Cíl: aplikaci, u které přesun nefunguje, **zkusit jednou (resp. dvakrát) a pak už ne** – ani po restartu aplikace nebo AutoSpaces.
+
+**Klíč záznamu:** název procesu malými písmeny (`foo.exe`) + třída okna (`*` = všechna okna procesu). Třída je tam proto, aby jedno problémové okno (úvodní obrazovka, překryv) nezablokovalo celou aplikaci. V menu se zobrazují názvy procesů.
+
+**Co se pozná a jak:**
+| Důvod | Jak se pozná | Tvrdost | Zablokuje po |
+|---|---|---|---|
+| `NoView` | `GetViewForHwnd` selže (okno nemá „view“ v shellu) | tvrdé | 1 |
+| `CannotMove` | `CanViewMoveDesktops` = false | tvrdé | 1 |
+| `MoveFailed` | `MoveViewToDesktop` vrátí chybu (uloží se HRESULT) | tvrdé | 1 |
+| `MoveNotApplied` | po přesunu `GetWindowDesktopId` ≠ cílová plocha (kontrola hned a po 100 ms) | tvrdé | 2 |
+| `Flapping` | okno opustí maximalizovaný stav do 800 ms po vstupu (aplikace se „pere“, nebo je to krátkodobé okno) | měkké | 3× během 10 min |
+| `ShortLived` | fullscreen okno zanikne/skryje se do 1,5 s (úvodní obrazovky, výřezy obrazovky, překryvy) | měkké | 2 |
+| `HideShowFailed` | jen fallback: po `SW_SHOW` není okno viditelné | tvrdé | 1 (platí jen pro fallback) |
+| `AccessDenied` | `E_ACCESSDENIED` (okno správce) | tvrdé | 1 |
+
+Okna, která **vůbec nejdou maximalizovat** (nemají `WS_MAXIMIZEBOX`), událost maximalizace nikdy nevyvolají – není co se učit. Zjevné překryvy (`WS_EX_TOPMOST` + `WS_EX_LAYERED`/`WS_EX_TRANSPARENT`/`WS_EX_NOACTIVATE` přes celý monitor) vyřadí rovnou klasifikátor (6.2), bez učení.
+
+**Co se nesmí počítat jako selhání** (jinak se seznam zanese – riziko R11):
+- přechodné chyby COM/RPC (`0x800706BA`, `0x800706BE`, `0x80010108`, …) a cokoli během restartu Exploreru → reinicializace backendu, žádný záznam;
+- selhání `create()` (to není vina aplikace);
+- `Flapping`, pokud výstup vyvolal uživatel prokazatelně vstupem (stisk myši/klávesy v posledních 300 ms – `GetLastInputInfo`); cílem je chytit aplikace, které se zmenšují samy.
+
+**Formát:**
+```json
+{ "version": 1, "entries": [
+  { "process": "foo.exe", "class": "*", "reason": "MoveFailed", "hresult": "0x80070005",
+    "strikes": 1, "blocked": true, "backend": "internal:win11-24h2",
+    "exeStamp": "size:mtime", "first": "2026-11-11", "last": "2026-11-11" } ] }
+```
+
+**Kdy se záznam zruší / zkusí znovu:**
+- změnil se `exeStamp` (aplikace byla aktualizována) → záznam se smaže;
+- změnil se backend nebo jeho varianta (jiná verze Windows, přechod fallback ↔ internal) → záznamy z jiného backendu se nepoužijí;
+- měkké důvody po `learnedRetryDays`; tvrdé nikdy samy;
+- ručně: tray menu **Naučené výjimky ▸** (seznam procesů, klik = zapomenout) a **Zapomenout vše**.
+
+**Implementace:** v paměti `HashMap<(proces, třída), Entry>` (desítky záznamů, zanedbatelná paměť), dotaz O(1) na začátku `EnterSpace`. Zápis na disk jen při změně. Odděleno od ručního `excludedProcesses` v nastavení (ten má vždy přednost a nikdy se nemaže).
+
+---
+
+## 7. Fáze a akceptační kritéria
+
+| Fáze | Obsah | Hotovo, když | Odhad |
+|---|---|---|---|
+| 0 | Rust toolchain, kostra (skryté okno, smyčka zpráv, tray ikona, jedna instance), CI. **Změřit paměť a CPU prázdné kostry s nasazenými hooky.** | paměť ≤ 5 MB, CPU v klidu < 0,1 % při běžné práci s myší; jinak přehodnotit (R10) | 1 d |
+| 1 | `internal.rs`: vtable volání, `variants.json`, výběr varianty (IID + build) + sebetest, `registry.rs` | integrační test vytvoří/přesune/smaže plochu na 24H2; nesprávná varianta je zamítnuta | 1,5–2 d |
+| 2 | `watcher.rs` + `classifier.rs`, bez debounce, zámek přechodu | přesně jedna změna stavu na akci pro: Notepad, Edge/Chrome, Explorer, UWP (Kalkulačka), WinForms, F11 v prohlížeči | 1 d |
+| 3 | `orchestrator.rs` (EnterSpace/ExitSpace jako v 6.3) + `state.json`, unit testy s fake backendem. **Změřit latenci událost → přepnutí; posoudit plynulost očima.** | scénář 6.4 prochází v unit testu i naživo; latence ≤ 30 ms; úklid po zabití procesu funguje | 1,5 d |
+| 4 | `learned.rs` (6.7) + položky v tray menu | aplikace se selháním přesunu se podruhé nezkouší (ani po restartu); přechodná chyba při restartu Exploreru nic nezapíše; aktualizace exe záznam zruší | 1 d |
+| 5 | `fallback.rs` | scénář 6.4 prochází při vynuceném `backend=fallback`; nekompatibilní aplikace se samy naučí (`HideShowFailed`) | 1–1,5 d |
+| 6 | Nastavení, autostart, restart Exploreru, log | ruční QA checklist (kap. 8) | 0,5–1 d |
+| 7 | Testy na verzích Windows, doplnění variant, podpis, release | matice kap. 8 vyplněná | 1–2 d |
+
+**Celkem cca 8,5–11 dní** (o ~2 dny víc než revize 1: Rust místo C# a naučený seznam). Fázi 5 lze odložit za v1, pokud stačí známé verze Windows.
+
+---
+
+## 8. Testování
+
+### Unit (Core)
+- Fake `DesktopBackend` + skriptované sekvence stavů oken; scénář 6.4; ResolveOrigin s řetězem zaniklých ploch; ručně smazaná plocha; duplicitní/rychlé události.
+
+### Integrační / ruční matice
+| Windows | Backend | Scénář 6.4 | Restart Exploreru | Pád aplikace + úklid |
+|---|---|---|---|---|
+| 10 22H2 | internal / fallback | | | |
+| 11 21H2 | internal / fallback | | | |
+| 11 22H2 (raný i pozdní build) | internal / fallback | | | |
+| 11 23H2 | internal / fallback | | | |
+| 11 24H2 | internal / fallback | ✅ (internal, prototyp) | | |
+| 11 Insider (Canary/Dev) | auto | | | |
+
+Prostředí: Hyper-V VM s Windows evaluation obrazy, snapshot před každým během.
+
+### Aplikace k testu
+Notepad, Edge, Chrome (F11), Firefox, Průzkumník, VS Code (Electron), Kalkulačka (UWP), Office, WinForms/WPF app, hra v borderless i exclusive fullscreenu, aplikace spuštěná jako správce, video přehrávač (fullscreen dvojklikem).
+
+### QA checklist chování
+- Maximalizace tlačítkem, dvojklikem na titulek, Win+↑, přetažením k hornímu okraji.
+- Obnovení tlačítkem, Win+↓, stažením titulku dolů (akce až po puštění myši).
+- Minimalizace a obnovení z hlavního panelu (→ nová plocha znovu).
+- Zavření Alt+F4, křížkem, ukončením procesu.
+- Aplikace, která se při zavření skryje do trayi.
+- Dva monitory: maximalizace na sekundárním monitoru.
+
+---
+
+## 9. Rizika
+
+| ID | Riziko | Dopad | Mitigace |
+|---|---|---|---|
+| R1 | Feature update Windows změní interní API | Úroveň 1 přestane fungovat | Výběr podle odezvy + sebetest, `variants.json` bez rekompilace, automatický přechod na fallback, diagnostický log |
+| R2 | Stejné IID, jiný vtable (22H2 raný vs. pozdní) | Pád Exploreru / chybné volání | Sebetest proti registru před prvním zápisovým voláním; volat nejdřív jen čtecí metody |
+| R3 | Více monitorů: plochy jsou ve Windows společné pro všechny monitory | Maximalizace na jednom monitoru „schová“ okna na ostatních | Zdokumentovat; volba „jen primární monitor“ nebo vypnutí pro sekundární |
+| R4 | Fallback: aplikace nepřežije hide/show | Okno zůstane skryté | Po `SW_SHOW` ověřit `IsWindowVisible`; pokud ne, okamžitě vrátit a zařadit proces do seznamu nekompatibilních |
+| R5 | `SetForegroundWindow` odepřen po přepnutí | Okno není aktivní | Viz 6.3 |
+| R6 | Elevated okna: UIPI blokuje `ShowWindow`/`SendInput` z neelevated procesu | Fallback nefunguje pro admin okna | Ověřit; v internal režimu přesun dělá Explorer (pravděpodobně funguje); případně volitelný elevated režim přes Plánovač úloh |
+| R7 | Antivirus/SmartScreen (hooky + SendInput + nepodepsaný exe) | Blokace | Podpis, žádná DLL injekce (out-of-context hooky) |
+| R8 | Aplikace, které se samy maximalizují při startu (např. prohlížeč) | Neočekávané nové plochy | Je to požadované chování; volitelně vyloučení procesu |
+| R9 | Licence převzatého kódu (layouty rozhraní) | Právní | Ověřit licence; definice rozhraní psát vlastní |
+| R10 | `EVENT_OBJECT_LOCATIONCHANGE` chodí pro každý pohyb kurzoru → časté probouzení procesu | CPU v klidu, výdrž baterie | Callback s okamžitým návratem (6.1); změřit ve fázi 0. Pokud nevyhoví: hook `LOCATIONCHANGE` nasazovat jen na proces okna v popředí (přehazovat při `EVENT_SYSTEM_FOREGROUND`) a pro ostatní spoléhat na `SHOW`/`MINIMIZESTART`/`DESTROY` |
+| R11 | Naučený seznam se zanese chybnými záznamy (přechodná chyba, uživatel rychle kliká) | Aplikace přestane „fungovat“ bez zjevné příčiny | Pravidla v 6.7 (přechodné chyby se nepočítají, měkké důvody až po opakování a s expirací), viditelnost a mazání v tray menu, oznámení při prvním zablokování aplikace |
+
+---
+
+## 10. Otevřené otázky (pro revizi)
+
+1. Je správné **přepínat zpět na původní plochu i v případě, že na pomocné ploše zůstala jiná okna** (krok 7)? Nyní default ano.
+2. Má se nová plocha přepnout **i když okno bylo maximalizováno na pozadí** (jiná plocha než aktuální, např. aplikace se sama maximalizuje)? Návrh: ne – plochu vytvořit, ale nepřepínat.
+3. Má se okno spuštěné maximalizované při **startu Windows / obnovení relace** chovat stejně? Návrh: ignorovat okna existující při startu AutoSpaces (volba).
+4. Chování na **více monitorech** (R3) – vypnout pro sekundární monitory?
+5. Pojmenovávat plochy podle aplikace (jen Win11)?
+6. ~~C#/.NET, nebo Rust?~~ **Rozhodnuto v revizi 2: Rust** (kap. 3).
+7. Podporovat fallback ve v1, nebo jen úroveň 1 + diagnostiku?
+8. Okamžité, nebo animované přepnutí jako výchozí? Revize 2 volí okamžité (rychlost); animované je blíž macOS, ale o ~440 ms pomalejší.
+9. Má aplikace při prvním zablokování procesu zobrazit oznámení („Aplikaci X nelze přesouvat, přidána do výjimek“), nebo učit potichu?
+
+## 11. Checklist pro revidující model
+- [ ] Zkontrolovat sloty vtable a IID všech variant v kap. 5.1 proti aktuálním zdrojům.
+- [ ] Posoudit, zda sebetest (5.1 bod 3) dostatečně chrání před R2 – navrhnout lepší (např. ověření délky vtable, kontrola modulu, ze kterého pochází vtable).
+- [ ] Ověřit správnost sady WinEvent událostí a strategie bez debounce (6.1), zejména pro UWP a Electron.
+- [ ] Posoudit stavový stroj (6.3) na race conditions: událost během vlastního přesunu/přepínání, rychlé max/restore, zavření během přepínání.
+- [ ] Zvážit, zda nepoužít `IVirtualDesktopNotification` místo polling/registry.
+- [ ] Posoudit fallback (5.2) – existuje lepší veřejný způsob přesunu cizího okna?
+- [ ] Zhodnotit odhady a pořadí fází.
