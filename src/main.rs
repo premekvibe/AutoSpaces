@@ -1,5 +1,7 @@
 #![windows_subsystem = "windows"]
 
+mod desktops;
+mod selftest;
 mod tray;
 mod windowing;
 
@@ -21,6 +23,28 @@ static LOGGING: AtomicBool = AtomicBool::new(false);
 static WM_TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 // Touched only from the single UI thread.
 static mut WATCHER: Option<watcher::Watcher> = None;
+// Initialised at startup; used by the orchestrator (phase 3). UI thread only.
+static mut BACKEND: Option<desktops::InternalBackend> = None;
+
+/// Selects the desktop backend; on failure the app stays inactive and only logs (plan 5.3).
+fn init_backend() -> Option<desktops::InternalBackend> {
+    use desktops::DesktopBackend;
+    let mut diag = Vec::new();
+    let res = desktops::InternalBackend::select(&mut diag);
+    for d in &diag {
+        log_line(d);
+    }
+    match res {
+        Ok(b) => {
+            log_line(&format!("backend: {}", b.name()));
+            Some(b)
+        }
+        Err(u) => {
+            log_line(&format!("backend: {u}"));
+            None
+        }
+    }
+}
 
 fn log_line(line: &str) {
     if !LOGGING.load(Relaxed) {
@@ -97,6 +121,12 @@ fn main() {
         cfg!(debug_assertions) || std::env::var("AUTOSPACES_LOG").is_ok_and(|v| v == "1"),
         Relaxed,
     );
+    if std::env::args().nth(1).as_deref() == Some("--selftest") {
+        let apartment = desktops::Apartment::init();
+        let code = selftest::run();
+        drop(apartment);
+        std::process::exit(code);
+    }
     unsafe {
         let mutex = CreateMutexW(
             std::ptr::null(),
@@ -139,6 +169,9 @@ fn main() {
             return;
         }
 
+        let _apartment = desktops::Apartment::init();
+        *std::ptr::addr_of_mut!(BACKEND) = init_backend();
+
         tray::add(hwnd);
         *std::ptr::addr_of_mut!(WATCHER) = Some(watcher::Watcher::start(hwnd));
 
@@ -147,6 +180,8 @@ fn main() {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
+        // Release COM proxies before the apartment is torn down.
+        *std::ptr::addr_of_mut!(BACKEND) = None;
     }
     log_line(&format!(
         "exit: callbacks_total={} callbacks_passed={}",

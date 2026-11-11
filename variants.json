@@ -1,0 +1,29 @@
+{
+  "variants": [
+    {
+      "name": "win11-24h2",
+      "minBuild": 26100,
+      "iidManagerInternal": "53F5CA0B-158F-4124-900C-057158060B27",
+      "iidDesktop": "3F07F4BE-B107-441A-AF0F-39D82529072C",
+      "iidViewCollection": "1841C6D7-4F9D-42C0-AF41-8747538F10E5",
+      "monitorParam": false,
+      "slots": {
+        "GetCount": 3,
+        "MoveViewToDesktop": 4,
+        "CanViewMoveDesktops": 5,
+        "GetCurrentDesktop": 6,
+        "GetDesktops": 7,
+        "SwitchDesktop": 9,
+        "SwitchDesktopAndMoveForegroundView": 10,
+        "CreateDesktop": 11,
+        "RemoveDesktop": 13,
+        "FindDesktop": 14,
+        "SetDesktopName": 16,
+        "SwitchDesktopWithAnimation": 22,
+        "WaitForAnimationToComplete": 24
+      },
+      "desktopSlots": { "GetId": 4 },
+      "viewSlots": { "GetViewForHwnd": 6 }
+    }
+  ]
+}
