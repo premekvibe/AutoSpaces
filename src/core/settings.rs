@@ -9,6 +9,10 @@ pub struct Settings {
     pub trigger_on_maximize: bool,
     pub trigger_on_fullscreen: bool,
     pub reuse_empty_desktops: bool,
+    /// Self-learning block list (plan 6.7); false = nothing recorded, nothing blocked.
+    pub learning: bool,
+    /// Days after which softly blocked apps (Flapping, ShortLived) are tried again.
+    pub learned_retry_days: u32,
 }
 
 impl Default for Settings {
@@ -21,6 +25,8 @@ impl Default for Settings {
             trigger_on_maximize: true,
             trigger_on_fullscreen: true,
             reuse_empty_desktops: true,
+            learning: true,
+            learned_retry_days: 30,
         }
     }
 }

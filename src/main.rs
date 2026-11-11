@@ -86,7 +86,20 @@ fn orch() -> Option<&'static mut Orch> {
 }
 
 fn new_orchestrator(b: desktops::InternalBackend) -> Orch {
-    let mut o = Orchestrator::new(b, Win32Windows::new(), Settings::default());
+    let settings = Settings::default();
+    let learned: Box<dyn core::learned::Learned> = match app_dir() {
+        Some(dir) => {
+            use desktops::DesktopBackend;
+            Box::new(core::learned::LearnedStore::load(
+                dir.join("learned.json"),
+                b.name(),
+                settings.learned_retry_days,
+            ))
+        }
+        None => Box::new(core::learned::NoLearned),
+    };
+    let mut o = Orchestrator::new(b, Win32Windows::new(), settings);
+    o.set_learned(learned);
     o.settings.enabled = tray::ENABLED.load(Relaxed);
     o
 }
@@ -205,7 +218,8 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
         }
         tray::WM_TRAY => {
             if lp as u32 == WM_RBUTTONUP {
-                match tray::show_menu(hwnd) {
+                let names = orch().map(|o| o.learned_mut().list_blocked()).unwrap_or_default();
+                match tray::show_menu(hwnd, &names) {
                     tray::CMD_TOGGLE => {
                         let on = !tray::ENABLED.fetch_xor(true, Relaxed);
                         if let Some(o) = orch() {
@@ -214,6 +228,18 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                     }
                     tray::CMD_EXIT => {
                         DestroyWindow(hwnd);
+                    }
+                    tray::CMD_FORGET_ALL => {
+                        if let Some(o) = orch() {
+                            o.forget_learned(None);
+                        }
+                        log_line("learned: forgot all");
+                    }
+                    c if c >= tray::CMD_FORGET_BASE => {
+                        if let (Some(o), Some(name)) = (orch(), names.get(c - tray::CMD_FORGET_BASE)) {
+                            o.forget_learned(Some(name));
+                            log_line(&format!("learned: forgot {name}"));
+                        }
                     }
                     _ => {}
                 }
@@ -230,6 +256,9 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
         }
         m if m != 0 && m == WM_TASKBAR_CREATED.load(Relaxed) => {
             tray::add(hwnd);
+            if let Some(o) = orch() {
+                o.suspend_learning();
+            }
             REINIT_LEFT.store(REINIT_TRIES, Relaxed);
             reinit_backend(hwnd);
             0

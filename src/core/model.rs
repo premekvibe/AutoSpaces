@@ -48,6 +48,8 @@ pub struct ManagedSpace {
     pub class: String,
     /// An existing empty desktop we reused; never deleted by us.
     pub borrowed: bool,
+    /// Entered as a (borderless) fullscreen window, not just maximized.
+    pub fullscreen: bool,
 }
 
 pub trait WindowSystem {
@@ -67,4 +69,6 @@ pub trait WindowSystem {
     fn is_alive(&self, hwnd: HWND, pid: u32) -> bool;
     /// The user pressed a key / moved the mouse within the last `ms`.
     fn recent_user_input(&self, ms: u32) -> bool;
+    /// `"size:mtime"` of the exe of process `pid`; empty when unknown (e.g. process gone).
+    fn exe_stamp(&self, pid: u32) -> String;
 }

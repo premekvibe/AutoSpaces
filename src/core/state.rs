@@ -53,6 +53,7 @@ pub fn from_json(text: &str) -> Result<Vec<ManagedSpace>, String> {
             process: text("process"),
             class: text("class"),
             borrowed: matches!(o.get("borrowed"), Some(Json::Bool(true))),
+            fullscreen: false,
         });
     }
     Ok(out)
@@ -74,6 +75,7 @@ mod tests {
             process: "a\"b.exe".into(),
             class: "Cls".into(),
             borrowed: true,
+            fullscreen: false,
         }];
         let back = from_json(&to_json(&v)).unwrap();
         assert_eq!(back.len(), 1);

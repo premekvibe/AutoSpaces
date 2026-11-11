@@ -30,25 +30,27 @@ fn pid_of(hwnd: HWND) -> u32 {
     pid
 }
 
-fn process_name(pid: u32) -> String {
+fn process_path(pid: u32) -> Option<String> {
     if pid == 0 {
-        return String::new();
+        return None;
     }
     unsafe {
         let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
         if h.is_null() {
-            return String::new();
+            return None;
         }
         let mut buf = [0u16; 520];
         let mut len = buf.len() as u32;
         let ok = QueryFullProcessImageNameW(h, 0, buf.as_mut_ptr(), &mut len);
         CloseHandle(h);
-        if ok == 0 {
-            return String::new();
-        }
-        let path = String::from_utf16_lossy(&buf[..len as usize]);
-        path.rsplit(['\\', '/']).next().unwrap_or("").to_lowercase()
+        (ok != 0).then(|| String::from_utf16_lossy(&buf[..len as usize]))
     }
+}
+
+fn process_name(pid: u32) -> String {
+    process_path(pid)
+        .map(|p| p.rsplit(['\\', '/']).next().unwrap_or("").to_lowercase())
+        .unwrap_or_default()
 }
 
 unsafe extern "system" fn collect(hwnd: HWND, lp: LPARAM) -> i32 {
@@ -99,6 +101,17 @@ impl WindowSystem for Win32Windows {
     }
     fn is_alive(&self, hwnd: HWND, pid: u32) -> bool {
         unsafe { IsWindow(hwnd) != 0 && pid_of(hwnd) == pid }
+    }
+    fn exe_stamp(&self, pid: u32) -> String {
+        let Some(m) = process_path(pid).and_then(|p| std::fs::metadata(p).ok()) else {
+            return String::new();
+        };
+        let mtime = m
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_secs());
+        format!("{}:{mtime}", m.len())
     }
     fn recent_user_input(&self, ms: u32) -> bool {
         unsafe {

@@ -180,17 +180,30 @@ impl WindowSystem for FW {
     fn recent_user_input(&self, _ms: u32) -> bool {
         self.0.input.get()
     }
+    fn exe_stamp(&self, _pid: u32) -> String {
+        "1:1".into()
+    }
 }
 
-type Log = Rc<RefCell<Vec<(FailReason, bool)>>>;
+type Log = Rc<RefCell<Vec<FailReason>>>;
 struct Rec(Log);
 impl Learned for Rec {
-    fn blocked(&self, _p: &str, _c: &str) -> bool {
+    fn blocked(&self, _: &str, _: &str) -> bool {
         false
     }
-    fn fail(&mut self, _p: &str, _c: &str, r: FailReason, hard: bool) {
-        self.0.borrow_mut().push((r, hard));
+    fn confirm(&mut self, _: &str, _: &str, _: &str) -> bool {
+        false
     }
+    fn fail(&mut self, _: &str, _: &str, r: FailReason, _: &str) -> bool {
+        self.0.borrow_mut().push(r);
+        false
+    }
+    fn set_backend(&mut self, _: &str) {}
+    fn list_blocked(&self) -> Vec<String> {
+        Vec::new()
+    }
+    fn forget(&mut self, _: &str) {}
+    fn forget_all(&mut self) {}
 }
 
 fn setup(n: u32) -> (Rc<World>, Orchestrator<FB, FW>, Log) {
@@ -285,7 +298,7 @@ fn cannot_move_creates_nothing_and_rejects() {
     w.wins.borrow_mut().get_mut(&1).unwrap().can_move = false;
     ev(&w, &mut o, 1, Loc);
     assert_eq!((w.count(), w.creates.get(), w.current.get()), (2, 0, g(1)));
-    assert_eq!(*log.borrow(), vec![(FailReason::CannotMove, true)]);
+    assert_eq!(*log.borrow(), vec![FailReason::CannotMove]);
     // Rejected: not asked again.
     ev(&w, &mut o, 1, Loc);
     ev(&w, &mut o, 1, Loc);
@@ -305,7 +318,7 @@ fn move_failure_rolls_back() {
     w.fail_move.set(Some(PERMANENT));
     ev(&w, &mut o, 1, Loc);
     assert_eq!((w.count(), w.current.get(), w.desk_of(1)), (2, g(1), g(1)));
-    assert_eq!(*log.borrow(), vec![(FailReason::MoveFailed(PERMANENT.hr()), true)]);
+    assert_eq!(*log.borrow(), vec![FailReason::MoveFailed(PERMANENT.hr())]);
     assert!(!o.is_managed(h(1)));
     assert_eq!(w.creates.get(), 1);
 }
@@ -317,7 +330,7 @@ fn move_not_applied_rolls_back() {
     w.move_noop.set(true);
     ev(&w, &mut o, 1, Loc);
     assert_eq!((w.count(), w.current.get(), w.desk_of(1)), (2, g(1), g(1)));
-    assert_eq!(*log.borrow(), vec![(FailReason::MoveNotApplied, true)]);
+    assert_eq!(*log.borrow(), vec![FailReason::MoveNotApplied]);
 }
 
 #[test]
@@ -495,7 +508,7 @@ fn flapping_and_short_lived_feed_learned_list() {
     w.tick(100);
     w.set_state(1, State::Normal);
     o.on_event(h(1), Event::Recheck);
-    assert_eq!(*log.borrow(), vec![(FailReason::Flapping, false)]);
+    assert_eq!(*log.borrow(), vec![FailReason::Flapping]);
     log.borrow_mut().clear();
     // User input exempts Flapping.
     w.set_state(1, State::Maximized);
@@ -505,14 +518,22 @@ fn flapping_and_short_lived_feed_learned_list() {
     w.set_state(1, State::Normal);
     o.on_event(h(1), Event::Recheck);
     assert!(log.borrow().is_empty());
-    // Closed within 1.5 s: ShortLived.
+    // A maximized (not fullscreen) window closed within 1.5 s is not ShortLived.
     w.input.set(false);
     w.set_state(1, State::Maximized);
     ev(&w, &mut o, 1, Loc);
     w.tick(1000);
     w.set_state(1, State::Destroyed);
     o.on_event(h(1), Event::Destroy);
-    assert_eq!(*log.borrow(), vec![(FailReason::ShortLived, false)]);
+    assert!(log.borrow().is_empty());
+    // Fullscreen closed within 1.5 s: ShortLived.
+    w.open(1, State::Fullscreen);
+    ev(&w, &mut o, 1, Loc);
+    ev(&w, &mut o, 1, Event::Recheck);
+    w.tick(1000);
+    w.set_state(1, State::Destroyed);
+    o.on_event(h(1), Event::Destroy);
+    assert_eq!(*log.borrow(), vec![FailReason::ShortLived]);
     assert_eq!(w.count(), 2);
 }
 
@@ -683,4 +704,123 @@ fn adopt_never_removes_borrowed() {
     o2.adopt(stored);
     assert_eq!(w.count(), 2);
     assert!(!o2.is_managed(h(1)));
+}
+
+// ---------------------------------------------------------------- learned list
+
+use super::learned::LearnedStore;
+use std::rc::Rc as R;
+
+fn setup_store(n: u32) -> (Rc<World>, Orchestrator<FB, FW>, Rc<Cell<u64>>) {
+    let w = World::new(n);
+    let mut o = Orchestrator::new(FB(w.clone()), FW(w.clone()), old());
+    let t = R::new(Cell::new(1_800_000_000u64));
+    let t2 = t.clone();
+    o.set_learned(Box::new(LearnedStore::with_clock(None, "fake", 30, Box::new(move || t2.get()))));
+    (w, o, t)
+}
+
+#[test]
+fn hard_failure_blocks_process_for_good_and_rejects_window() {
+    let (w, mut o, _) = setup_store(2);
+    w.open(1, State::Maximized);
+    w.wins.borrow_mut().get_mut(&1).unwrap().can_move = false;
+    ev(&w, &mut o, 1, Loc);
+    assert_eq!(w.can_move_calls.get(), 1);
+    assert_eq!(o.learned_mut().list_blocked(), ["app.exe"]);
+    // A new window of the same process is never entered: no can_move, create or move calls.
+    w.wins.borrow_mut().get_mut(&1).unwrap().can_move = true;
+    w.set_state(1, State::Normal);
+    ev(&w, &mut o, 1, Loc);
+    w.set_state(1, State::Maximized);
+    ev(&w, &mut o, 1, Loc);
+    w.open(2, State::Maximized);
+    ev(&w, &mut o, 2, Loc);
+    assert_eq!((w.can_move_calls.get(), w.creates.get(), w.count()), (1, 0, 2));
+    assert!(!o.is_managed(h(1)) && !o.is_managed(h(2)) && o.is_rejected(h(2)));
+    // Forgetting lets the next maximize through.
+    o.forget_learned(Some("app.exe"));
+    ev(&w, &mut o, 2, Loc);
+    assert!(o.is_managed(h(2)));
+}
+
+#[test]
+fn learning_off_records_and_blocks_nothing() {
+    let (w, mut o, _) = setup_store(2);
+    o.settings.learning = false;
+    w.open(1, State::Maximized);
+    w.wins.borrow_mut().get_mut(&1).unwrap().can_move = false;
+    ev(&w, &mut o, 1, Loc);
+    assert!(o.learned_mut().list_blocked().is_empty());
+    // Entry made while learning was on is not applied once it is off.
+    o.settings.learning = true;
+    w.set_state(1, State::Normal);
+    ev(&w, &mut o, 1, Loc);
+    w.set_state(1, State::Maximized);
+    ev(&w, &mut o, 1, Loc);
+    assert_eq!(o.learned_mut().list_blocked(), ["app.exe"]);
+    o.settings.learning = false;
+    w.wins.borrow_mut().get_mut(&1).unwrap().can_move = true;
+    w.set_state(1, State::Normal);
+    ev(&w, &mut o, 1, Loc);
+    w.set_state(1, State::Maximized);
+    ev(&w, &mut o, 1, Loc);
+    assert!(o.is_managed(h(1)));
+}
+
+#[test]
+fn move_not_applied_blocks_on_second_strike_and_transient_is_not_recorded() {
+    let (w, mut o, _) = setup_store(2);
+    w.open(1, State::Maximized);
+    w.fail_move.set(Some(TRANSIENT));
+    ev(&w, &mut o, 1, Loc);
+    w.fail_move.set(None);
+    w.move_noop.set(true);
+    ev(&w, &mut o, 1, Loc);
+    assert!(o.learned_mut().list_blocked().is_empty());
+    w.set_state(1, State::Normal);
+    ev(&w, &mut o, 1, Loc);
+    w.set_state(1, State::Maximized);
+    ev(&w, &mut o, 1, Loc);
+    assert_eq!(o.learned_mut().list_blocked(), ["app.exe"]);
+}
+
+#[test]
+fn nothing_is_learned_while_backend_reinitialises() {
+    let (w, mut o, _) = setup_store(2);
+    w.open(1, State::Maximized);
+    w.wins.borrow_mut().get_mut(&1).unwrap().can_move = false;
+    o.suspend_learning();
+    ev(&w, &mut o, 1, Loc);
+    assert!(o.learned_mut().list_blocked().is_empty());
+    o.set_backend(FB(w.clone()));
+    w.set_state(1, State::Normal);
+    ev(&w, &mut o, 1, Loc);
+    w.set_state(1, State::Maximized);
+    ev(&w, &mut o, 1, Loc);
+    assert_eq!(o.learned_mut().list_blocked(), ["app.exe"]);
+}
+
+#[test]
+fn flapping_learns_after_three_but_not_after_user_input() {
+    let (w, mut o, _) = setup_store(2);
+    w.open(1, State::Maximized);
+    for round in 0..3 {
+        w.input.set(round == 0); // first one was the user's doing
+        ev(&w, &mut o, 1, Loc);
+        w.tick(100);
+        w.set_state(1, State::Normal);
+        o.on_event(h(1), Event::Recheck);
+        w.set_state(1, State::Maximized);
+    }
+    assert!(o.learned_mut().list_blocked().is_empty());
+    w.input.set(false);
+    for _ in 0..2 {
+        ev(&w, &mut o, 1, Loc);
+        w.tick(100);
+        w.set_state(1, State::Normal);
+        o.on_event(h(1), Event::Recheck);
+        w.set_state(1, State::Maximized);
+    }
+    assert_eq!(o.learned_mut().list_blocked(), ["app.exe"]);
 }

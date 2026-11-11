@@ -38,6 +38,8 @@ pub struct Orchestrator<B: DesktopBackend, W: WindowSystem> {
     leaked: Vec<Guid>,
     retries: HashMap<HWND, u8>,
     dirty: bool,
+    /// Backend is being re-initialised (Explorer restart): nothing is learned meanwhile.
+    reinit: bool,
     log: Vec<String>,
 }
 
@@ -57,13 +59,29 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
             leaked: Vec::new(),
             retries: HashMap::new(),
             dirty: false,
+            reinit: false,
             log: Vec::new(),
         }
     }
 
-    #[allow(dead_code)] // wired up with the learned list (later phase)
     pub fn set_learned(&mut self, l: Box<dyn Learned>) {
         self.learned = l;
+        self.learned.set_backend(self.backend.name());
+    }
+    pub fn learned_mut(&mut self) -> &mut dyn Learned {
+        &mut *self.learned
+    }
+    /// Tray: forget one process (or all when `None`); rejected windows get another chance.
+    pub fn forget_learned(&mut self, process: Option<&str>) {
+        match process {
+            Some(p) => self.learned.forget(p),
+            None => self.learned.forget_all(),
+        }
+        self.rejected.clear();
+    }
+    /// Explorer restarted: record nothing until `set_backend` delivers the new backend.
+    pub fn suspend_learning(&mut self) {
+        self.reinit = true;
     }
     #[allow(dead_code)]
     pub fn backend(&self) -> &B {
@@ -76,11 +94,17 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
     /// Replaces the backend after an Explorer restart (the old COM objects are dead).
     pub fn set_backend(&mut self, b: B) {
         self.backend = b;
+        self.learned.set_backend(self.backend.name());
+        self.reinit = false;
         self.leaked.clear();
     }
     #[allow(dead_code)]
     pub fn is_managed(&self, hwnd: HWND) -> bool {
         self.by_window.contains_key(&hwnd)
+    }
+    #[cfg(test)]
+    pub fn is_rejected(&self, hwnd: HWND) -> bool {
+        self.rejected.contains(&hwnd)
     }
     /// True once since the managed set changed (host then rewrites `state.json`).
     pub fn take_dirty(&mut self) -> bool {
@@ -177,28 +201,33 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
         if state == State::Fullscreen && ev != Event::Recheck && s.fullscreen_settle_ms > 0 {
             return Some(Schedule { hwnd, delay_ms: s.fullscreen_settle_ms });
         }
-        self.enter_space(hwnd)
+        self.enter_space(hwnd, state == State::Fullscreen)
     }
 
     // ------------------------------------------------------------ enter
 
     /// Transactional: nothing is left behind when any step fails.
-    fn enter_space(&mut self, hwnd: HWND) -> Option<Schedule> {
+    fn enter_space(&mut self, hwnd: HWND, fullscreen: bool) -> Option<Schedule> {
         let (process, pid) = self.ws.process(hwnd);
         let class = self.ws.class(hwnd);
-        if self.learned.blocked(&process, &class) {
-            self.rejected.insert(hwnd);
-            return None;
+        // O(1) memory lookup; the exe stamp is only read for apps already on the list.
+        if self.settings.learning && self.learned.blocked(&process, &class) {
+            let stamp = self.ws.exe_stamp(pid);
+            if self.learned.confirm(&process, &class, &stamp) {
+                self.note(format!("skip {:#x} {process} {class}: on learned list", hwnd as usize));
+                self.rejected.insert(hwnd);
+                return None;
+            }
         }
         match self.backend.can_move(hwnd) {
             Ok(true) => {}
             Ok(false) => {
-                self.reject(hwnd, &process, &class, FailReason::CannotMove);
+                self.reject(hwnd, &process, &class, pid, FailReason::CannotMove);
                 return None;
             }
             Err(e) if e.is_transient() => return None,
             Err(e) => {
-                self.reject(hwnd, &process, &class, fail_reason(e, FailReason::NoView));
+                self.reject(hwnd, &process, &class, pid, fail_reason(e, FailReason::NoView));
                 return None;
             }
         }
@@ -219,13 +248,13 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
         if let Err(e) = self.backend.move_window(hwnd, d) {
             self.rollback(hwnd, d, origin, borrowed);
             if !e.is_transient() {
-                self.reject(hwnd, &process, &class, fail_reason(e, FailReason::MoveFailed(e.hr())));
+                self.reject(hwnd, &process, &class, pid, fail_reason(e, FailReason::MoveFailed(e.hr())));
             }
             return None;
         }
         if self.backend.window_desktop(hwnd) != Some(d) {
             self.rollback(hwnd, d, origin, borrowed);
-            self.reject(hwnd, &process, &class, FailReason::MoveNotApplied);
+            self.reject(hwnd, &process, &class, pid, FailReason::MoveNotApplied);
             return None;
         }
         if viewing && self.backend.switch(d, self.settings.switch_animation).is_err() {
@@ -236,16 +265,30 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
         let entered_at = self.ws.now();
         self.note(format!("enter {:#x} {process} {class} {origin} -> {d}", hwnd as usize));
         self.spaces
-            .insert(d, ManagedSpace { desktop: d, hwnd, pid, origin, entered_at, process, class, borrowed });
+            .insert(
+            d,
+            ManagedSpace { desktop: d, hwnd, pid, origin, entered_at, process, class, borrowed, fullscreen },
+        );
         self.by_window.insert(hwnd, d);
         self.dirty = true;
         self.lock(hwnd)
     }
 
-    fn reject(&mut self, hwnd: HWND, process: &str, class: &str, reason: FailReason) {
+    fn reject(&mut self, hwnd: HWND, process: &str, class: &str, pid: u32, reason: FailReason) {
         self.note(format!("reject {:#x} {process} {class} {reason:?}", hwnd as usize));
-        self.learned.fail(process, class, reason, true);
+        self.record(process, class, pid, reason);
         self.rejected.insert(hwnd);
+    }
+
+    /// Feeds the learned list, unless learning is off or the backend is being re-initialised.
+    fn record(&mut self, process: &str, class: &str, pid: u32, reason: FailReason) {
+        if !self.settings.learning || self.reinit {
+            return;
+        }
+        let stamp = self.ws.exe_stamp(pid);
+        if self.learned.fail(process, class, reason, &stamp) {
+            self.note(format!("learned: {process} {class} blocked ({})", reason.name()));
+        }
     }
 
     /// An existing empty desktop (not the origin, not ours) to reuse, in desktop order.
@@ -323,10 +366,10 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
             self.note(format!("exit {:#x} failed: {e}; releasing", hwnd as usize));
         } else {
             let elapsed = self.ws.now().saturating_sub(sp.entered_at);
-            if (closed || state == State::Hidden) && elapsed < SHORT_LIVED_MS {
-                self.learned.fail(&sp.process, &sp.class, FailReason::ShortLived, false);
+            if sp.fullscreen && (closed || state == State::Hidden) && elapsed < SHORT_LIVED_MS {
+                self.record(&sp.process, &sp.class, sp.pid, FailReason::ShortLived);
             } else if elapsed < FLAPPING_MS && !self.ws.recent_user_input(USER_INPUT_MS) {
-                self.learned.fail(&sp.process, &sp.class, FailReason::Flapping, false);
+                self.record(&sp.process, &sp.class, sp.pid, FailReason::Flapping);
             }
         }
         self.note(format!("exit {:#x} closed={closed} others={others} -> {target}", hwnd as usize));
