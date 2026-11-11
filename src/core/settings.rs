@@ -8,6 +8,7 @@ pub struct Settings {
     pub fullscreen_settle_ms: u32,
     pub trigger_on_maximize: bool,
     pub trigger_on_fullscreen: bool,
+    pub reuse_empty_desktops: bool,
 }
 
 impl Default for Settings {
@@ -19,6 +20,7 @@ impl Default for Settings {
             fullscreen_settle_ms: 60,
             trigger_on_maximize: true,
             trigger_on_fullscreen: true,
+            reuse_empty_desktops: true,
         }
     }
 }

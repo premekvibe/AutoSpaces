@@ -195,7 +195,7 @@ impl Learned for Rec {
 
 fn setup(n: u32) -> (Rc<World>, Orchestrator<FB, FW>, Log) {
     let w = World::new(n);
-    let mut o = Orchestrator::new(FB(w.clone()), FW(w.clone()), Settings::default());
+    let mut o = Orchestrator::new(FB(w.clone()), FW(w.clone()), old());
     let log: Log = Rc::default();
     o.set_learned(Box::new(Rec(log.clone())));
     (w, o, log)
@@ -541,7 +541,7 @@ fn adopt_removes_empty_desktops_and_readopts_live_windows() {
     assert_eq!(stored.len(), 2);
     // "Restart": a new orchestrator; window 2 died meanwhile.
     w.set_state(2, State::Destroyed);
-    let mut o2 = Orchestrator::new(FB(w.clone()), FW(w.clone()), Settings::default());
+    let mut o2 = Orchestrator::new(FB(w.clone()), FW(w.clone()), old());
     o2.adopt(stored);
     assert!(o2.is_managed(h(1)));
     assert!(!o2.is_managed(h(2)));
@@ -549,7 +549,7 @@ fn adopt_removes_empty_desktops_and_readopts_live_windows() {
     // And a window that was restored while we were away leaves its space right away.
     let stored = o2.snapshot();
     w.set_state(1, State::Normal);
-    let mut o3 = Orchestrator::new(FB(w.clone()), FW(w.clone()), Settings::default());
+    let mut o3 = Orchestrator::new(FB(w.clone()), FW(w.clone()), old());
     o3.adopt(stored);
     assert!(!o3.is_managed(h(1)));
     assert_eq!(w.count(), 2);
@@ -565,4 +565,122 @@ fn non_candidate_is_rejected_and_pinned_window_is_skipped() {
     w.wins.borrow_mut().get_mut(&2).unwrap().desktop = Guid::ZERO;
     ev(&w, &mut o, 2, Loc);
     assert_eq!(w.creates.get(), 0);
+}
+
+fn old() -> Settings {
+    Settings { reuse_empty_desktops: false, ..Settings::default() }
+}
+
+fn setup_reuse(n: u32) -> (Rc<World>, Orchestrator<FB, FW>) {
+    let w = World::new(n);
+    let o = Orchestrator::new(FB(w.clone()), FW(w.clone()), Settings::default());
+    (w, o)
+}
+
+#[test]
+fn empty_desktop_is_reused_without_create() {
+    let (w, mut o) = setup_reuse(2);
+    w.open(1, State::Maximized);
+    ev(&w, &mut o, 1, Loc);
+    assert_eq!((w.creates.get(), w.count()), (0, 2));
+    assert_eq!((w.current.get(), w.desk_of(1)), (g(2), g(2)));
+    assert!(o.snapshot()[0].borrowed);
+}
+
+#[test]
+fn borrowed_desktop_survives_restore_and_close() {
+    let (w, mut o) = setup_reuse(2);
+    w.open(1, State::Maximized);
+    ev(&w, &mut o, 1, Loc);
+    w.set_state(1, State::Normal);
+    ev(&w, &mut o, 1, Loc);
+    assert_eq!((w.count(), w.current.get(), w.desk_of(1)), (2, g(1), g(1)));
+    w.set_state(1, State::Maximized);
+    ev(&w, &mut o, 1, Loc);
+    assert_eq!(w.current.get(), g(2));
+    w.set_state(1, State::Destroyed);
+    ev(&w, &mut o, 1, Event::Destroy);
+    assert_eq!((w.count(), w.current.get()), (2, g(1)));
+    assert_eq!(w.creates.get(), 0);
+}
+
+#[test]
+fn borrowed_not_viewed_stays_and_others_keep_it() {
+    let (w, mut o) = setup_reuse(2);
+    w.open(1, State::Maximized);
+    ev(&w, &mut o, 1, Loc);
+    w.current.set(g(1)); // user looks elsewhere
+    w.set_state(1, State::Normal);
+    ev(&w, &mut o, 1, Loc);
+    assert_eq!((w.count(), w.current.get(), w.desk_of(1)), (2, g(1), g(1)));
+}
+
+#[test]
+fn non_empty_and_origin_desktops_are_skipped() {
+    let (w, mut o) = setup_reuse(3);
+    w.open(9, State::Normal);
+    w.wins.borrow_mut().get_mut(&9).unwrap().desktop = g(2); // d2 busy
+    w.open(1, State::Maximized); // origin d1 (empty of others but is origin)
+    ev(&w, &mut o, 1, Loc);
+    assert_eq!((w.creates.get(), w.desk_of(1)), (0, g(3)));
+    // Now d1 is empty again but is the origin of the next window on d1.
+    let (w, mut o) = setup_reuse(2);
+    w.open(1, State::Maximized);
+    w.current.set(g(1));
+    w.wins.borrow_mut().get_mut(&1).unwrap().desktop = g(2);
+    w.open(2, State::Maximized); // on d1? current d1
+    w.wins.borrow_mut().get_mut(&2).unwrap().desktop = g(1);
+    w.wins.borrow_mut().get_mut(&1).unwrap().state = State::Normal;
+    w.wins.borrow_mut().get_mut(&1).unwrap().desktop = g(2);
+    ev(&w, &mut o, 2, Loc); // d2 busy, d1 is origin -> create
+    assert_eq!(w.creates.get(), 1);
+}
+
+#[test]
+fn desktop_of_another_managed_space_is_never_chosen() {
+    let (w, mut o) = setup_reuse(3);
+    w.open(1, State::Maximized);
+    ev(&w, &mut o, 1, Loc); // borrows d2, user now on d2
+    w.current.set(g(1));
+    // Make d2 look empty (window minimised away from it), still managed.
+    w.wins.borrow_mut().get_mut(&1).unwrap().state = State::Minimized;
+    w.open(2, State::Maximized);
+    ev(&w, &mut o, 2, Loc);
+    assert_eq!(w.desk_of(2), g(3)); // d2 skipped, empty d3 borrowed
+    w.open(3, State::Maximized);
+    w.current.set(g(1));
+    w.wins.borrow_mut().get_mut(&3).unwrap().desktop = g(1);
+    ev(&w, &mut o, 3, Loc);
+    assert_eq!(w.creates.get(), 1);
+}
+
+#[test]
+fn setting_off_keeps_old_behaviour() {
+    let (w, mut o, _) = setup(2);
+    w.open(1, State::Maximized);
+    ev(&w, &mut o, 1, Loc);
+    assert_eq!((w.creates.get(), w.count()), (1, 3));
+    assert!(!o.snapshot()[0].borrowed);
+}
+
+#[test]
+fn borrowed_rollback_keeps_desktop() {
+    let (w, mut o) = setup_reuse(2);
+    w.open(1, State::Maximized);
+    w.move_noop.set(true);
+    ev(&w, &mut o, 1, Loc);
+    assert_eq!((w.count(), w.creates.get(), w.desk_of(1)), (2, 0, g(1)));
+}
+
+#[test]
+fn adopt_never_removes_borrowed() {
+    let (w, mut o) = setup_reuse(2);
+    w.open(1, State::Maximized);
+    ev(&w, &mut o, 1, Loc);
+    let stored = o.snapshot();
+    w.set_state(1, State::Destroyed);
+    let mut o2 = Orchestrator::new(FB(w.clone()), FW(w.clone()), Settings::default());
+    o2.adopt(stored);
+    assert_eq!(w.count(), 2);
+    assert!(!o2.is_managed(h(1)));
 }

@@ -11,13 +11,14 @@ pub fn to_json(spaces: &[ManagedSpace]) -> String {
             s.push(',');
         }
         s.push_str(&format!(
-            "\n  {{\"desktop\":\"{}\",\"hwnd\":{},\"pid\":{},\"origin\":\"{}\",\"process\":{},\"class\":{}}}",
+            "\n  {{\"desktop\":\"{}\",\"hwnd\":{},\"pid\":{},\"origin\":\"{}\",\"process\":{},\"class\":{},\"borrowed\":{}}}",
             m.desktop,
             m.hwnd as usize,
             m.pid,
             m.origin,
             quote(&m.process),
-            quote(&m.class)
+            quote(&m.class),
+            m.borrowed
         ));
     }
     s.push_str("\n]}\n");
@@ -51,6 +52,7 @@ pub fn from_json(text: &str) -> Result<Vec<ManagedSpace>, String> {
             entered_at: 0,
             process: text("process"),
             class: text("class"),
+            borrowed: matches!(o.get("borrowed"), Some(Json::Bool(true))),
         });
     }
     Ok(out)
@@ -71,12 +73,15 @@ mod tests {
             entered_at: 99,
             process: "a\"b.exe".into(),
             class: "Cls".into(),
+            borrowed: true,
         }];
         let back = from_json(&to_json(&v)).unwrap();
         assert_eq!(back.len(), 1);
         assert_eq!(back[0].desktop, g(1));
         assert_eq!(back[0].hwnd as usize, 0x1234);
         assert_eq!(back[0].process, "a\"b.exe");
+        assert!(back[0].borrowed);
+        assert!(!from_json(r#"{"spaces":[{"desktop":"00000001-0000-0000-0000-000000000000","hwnd":1,"pid":2,"origin":"00000001-0000-0000-0000-000000000000"}]}"#).unwrap()[0].borrowed);
         assert_eq!(from_json(&to_json(&[])).unwrap().len(), 0);
         assert!(from_json("{").is_err());
     }

@@ -46,6 +46,8 @@ pub struct ManagedSpace {
     pub entered_at: u64,
     pub process: String,
     pub class: String,
+    /// An existing empty desktop we reused; never deleted by us.
+    pub borrowed: bool,
 }
 
 pub trait WindowSystem {

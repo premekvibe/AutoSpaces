@@ -212,28 +212,31 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
             None => cur,
         };
         let viewing = cur == origin;
-        let d = self.backend.create().ok()?;
+        let (d, borrowed) = match self.find_empty(origin) {
+            Some(d) => (d, true),
+            None => (self.backend.create().ok()?, false),
+        };
         if let Err(e) = self.backend.move_window(hwnd, d) {
-            self.rollback(d, origin);
+            self.rollback(hwnd, d, origin, borrowed);
             if !e.is_transient() {
                 self.reject(hwnd, &process, &class, fail_reason(e, FailReason::MoveFailed(e.hr())));
             }
             return None;
         }
         if self.backend.window_desktop(hwnd) != Some(d) {
-            self.rollback(d, origin);
+            self.rollback(hwnd, d, origin, borrowed);
             self.reject(hwnd, &process, &class, FailReason::MoveNotApplied);
             return None;
         }
         if viewing && self.backend.switch(d, self.settings.switch_animation).is_err() {
-            self.rollback(d, origin);
+            self.rollback(hwnd, d, origin, borrowed);
             return None;
         }
         self.ws.activate(hwnd);
         let entered_at = self.ws.now();
         self.note(format!("enter {:#x} {process} {class} {origin} -> {d}", hwnd as usize));
         self.spaces
-            .insert(d, ManagedSpace { desktop: d, hwnd, pid, origin, entered_at, process, class });
+            .insert(d, ManagedSpace { desktop: d, hwnd, pid, origin, entered_at, process, class, borrowed });
         self.by_window.insert(hwnd, d);
         self.dirty = true;
         self.lock(hwnd)
@@ -245,7 +248,31 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
         self.rejected.insert(hwnd);
     }
 
-    fn rollback(&mut self, d: Guid, fallback: Guid) {
+    /// An existing empty desktop (not the origin, not ours) to reuse, in desktop order.
+    /// One window enumeration, and only when there is more than one desktop.
+    fn find_empty(&self, origin: Guid) -> Option<Guid> {
+        if !self.settings.reuse_empty_desktops {
+            return None;
+        }
+        let list = self.backend.desktops().ok()?;
+        if list.len() < 2 {
+            return None;
+        }
+        let used: HashSet<Guid> = self
+            .ws
+            .app_windows()
+            .into_iter()
+            .filter_map(|w| self.backend.window_desktop(w))
+            .collect();
+        list.into_iter().find(|d| *d != origin && !self.spaces.contains_key(d) && !used.contains(d))
+    }
+
+    /// Undo a failed enter. A borrowed desktop is never removed, only emptied again.
+    fn rollback(&mut self, hwnd: HWND, d: Guid, fallback: Guid, borrowed: bool) {
+        if borrowed {
+            let _ = self.backend.move_window(hwnd, fallback);
+            return;
+        }
         if self.backend.remove(d, fallback).is_err() {
             self.leaked.push(d);
         }
@@ -277,12 +304,12 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
         let sp = self.spaces.get(&d)?.clone();
         let target = self.resolve_origin(sp.origin, list);
         let others = self.count_on(d, Some(hwnd));
-        let res = if others == 0 {
+        let res = if others == 0 && !sp.borrowed {
             self.backend.remove(d, target) // one call: moves W, switches the view, deletes
         } else {
             let moved = if closed { Ok(()) } else { self.backend.move_window(hwnd, target) };
             moved.and_then(|()| match self.backend.current() {
-                Ok(c) if c == d && self.settings.switch_back_when_others_remain => {
+                Ok(c) if c == d && (sp.borrowed || self.settings.switch_back_when_others_remain) => {
                     self.backend.switch(target, false)
                 }
                 Ok(_) => Ok(()),
@@ -303,7 +330,7 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
             }
         }
         self.note(format!("exit {:#x} closed={closed} others={others} -> {target}", hwnd as usize));
-        self.forget(&sp, others == 0);
+        self.forget(&sp, others == 0 && !sp.borrowed);
         self.lock(hwnd)
     }
 
@@ -316,7 +343,7 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
         let Some(sp) = self.spaces.get(&d).cloned() else { return };
         self.note(format!("{:#x} moved away from {d} to {cur}; released", hwnd as usize));
         let empty = self.count_on(d, Some(hwnd)) == 0;
-        let removed = empty && self.backend.remove(d, cur).is_ok();
+        let removed = empty && !sp.borrowed && self.backend.remove(d, cur).is_ok();
         self.forget(&sp, removed);
         self.rejected.insert(hwnd); // do not fight the user
     }
@@ -423,6 +450,9 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
                 continue;
             }
             if self.count_on(sp.desktop, None) == 0 {
+                if sp.borrowed {
+                    continue; // not ours to delete
+                }
                 let target = self.resolve_origin(sp.origin, &list);
                 let _ = self.backend.remove(sp.desktop, target);
                 self.note(format!("startup: removed empty {}", sp.desktop));

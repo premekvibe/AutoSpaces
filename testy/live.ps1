@@ -85,7 +85,7 @@ public static class AsLive {
       Guid[] ids = Ids(); Guid cur = Cur(); Guid wd = checkWin ? WinDesk(h) : Guid.Empty;
       desc = "desktops=" + ids.Length + " current=#" + Idx(ids, cur) + (checkWin ? " window=#" + Idx(ids, wd) : "");
       bool good;
-      if (entered) good = ids.Length == baseCount + 1 && ids.Length > 0 && cur == ids[ids.Length - 1] && (!checkWin || wd == cur);
+      if (entered) good = (ids.Length == baseCount || ids.Length == baseCount + 1) && cur != origin && (!checkWin || wd == cur);
       else good = ids.Length == baseCount && cur == origin && (!checkWin || wd == origin);
       if (good) { ok = sw.ElapsedMilliseconds; break; }
       Thread.Sleep(5);
@@ -152,7 +152,7 @@ try {
 
   # (a) maximize
   $ms = [AsLive]::Run($hwnd, 3, $true, $baseCount, $origin, $true, 3000)
-  Report '(a) maximize -> new desktop, window + current there' $ms 'count+1, window and current on last'
+  Report '(a) maximize -> new desktop, window + current there' $ms 'window and current on a desktop other than origin (count unchanged if an empty one was reused, else +1)'
   Start-Sleep -Milliseconds 1200
   # (b) restore
   $ms = [AsLive]::Run($hwnd, 9, $false, $baseCount, $origin, $true, 3000)
@@ -160,14 +160,14 @@ try {
   Start-Sleep -Milliseconds 1200
   # (c) maximize, minimize
   $ms = [AsLive]::Run($hwnd, 3, $true, $baseCount, $origin, $true, 3000)
-  Report '(c1) maximize again' $ms 'count+1, window and current on last'
+  Report '(c1) maximize again' $ms 'window and current on a desktop other than origin (count unchanged if an empty one was reused, else +1)'
   Start-Sleep -Milliseconds 1200
   $ms = [AsLive]::Run($hwnd, 6, $false, $baseCount, $origin, $true, 3000)
   Report '(c2) minimize -> back on origin, desktop removed' $ms 'count back, window and current on origin'
   Start-Sleep -Milliseconds 1200
   # (d) maximize (from minimized), close
   $ms = [AsLive]::Run($hwnd, 3, $true, $baseCount, $origin, $true, 3000)
-  Report '(d1) maximize again (from minimized)' $ms 'count+1, window and current on last'
+  Report '(d1) maximize again (from minimized)' $ms 'window and current on a desktop other than origin (count unchanged if an empty one was reused, else +1)'
   Start-Sleep -Milliseconds 1200
   $ms = [AsLive]::Run($hwnd, -1, $false, $baseCount, $origin, $false, 3000)
   Report '(d2) close (WM_CLOSE) -> current on origin, desktop removed' $ms 'count back, current on origin'
