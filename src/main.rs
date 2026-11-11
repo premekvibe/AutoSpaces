@@ -1,10 +1,13 @@
 #![windows_subsystem = "windows"]
 
+mod core;
 mod desktops;
+mod json;
 mod selftest;
 mod tray;
 mod windowing;
 
+use crate::core::{Event, Orchestrator, Schedule, Settings};
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
 use windows_sys::Win32::Foundation::{
@@ -13,18 +16,27 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
-    PostQuitMessage, RegisterClassW, RegisterWindowMessageW, TranslateMessage, MSG, WM_DESTROY,
-    WM_RBUTTONUP, WNDCLASSW,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, KillTimer,
+    PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SetTimer, TranslateMessage, MSG,
+    WM_DESTROY, WM_RBUTTONUP, WM_TIMER, WNDCLASSW,
 };
-use windowing::{classifier, watcher};
+use windowing::system::Win32Windows;
+use windowing::watcher;
+
+type Orch = Orchestrator<desktops::InternalBackend, Win32Windows>;
 
 static LOGGING: AtomicBool = AtomicBool::new(false);
 static WM_TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 // Touched only from the single UI thread.
 static mut WATCHER: Option<watcher::Watcher> = None;
-// Initialised at startup; used by the orchestrator (phase 3). UI thread only.
-static mut BACKEND: Option<desktops::InternalBackend> = None;
+static mut ORCH: Option<Orch> = None;
+/// One-shot timers requested by the orchestrator: (timer id, hwnd).
+static mut TIMERS: Vec<(usize, HWND)> = Vec::new();
+
+const TIMER_BASE: usize = 100;
+const TIMER_REINIT: usize = 1;
+const REINIT_TRIES: u32 = 20;
+static REINIT_LEFT: AtomicU32 = AtomicU32::new(0);
 
 /// Selects the desktop backend; on failure the app stays inactive and only logs (plan 5.3).
 fn init_backend() -> Option<desktops::InternalBackend> {
@@ -46,15 +58,20 @@ fn init_backend() -> Option<desktops::InternalBackend> {
     }
 }
 
+fn app_dir() -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("LOCALAPPDATA")?;
+    let dir = std::path::Path::new(&base).join("AutoSpaces");
+    let _ = std::fs::create_dir_all(&dir);
+    Some(dir)
+}
+
 fn log_line(line: &str) {
     if !LOGGING.load(Relaxed) {
         return;
     }
-    let Some(base) = std::env::var_os("LOCALAPPDATA") else {
+    let Some(dir) = app_dir() else {
         return;
     };
-    let dir = std::path::Path::new(&base).join("AutoSpaces");
-    let _ = std::fs::create_dir_all(&dir);
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -64,33 +81,136 @@ fn log_line(line: &str) {
     }
 }
 
-fn handle_winevent(hwnd: HWND, event: u32) {
-    if !tray::ENABLED.load(Relaxed) || !LOGGING.load(Relaxed) {
-        return;
+fn orch() -> Option<&'static mut Orch> {
+    unsafe { (*std::ptr::addr_of_mut!(ORCH)).as_mut() }
+}
+
+fn new_orchestrator(b: desktops::InternalBackend) -> Orch {
+    let mut o = Orchestrator::new(b, Win32Windows::new(), Settings::default());
+    o.settings.enabled = tray::ENABLED.load(Relaxed);
+    o
+}
+
+/// Writes `state.json` (managed spaces) when it changed; logs the orchestrator's notes.
+fn after_orchestrator(hwnd: HWND, o: &mut Orch, sch: Option<Schedule>) {
+    for l in o.drain_log() {
+        log_line(&l);
     }
-    let state = classifier::window_state(hwnd);
-    let class = classifier::class_name(hwnd);
-    log_line(&format!(
-        "{} {:#x} {:?} candidate={} class={}",
-        watcher::event_name(event),
-        hwnd as usize,
-        state,
-        classifier::is_candidate(hwnd),
-        class
-    ));
+    if o.take_dirty() {
+        if let Some(dir) = app_dir() {
+            let tmp = dir.join("state.json.tmp");
+            if std::fs::write(&tmp, core::state::to_json(&o.snapshot())).is_ok() {
+                let _ = std::fs::rename(&tmp, dir.join("state.json"));
+            }
+        }
+    }
+    if let Some(s) = sch {
+        schedule(hwnd, s);
+    }
+}
+
+fn schedule(main: HWND, s: Schedule) {
+    unsafe {
+        let timers = &mut *std::ptr::addr_of_mut!(TIMERS);
+        // Same window: reuse the id, which restarts the timer.
+        let id = match timers.iter().find(|t| t.1 == s.hwnd) {
+            Some(t) => t.0,
+            None => {
+                let id = (TIMER_BASE..).find(|i| !timers.iter().any(|t| t.0 == *i)).unwrap_or(TIMER_BASE);
+                timers.push((id, s.hwnd));
+                id
+            }
+        };
+        SetTimer(main, id, s.delay_ms.max(10), None);
+    }
+}
+
+fn dispatch(main: HWND, target: HWND, ev: Event) {
+    if let Some(o) = orch() {
+        let sch = o.on_event(target, ev);
+        after_orchestrator(main, o, sch);
+    }
+}
+
+fn on_timer(main: HWND, id: usize) {
+    unsafe {
+        if id == TIMER_REINIT {
+            KillTimer(main, id);
+            reinit_backend(main);
+            return;
+        }
+        KillTimer(main, id);
+        let timers = &mut *std::ptr::addr_of_mut!(TIMERS);
+        if let Some(pos) = timers.iter().position(|t| t.0 == id) {
+            let (_, target) = timers.swap_remove(pos);
+            dispatch(main, target, Event::Recheck);
+        }
+    }
+}
+
+/// (Re)creates the backend, e.g. after an Explorer restart (plan 6.5). Retries by timer
+/// while Explorer's COM services are not up yet.
+fn reinit_backend(main: HWND) {
+    match init_backend() {
+        Some(b) => unsafe {
+            match orch() {
+                Some(o) => {
+                    o.set_backend(b);
+                    o.reconcile();
+                }
+                None => {
+                    let mut o = new_orchestrator(b);
+                    o.adopt(load_state());
+                    *std::ptr::addr_of_mut!(ORCH) = Some(o);
+                }
+            }
+            if let Some(o) = orch() {
+                after_orchestrator(main, o, None);
+            }
+        },
+        None => {
+            let left = REINIT_LEFT.load(Relaxed);
+            if left > 0 {
+                REINIT_LEFT.store(left - 1, Relaxed);
+                unsafe { SetTimer(main, TIMER_REINIT, 1000, None) };
+            }
+        }
+    }
+}
+
+fn load_state() -> Vec<crate::core::ManagedSpace> {
+    let Some(dir) = app_dir() else {
+        return Vec::new();
+    };
+    match std::fs::read_to_string(dir.join("state.json")) {
+        Ok(t) => core::state::from_json(&t).unwrap_or_else(|e| {
+            log_line(&format!("state.json ignored: {e}"));
+            Vec::new()
+        }),
+        Err(_) => Vec::new(),
+    }
 }
 
 unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
         watcher::WM_WINEVENT => {
-            handle_winevent(wp as HWND, lp as u32);
+            if let Some(ev) = watcher::to_event(lp as u32) {
+                dispatch(hwnd, wp as HWND, ev);
+            }
+            0
+        }
+        WM_TIMER => {
+            on_timer(hwnd, wp);
             0
         }
         tray::WM_TRAY => {
             if lp as u32 == WM_RBUTTONUP {
                 match tray::show_menu(hwnd) {
                     tray::CMD_TOGGLE => {
-                        tray::ENABLED.fetch_xor(true, Relaxed);
+                        let on = !tray::ENABLED.fetch_xor(true, Relaxed);
+                        if let Some(o) = orch() {
+                            o.settings.enabled = on;
+                        }
                     }
                     tray::CMD_EXIT => {
                         DestroyWindow(hwnd);
@@ -110,6 +230,8 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
         }
         m if m != 0 && m == WM_TASKBAR_CREATED.load(Relaxed) => {
             tray::add(hwnd);
+            REINIT_LEFT.store(REINIT_TRIES, Relaxed);
+            reinit_backend(hwnd);
             0
         }
         _ => DefWindowProcW(hwnd, msg, wp, lp),
@@ -170,7 +292,20 @@ fn main() {
         }
 
         let _apartment = desktops::Apartment::init();
-        *std::ptr::addr_of_mut!(BACKEND) = init_backend();
+        match init_backend() {
+            Some(b) => {
+                let mut o = new_orchestrator(b);
+                o.adopt(load_state());
+                *std::ptr::addr_of_mut!(ORCH) = Some(o);
+                if let Some(o) = orch() {
+                    after_orchestrator(hwnd, o, None);
+                }
+            }
+            None => {
+                REINIT_LEFT.store(REINIT_TRIES, Relaxed);
+                SetTimer(hwnd, TIMER_REINIT, 1000, None);
+            }
+        }
 
         tray::add(hwnd);
         *std::ptr::addr_of_mut!(WATCHER) = Some(watcher::Watcher::start(hwnd));
@@ -181,7 +316,7 @@ fn main() {
             DispatchMessageW(&msg);
         }
         // Release COM proxies before the apartment is torn down.
-        *std::ptr::addr_of_mut!(BACKEND) = None;
+        *std::ptr::addr_of_mut!(ORCH) = None;
     }
     log_line(&format!(
         "exit: callbacks_total={} callbacks_passed={}",

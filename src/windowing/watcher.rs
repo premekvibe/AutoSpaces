@@ -1,5 +1,6 @@
 //! WinEvent hooks. The callback is minimal: filter, then PostMessageW.
 
+use crate::core::Event;
 use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering::Relaxed};
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
@@ -75,15 +76,16 @@ impl Watcher {
     }
 }
 
-pub fn event_name(event: u32) -> &'static str {
-    match event {
-        EVENT_OBJECT_LOCATIONCHANGE => "LOCATIONCHANGE",
-        EVENT_OBJECT_SHOW => "SHOW",
-        EVENT_OBJECT_HIDE => "HIDE",
-        EVENT_OBJECT_DESTROY => "DESTROY",
-        EVENT_SYSTEM_MINIMIZESTART => "MINIMIZESTART",
-        EVENT_SYSTEM_MOVESIZESTART => "MOVESIZESTART",
-        EVENT_SYSTEM_MOVESIZEEND => "MOVESIZEEND",
-        _ => "OTHER",
-    }
+/// Maps a WinEvent id to the core event type.
+pub fn to_event(event: u32) -> Option<Event> {
+    Some(match event {
+        EVENT_OBJECT_LOCATIONCHANGE => Event::LocationChange,
+        EVENT_OBJECT_SHOW => Event::Show,
+        EVENT_OBJECT_HIDE => Event::Hide,
+        EVENT_OBJECT_DESTROY => Event::Destroy,
+        EVENT_SYSTEM_MINIMIZESTART => Event::MinimizeStart,
+        EVENT_SYSTEM_MOVESIZESTART => Event::MoveSizeStart,
+        EVENT_SYSTEM_MOVESIZEEND => Event::MoveSizeEnd,
+        _ => return None,
+    })
 }

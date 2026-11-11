@@ -10,15 +10,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WS_CHILD, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
 };
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum State {
-    Normal,
-    Maximized,
-    Fullscreen,
-    Minimized,
-    Hidden,
-    Destroyed,
-}
+pub use crate::core::State;
 
 pub fn window_state(hwnd: HWND) -> State {
     unsafe {

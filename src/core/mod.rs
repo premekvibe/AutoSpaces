@@ -1,0 +1,14 @@
+//! Platform-independent core: orchestrator, models and abstractions (no direct Win32 calls).
+
+pub mod learned;
+pub mod model;
+pub mod orchestrator;
+pub mod settings;
+pub mod state;
+
+pub use model::{Event, ManagedSpace, Schedule, State, WindowSystem};
+pub use orchestrator::Orchestrator;
+pub use settings::Settings;
+
+#[cfg(test)]
+mod tests;
