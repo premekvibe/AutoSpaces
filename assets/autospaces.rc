@@ -1,1 +1,61 @@
+﻿#pragma code_page(65001)
+
+// rc.exe runs without the SDK include path, so the few style bits used here are spelled out.
+#define DS_MODALFRAME 0x80
+#define DS_SHELLFONT 0x48
+#define DS_CENTER 0x800
+#define WS_POPUP 0x80000000
+#define WS_CAPTION 0xC00000
+#define WS_SYSMENU 0x80000
+#define WS_GROUP 0x20000
+#define WS_TABSTOP 0x10000
+#define WS_BORDER 0x800000
+#define WS_VSCROLL 0x200000
+#define WS_HSCROLL 0x100000
+#define LBS_NOTIFY 1
+#define LBS_SORT 2
+#define LBS_NOINTEGRALHEIGHT 0x100
+
 1 ICON "autospaces.ico"
+// Per-monitor v2 DPI awareness for the whole process (plan 12.2).
+1 24 "autospaces.manifest"
+
+// Dialog and control IDs must match src/settings_dlg.rs.
+101 DIALOGEX 0, 0, 304, 308
+STYLE DS_SHELLFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "AutoSpaces – Nastavení"
+FONT 9, "MS Shell Dlg", 400, 0, 1
+BEGIN
+    GROUPBOX        "Co spouští přesun na samostatnou plochu", -1, 6, 4, 292, 44
+    AUTORADIOBUTTON "Všechna maximalizovaná okna i celoobrazovkový režim", 110, 14, 17, 278, 10, WS_GROUP | WS_TABSTOP
+    AUTORADIOBUTTON "Jen celoobrazovkový režim (např. F11 v prohlížeči)", 111, 14, 31, 278, 10
+
+    GROUPBOX        "Vyloučené aplikace (okna zůstávají, kde jsou)", -1, 6, 52, 292, 72
+    LISTBOX         120, 14, 64, 204, 54, LBS_NOTIFY | LBS_SORT | LBS_NOINTEGRALHEIGHT | WS_BORDER | WS_VSCROLL | WS_TABSTOP
+    PUSHBUTTON      "Přidat z běžících…", 121, 224, 64, 68, 14
+    PUSHBUTTON      "Odebrat", 122, 224, 82, 68, 14
+
+    GROUPBOX        "Naučené výjimky (aplikace, které se nepodařilo přesunout)", -1, 6, 128, 292, 72
+    LISTBOX         130, 14, 140, 204, 40, LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | WS_BORDER | WS_VSCROLL | WS_TABSTOP
+    PUSHBUTTON      "Odebrat", 131, 224, 140, 68, 14
+    AUTOCHECKBOX    "Učit se z neúspěšných přesunů", 132, 14, 184, 204, 10, WS_TABSTOP
+
+    GROUPBOX        "Systém", -1, 6, 204, 292, 78
+    AUTOCHECKBOX    "Spouštět AutoSpaces po startu Windows", 140, 14, 216, 278, 10, WS_TABSTOP
+    PUSHBUTTON      "Otevřít nastavení Windows…", 141, 14, 232, 120, 14
+    LTEXT           "Aby klik na ikonu běžící aplikace přepnul na její plochu, nastavte ve Windows v části Plochy „Na hlavním panelu zobrazovat všechna otevřená okna“ na „Na všech plochách“. Shift + klik na ikonu spustí novou instanci aplikace.", 142, 14, 250, 278, 28
+
+    DEFPUSHBUTTON   "OK", 1, 190, 288, 50, 14
+    PUSHBUTTON      "Storno", 2, 246, 288, 50, 14
+END
+
+102 DIALOGEX 0, 0, 240, 170
+STYLE DS_SHELLFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Vyloučit aplikaci"
+FONT 9, "MS Shell Dlg", 400, 0, 1
+BEGIN
+    LTEXT           "Aplikace s otevřeným oknem (proces – titulek):", -1, 6, 6, 228, 10
+    LISTBOX         150, 6, 18, 228, 128, LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | WS_BORDER | WS_VSCROLL | WS_HSCROLL | WS_TABSTOP
+    DEFPUSHBUTTON   "Vyloučit", 1, 128, 150, 50, 14
+    PUSHBUTTON      "Storno", 2, 184, 150, 50, 14
+END

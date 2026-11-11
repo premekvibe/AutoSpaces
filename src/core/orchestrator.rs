@@ -90,6 +90,12 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
             }
         }
     }
+    /// New settings from the dialog; effective at once. The tray toggle (`enabled`) is kept.
+    /// Windows already left alone stay alone until the user restores them.
+    pub fn apply_settings(&mut self, mut new: Settings) {
+        new.enabled = self.settings.enabled;
+        self.settings = new;
+    }
     /// Tray toggle.
     pub fn set_enabled(&mut self, on: bool) {
         if on && !self.settings.enabled {
@@ -301,6 +307,11 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
     fn enter_space(&mut self, hwnd: HWND, fullscreen: bool) -> Option<Schedule> {
         let (process, pid) = self.ws.process(hwnd);
         let class = self.ws.class(hwnd);
+        if self.settings.is_excluded(&process) {
+            self.note(format!("skip {:#x} {process}: excluded in settings", hwnd as usize));
+            self.rejected.insert(hwnd);
+            return None;
+        }
         // O(1) memory lookup; the exe stamp is only read for apps already on the list.
         if self.settings.learning && self.learned.blocked(&process, &class) {
             let stamp = self.ws.exe_stamp(pid);

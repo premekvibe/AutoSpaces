@@ -1,4 +1,7 @@
-//! Settings (plan 6.6). Loading from a file is a later phase; for now plain defaults.
+//! Settings (plan 6.6, 12.2): defaults plus `settings.json` in `%APPDATA%\AutoSpaces`.
+
+use crate::json::{parse_json, quote, Json};
+use std::path::Path;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Settings {
@@ -15,6 +18,10 @@ pub struct Settings {
     pub learning: bool,
     /// Days after which softly blocked apps (Flapping, ShortLived) are tried again.
     pub learned_retry_days: u32,
+    /// Lower-case process names that are never moved (plan 12.2).
+    pub excluded: Vec<String>,
+    /// Start with Windows (HKCU Run). The registry is the truth; this mirrors the last choice.
+    pub autostart: bool,
 }
 
 impl Default for Settings {
@@ -29,6 +36,161 @@ impl Default for Settings {
             empty_desktop_grace_ms: 300,
             learning: true,
             learned_retry_days: 30,
+            excluded: Vec::new(),
+            autostart: false,
         }
+    }
+}
+
+/// Canonical form of a process name in the exclusion list.
+pub fn norm_process(s: &str) -> String {
+    s.trim().to_lowercase()
+}
+
+impl Settings {
+    /// Launch mode (a): every maximized window and fullscreen; (b) fullscreen only.
+    pub fn fullscreen_only(&self) -> bool {
+        !self.trigger_on_maximize
+    }
+
+    pub fn set_fullscreen_only(&mut self, only: bool) {
+        self.trigger_on_maximize = !only;
+        self.trigger_on_fullscreen = true;
+    }
+
+    pub fn is_excluded(&self, process: &str) -> bool {
+        !self.excluded.is_empty() && self.excluded.iter().any(|e| e == process)
+    }
+
+    /// Adds a process to the exclusion list (normalized, no duplicates); false = nothing added.
+    pub fn exclude(&mut self, process: &str) -> bool {
+        let p = norm_process(process);
+        if p.is_empty() || self.excluded.contains(&p) {
+            return false;
+        }
+        self.excluded.push(p);
+        self.excluded.sort();
+        true
+    }
+
+    /// Reads `settings.json` text; tolerant: a missing or wrongly typed key keeps its default.
+    /// Err only when the text is not JSON at all (the caller then uses the defaults).
+    pub fn from_json(text: &str) -> Result<Settings, String> {
+        let j = parse_json(text)?;
+        let mut s = Settings::default();
+        if !matches!(j, Json::Obj(_)) {
+            return Err("settings.json is not an object".into());
+        }
+        let flag = |key: &str, dst: &mut bool| {
+            if let Some(Json::Bool(b)) = j.get(key) {
+                *dst = *b;
+            }
+        };
+        match j.get("mode").and_then(Json::as_str) {
+            Some("fullscreen") => s.set_fullscreen_only(true),
+            Some("all") => s.set_fullscreen_only(false),
+            _ => {}
+        }
+        flag("autostart", &mut s.autostart);
+        flag("learning", &mut s.learning);
+        flag("switchAnimation", &mut s.switch_animation);
+        if let Some(Json::Arr(a)) = j.get("excluded") {
+            for item in a {
+                if let Some(name) = item.as_str() {
+                    s.exclude(name);
+                }
+            }
+        }
+        Ok(s)
+    }
+
+    pub fn to_json(&self) -> String {
+        let list: Vec<String> = self.excluded.iter().map(|e| quote(e)).collect();
+        format!(
+            "{{
+  \"mode\": {},
+  \"excluded\": [{}],
+  \"autostart\": {},
+  \"learning\": {},
+  \"switchAnimation\": {}
+}}
+",
+            quote(if self.fullscreen_only() { "fullscreen" } else { "all" }),
+            list.join(", "),
+            self.autostart,
+            self.learning,
+            self.switch_animation
+        )
+    }
+
+    /// Missing or unreadable file = defaults.
+    pub fn load(path: &Path) -> Settings {
+        std::fs::read_to_string(path).ok().and_then(|t| Settings::from_json(&t).ok()).unwrap_or_default()
+    }
+
+    pub fn save(&self, path: &Path) -> std::io::Result<()> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, self.to_json())?;
+        std::fs::rename(&tmp, path)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_for_empty_and_partial() {
+        let d = Settings::default();
+        assert_eq!(Settings::from_json("{}").unwrap(), d);
+        let s = Settings::from_json(r#"{"mode":"fullscreen"}"#).unwrap();
+        assert!(s.fullscreen_only() && s.trigger_on_fullscreen && s.excluded.is_empty() && s.learning);
+    }
+
+    #[test]
+    fn tolerant_to_wrong_types_and_unknown_keys() {
+        let s = Settings::from_json(
+            r#"{"mode":5,"excluded":"x","autostart":1,"learning":false,"extra":[1],"switchAnimation":"yes"}"#,
+        )
+        .unwrap();
+        assert!(!s.fullscreen_only() && !s.autostart && !s.learning && !s.switch_animation);
+        assert!(s.excluded.is_empty());
+        assert!(Settings::from_json("not json").is_err());
+        assert!(Settings::from_json("[1]").is_err());
+    }
+
+    #[test]
+    fn roundtrip_and_normalization() {
+        let mut s = Settings::default();
+        s.set_fullscreen_only(true);
+        s.autostart = true;
+        s.learning = false;
+        assert!(s.exclude("  Chrome.EXE "));
+        assert!(!s.exclude("chrome.exe"));
+        assert!(!s.exclude("   "));
+        assert!(s.exclude("a\"b.exe"));
+        let back = Settings::from_json(&s.to_json()).unwrap();
+        assert_eq!(back, s);
+        assert!(back.is_excluded("chrome.exe") && !back.is_excluded("code.exe"));
+        // names from a hand-edited file are normalized and deduplicated
+        let h = Settings::from_json(r#"{"excluded":["Foo.exe","foo.exe",5,""," Bar.exe"]}"#).unwrap();
+        assert_eq!(h.excluded, vec!["bar.exe", "foo.exe"]);
+    }
+
+    #[test]
+    fn file_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("autospaces-test-{}", std::process::id()));
+        let path = dir.join("sub").join("settings.json");
+        assert_eq!(Settings::load(&path), Settings::default());
+        let mut s = Settings::default();
+        s.exclude("x.exe");
+        s.save(&path).unwrap();
+        assert_eq!(Settings::load(&path), s);
+        std::fs::write(&path, "{ broken").unwrap();
+        assert_eq!(Settings::load(&path), Settings::default());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -4,6 +4,8 @@ mod core;
 mod desktops;
 mod json;
 mod selftest;
+mod settings_dlg;
+mod sysopts;
 mod tray;
 mod windowing;
 
@@ -120,8 +122,45 @@ fn orch() -> Option<&'static mut Orch> {
     unsafe { (*std::ptr::addr_of_mut!(ORCH)).as_mut() }
 }
 
+/// `%APPDATA%\AutoSpaces\settings.json` (plan 12.2).
+fn settings_path() -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("APPDATA")?;
+    Some(std::path::Path::new(&base).join("AutoSpaces").join("settings.json"))
+}
+
+fn load_settings() -> Settings {
+    match settings_path() {
+        Some(p) => Settings::load(&p),
+        None => Settings::default(),
+    }
+}
+
+/// Opens the settings dialog and applies the result at once.
+fn open_settings(hwnd: HWND) {
+    let Some(o) = orch() else { return };
+    let learned = o.learned_mut().list_blocked();
+    let current = o.settings.clone();
+    // Modal; events keep flowing meanwhile, so the orchestrator is looked up again afterwards.
+    let Some(out) = settings_dlg::show(&current, learned, settings_dlg::running_apps) else { return };
+    let Some(o) = orch() else { return };
+    for p in &out.forgotten {
+        o.forget_learned(Some(p));
+        log_line(&format!("learned: forgot {p}"));
+    }
+    if sysopts::autostart_enabled() != out.settings.autostart && !sysopts::set_autostart(out.settings.autostart) {
+        log_line("autostart: registry write failed");
+    }
+    if let Some(p) = settings_path() {
+        if let Err(e) = out.settings.save(&p) {
+            log_line(&format!("settings.json not saved: {e}"));
+        }
+    }
+    o.apply_settings(out.settings);
+    after_orchestrator(hwnd, o, None);
+}
+
 fn new_orchestrator(b: desktops::InternalBackend) -> Orch {
-    let settings = Settings::default();
+    let settings = load_settings();
     let learned: Box<dyn core::learned::Learned> = match app_dir() {
         Some(dir) => {
             use desktops::DesktopBackend;
@@ -283,6 +322,11 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             }
             0
         }
+        #[cfg(debug_assertions)]
+        m if m == windows_sys::Win32::UI::WindowsAndMessaging::WM_APP + 9 => {
+            open_settings(hwnd);
+            0
+        }
         WM_TIMER => {
             on_timer(hwnd, wp);
             0
@@ -304,6 +348,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                         }
                         DestroyWindow(hwnd);
                     }
+                    tray::CMD_SETTINGS => open_settings(hwnd),
                     tray::CMD_FORGET_ALL => {
                         if let Some(o) = orch() {
                             o.forget_learned(None);
@@ -423,6 +468,10 @@ fn main() {
         }
 
         tray::add(hwnd);
+        #[cfg(debug_assertions)]
+        if std::env::var_os("AUTOSPACES_OPEN_SETTINGS").is_some() {
+            windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(hwnd, windows_sys::Win32::UI::WindowsAndMessaging::WM_APP + 9, 0, 0);
+        }
         init_reg_notify();
         *std::ptr::addr_of_mut!(WATCHER) = Some(watcher::Watcher::start(hwnd));
 

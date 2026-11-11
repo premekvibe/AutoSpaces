@@ -586,3 +586,10 @@ Cíl: v nastavení určit, kolik ploch má po startu existovat a které aplikace
 - TradingView existuje jako desktopová aplikace i jako web v prohlížeči – druhý případ potřebuje párování podle titulku.
 
 **Zařazení:** nová fáze 5b (po dialogu Nastavení, před O aplikaci). Odhad 2–3 dny.
+
+### 12.8 Přepínání do existujícího okna
+
+- **Rozhodnutí uživatele:** vlastní zachytávání spouštění aplikací (Start, zástupci) se **nedělá**.
+- V dialogu nastavení (12.2) je tlačítko „Otevřít nastavení Windows…“ (`ms-settings:multitasking`) s krátkým návodem: v části Plochy nastavit „Na hlavním panelu zobrazovat všechna otevřená okna“ na „Na všech plochách“. Přímý zápis do registru se **nedělá** (rozhodnutí uživatele): na sestavení 26340 Windows volbu neukládají do `VirtualDesktopTaskbarFilter`, ale do nedokumentovaného binárního záznamu CloudStore, a zápis do původní hodnoty se na panelu neprojevil.
+- **Nová instance:** Shift + klik na ikonu v hlavním panelu (standard Windows); dialog to uvede jako nápovědu (klik na ikonu běžící aplikace přepne na její plochu). Alt zamítnut (Alt + dvojklik = Vlastnosti).
+- Vedlejší účinek: hlavní panel ukazuje okna ze všech ploch.

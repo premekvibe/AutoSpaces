@@ -1162,3 +1162,53 @@ fn give_back_all_restores_windows_switches_and_compacts() {
     assert_eq!(w.desk_of(1).d1, 1);
     assert_eq!(w.current.get().d1, 1);
 }
+
+#[test]
+fn settings_exclusion_and_mode_take_effect_without_restart() {
+    let w = World::new(3);
+    put(&w, 9, 1);
+    let mut o = started(&w);
+    // Excluded process: its maximized window stays put.
+    let mut s = Settings::default();
+    s.exclude("App.exe");
+    o.apply_settings(s);
+    put(&w, 1, 1);
+    w.set_state(1, State::Maximized);
+    ev(&w, &mut o, 1, Loc);
+    assert!(!o.is_managed(h(1)) && o.is_rejected(h(1)));
+    assert_eq!(w.desk_of(1).d1, 1);
+    // Exclusion removed: the next maximize (after a restore) is handled.
+    o.apply_settings(Settings::default());
+    w.set_state(1, State::Normal);
+    ev(&w, &mut o, 1, Loc);
+    w.set_state(1, State::Maximized);
+    ev(&w, &mut o, 1, Loc);
+    assert!(o.is_managed(h(1)));
+    assert_eq!(w.desk_of(1).d1, 2);
+    // Fullscreen-only: a maximized window is ignored (and not remembered as rejected).
+    let mut s = Settings::default();
+    s.set_fullscreen_only(true);
+    o.apply_settings(s);
+    put(&w, 2, 1);
+    w.set_state(2, State::Maximized);
+    ev(&w, &mut o, 2, Loc);
+    assert!(!o.is_managed(h(2)) && !o.is_rejected(h(2)));
+    // ... but fullscreen still moves, and switching back to "all" handles maximize again.
+    put(&w, 3, 1);
+    w.set_state(3, State::Fullscreen);
+    ev(&w, &mut o, 3, Loc);
+    ev(&w, &mut o, 3, Event::Recheck);
+    assert!(o.is_managed(h(3)));
+    o.apply_settings(Settings::default());
+    ev(&w, &mut o, 2, Loc);
+    assert!(o.is_managed(h(2)));
+}
+
+#[test]
+fn apply_settings_keeps_the_tray_toggle() {
+    let w = World::new(2);
+    let mut o = started(&w);
+    o.set_enabled(false);
+    o.apply_settings(Settings::default());
+    assert!(!o.settings.enabled);
+}

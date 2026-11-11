@@ -17,6 +17,7 @@ pub const WM_TRAY: u32 = WM_APP + 1;
 pub const CMD_TOGGLE: usize = 1;
 pub const CMD_EXIT: usize = 2;
 pub const CMD_FORGET_ALL: usize = 3;
+pub const CMD_SETTINGS: usize = 4;
 /// Command id of the first learned process in the submenu (index = id - base).
 pub const CMD_FORGET_BASE: usize = 1000;
 
@@ -104,6 +105,7 @@ pub fn show_menu(hwnd: HWND, learned: &[String]) -> usize {
         let on = if ENABLED.load(Relaxed) { MF_CHECKED } else { 0 };
         AppendMenuW(menu, MF_STRING | on, CMD_TOGGLE, wide("Zapnuto").as_ptr());
         AppendMenuW(menu, MF_POPUP, sub as usize, wide("Naučené výjimky").as_ptr());
+        AppendMenuW(menu, MF_STRING, CMD_SETTINGS, wide("Nastavení…").as_ptr());
         AppendMenuW(menu, MF_STRING, CMD_EXIT, wide("Ukončit").as_ptr());
         let mut pt = POINT { x: 0, y: 0 };
         GetCursorPos(&mut pt);
