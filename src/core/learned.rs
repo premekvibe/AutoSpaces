@@ -76,6 +76,12 @@ pub trait Learned {
     /// Forgets every entry of a process (all classes).
     fn forget(&mut self, process: &str);
     fn forget_all(&mut self);
+    /// Blocked processes with their readable names (empty = unknown), sorted by process.
+    fn list_named(&self) -> Vec<(String, String)> {
+        self.list_blocked().into_iter().map(|p| (p, String::new())).collect()
+    }
+    /// Stores the readable name for every entry of `process` that has none yet.
+    fn set_name(&mut self, _process: &str, _name: &str) {}
 }
 
 /// Blocks nothing, remembers nothing.
@@ -109,6 +115,8 @@ struct Entry {
     stamp: String,
     first: String,
     last: String,
+    /// Readable app name for display only (empty = unknown).
+    name: String,
 }
 
 type Key = (String, String);
@@ -259,6 +267,7 @@ impl Learned for LearnedStore {
             stamp: String::new(),
             first: today.clone(),
             last: today.clone(),
+            name: String::new(),
         });
         if e.reason != name {
             e.reason = name.into();
@@ -296,6 +305,38 @@ impl Learned for LearnedStore {
         v
     }
 
+    fn list_named(&self) -> Vec<(String, String)> {
+        let mut v: Vec<(String, String)> = Vec::new();
+        for (k, e) in self.entries.iter().filter(|(_, e)| self.active(e)) {
+            match v.iter_mut().find(|(p, _)| *p == k.0) {
+                Some(x) => {
+                    if x.1.is_empty() {
+                        x.1 = e.name.clone();
+                    }
+                }
+                None => v.push((k.0.clone(), e.name.clone())),
+            }
+        }
+        v.sort();
+        v
+    }
+
+    fn set_name(&mut self, process: &str, name: &str) {
+        if name.is_empty() {
+            return;
+        }
+        let mut changed = false;
+        for (k, e) in self.entries.iter_mut() {
+            if k.0 == process && e.name.is_empty() {
+                e.name = name.to_string();
+                changed = true;
+            }
+        }
+        if changed {
+            self.save();
+        }
+    }
+
     fn forget(&mut self, process: &str) {
         let before = self.entries.len();
         self.entries.retain(|k, _| k.0 != process);
@@ -325,7 +366,7 @@ fn to_json(entries: &HashMap<Key, Entry>) -> String {
         }
         let hr = e.hresult.map_or(String::new(), |h| format!("\"hresult\":\"{:#010X}\",", h as u32));
         s.push_str(&format!(
-            "\n  {{\"process\":{},\"class\":{},\"reason\":{},{}\"strikes\":{},\"blocked\":{},\"backend\":{},\"exeStamp\":{},\"first\":{},\"last\":{}}}",
+            "\n  {{\"process\":{},\"class\":{},\"reason\":{},{}\"strikes\":{},\"blocked\":{},\"backend\":{},\"exeStamp\":{},\"first\":{},\"last\":{}{}}}",
             quote(&k.0),
             quote(&k.1),
             quote(&e.reason),
@@ -335,7 +376,8 @@ fn to_json(entries: &HashMap<Key, Entry>) -> String {
             quote(&e.backend),
             quote(&e.stamp),
             quote(&e.first),
-            quote(&e.last)
+            quote(&e.last),
+            if e.name.is_empty() { String::new() } else { format!(",\"name\":{}", quote(&e.name)) }
         ));
     }
     s.push_str("\n]}\n");
@@ -373,6 +415,7 @@ fn from_json(text: &str) -> Result<HashMap<Key, Entry>, String> {
             stamp: text("exeStamp"),
             first: text("first"),
             last: text("last"),
+            name: text("name"),
         };
         out.insert((process, class), e);
     }
@@ -518,5 +561,26 @@ mod tests {
         assert_eq!(date_of(1_794_355_200), "2026-11-11");
         assert_eq!(parse_date("2026-11-11"), Some(1_794_355_200 / 86_400));
         assert_eq!(parse_date("nope"), None);
+    }
+
+    #[test]
+    fn names_old_and_new_format() {
+        // Old file without "name": loads, name unknown.
+        let old = r#"{"version":1,"entries":[{"process":"pdr.exe","class":"V","reason":"CannotMove","strikes":1,"blocked":true,"backend":"b","exeStamp":"1:2","first":"2026-11-11","last":"2026-11-11"}]}"#;
+        let m = from_json(old).unwrap();
+        assert_eq!(m[&("pdr.exe".to_string(), "V".to_string())].name, "");
+        let dir = std::env::temp_dir().join(format!("as-learned-n-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("learned.json");
+        std::fs::write(&path, old).unwrap();
+        let mut s = LearnedStore::load(path.clone(), "b", 30);
+        assert_eq!(s.list_named(), vec![("pdr.exe".to_string(), String::new())]);
+        s.set_name("pdr.exe", "CyberLink PowerDirector 365");
+        s.set_name("pdr.exe", "Other"); // an existing name is kept
+        s.set_name("none.exe", "X");
+        let back = LearnedStore::load(path, "b", 30);
+        assert_eq!(back.list_named(), vec![("pdr.exe".to_string(), "CyberLink PowerDirector 365".to_string())]);
+        assert!(back.blocked("pdr.exe", "V"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

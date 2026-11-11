@@ -69,4 +69,9 @@ pub trait WindowSystem {
     fn recent_user_input(&self, ms: u32) -> bool;
     /// `"size:mtime"` of the exe of process `pid`; empty when unknown (e.g. process gone).
     fn exe_stamp(&self, pid: u32) -> String;
+    /// Human-readable app name from the exe's version info (FileDescription, else ProductName);
+    /// empty when unknown. Reads files: never call it on the event hot path.
+    fn app_name(&self, _pid: u32) -> String {
+        String::new()
+    }
 }

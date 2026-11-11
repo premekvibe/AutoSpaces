@@ -53,6 +53,54 @@ fn process_name(pid: u32) -> String {
         .unwrap_or_default()
 }
 
+/// FileDescription (else ProductName) of an exe; empty when it has no version info.
+pub fn version_name(path: &str) -> String {
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW,
+    };
+    let wpath: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        let size = GetFileVersionInfoSizeW(wpath.as_ptr(), std::ptr::null_mut());
+        if size == 0 {
+            return String::new();
+        }
+        let mut buf = vec![0u8; size as usize];
+        if GetFileVersionInfoW(wpath.as_ptr(), 0, size, buf.as_mut_ptr() as *mut _) == 0 {
+            return String::new();
+        }
+        // Language/codepage pairs first, then the usual English fallbacks.
+        let mut langs: Vec<String> = Vec::new();
+        let tw: Vec<u16> = r"\VarFileInfo\Translation".encode_utf16().chain(std::iter::once(0)).collect();
+        let mut p: *mut core::ffi::c_void = std::ptr::null_mut();
+        let mut len = 0u32;
+        if VerQueryValueW(buf.as_ptr() as *const _, tw.as_ptr(), &mut p, &mut len) != 0 && !p.is_null() {
+            let pairs = std::slice::from_raw_parts(p as *const u16, (len / 2) as usize);
+            for c in pairs.chunks_exact(2) {
+                langs.push(format!("{:04x}{:04x}", c[0], c[1]));
+            }
+        }
+        langs.push("040904b0".into());
+        langs.push("040904e4".into());
+        for field in ["FileDescription", "ProductName"] {
+            for l in &langs {
+                let sub: Vec<u16> =
+                    format!(r"\StringFileInfo\{l}\{field}").encode_utf16().chain(std::iter::once(0)).collect();
+                let mut p: *mut core::ffi::c_void = std::ptr::null_mut();
+                let mut len = 0u32;
+                if VerQueryValueW(buf.as_ptr() as *const _, sub.as_ptr(), &mut p, &mut len) != 0 && !p.is_null() && len > 1 {
+                    let w = std::slice::from_raw_parts(p as *const u16, len as usize);
+                    let end = w.iter().position(|&c| c == 0).unwrap_or(w.len());
+                    let name = String::from_utf16_lossy(&w[..end]).trim().to_string();
+                    if !name.is_empty() {
+                        return name;
+                    }
+                }
+            }
+        }
+        String::new()
+    }
+}
+
 unsafe extern "system" fn collect(hwnd: HWND, lp: LPARAM) -> i32 {
     let v = &mut *(lp as *mut Vec<HWND>);
     if classifier::is_candidate(hwnd) {
@@ -112,6 +160,9 @@ impl WindowSystem for Win32Windows {
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map_or(0, |d| d.as_secs());
         format!("{}:{mtime}", m.len())
+    }
+    fn app_name(&self, pid: u32) -> String {
+        process_path(pid).map(|p| version_name(&p)).unwrap_or_default()
     }
     fn recent_user_input(&self, ms: u32) -> bool {
         unsafe {

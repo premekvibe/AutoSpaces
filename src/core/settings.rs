@@ -1,6 +1,7 @@
 //! Settings (plan 6.6, 12.2): defaults plus `settings.json` in `%APPDATA%\AutoSpaces`.
 
 use crate::json::{parse_json, quote, Json};
+use std::collections::BTreeMap;
 use std::path::Path;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -20,6 +21,8 @@ pub struct Settings {
     pub learned_retry_days: u32,
     /// Lower-case process names that are never moved (plan 12.2).
     pub excluded: Vec<String>,
+    /// Readable names of excluded processes (display only; may be missing).
+    pub names: BTreeMap<String, String>,
     /// Start with Windows (HKCU Run). The registry is the truth; this mirrors the last choice.
     pub autostart: bool,
 }
@@ -37,8 +40,19 @@ impl Default for Settings {
             learning: true,
             learned_retry_days: 30,
             excluded: Vec::new(),
+            names: BTreeMap::new(),
             autostart: false,
         }
+    }
+}
+
+/// "Readable name (file.exe)", or just the file when the name is unknown or the same.
+pub fn display_label(process: &str, name: &str) -> String {
+    let n = name.trim();
+    if n.is_empty() || n.eq_ignore_ascii_case(process) {
+        process.to_string()
+    } else {
+        format!("{n} ({process})")
     }
 }
 
@@ -73,6 +87,14 @@ impl Settings {
         true
     }
 
+    /// Remembers a readable name for an excluded process (empty names are ignored).
+    pub fn set_name(&mut self, process: &str, name: &str) {
+        let (p, n) = (norm_process(process), name.trim());
+        if !n.is_empty() {
+            self.names.insert(p, n.to_string());
+        }
+    }
+
     /// Reads `settings.json` text; tolerant: a missing or wrongly typed key keeps its default.
     /// Err only when the text is not JSON at all (the caller then uses the defaults).
     pub fn from_json(text: &str) -> Result<Settings, String> {
@@ -101,15 +123,29 @@ impl Settings {
                 }
             }
         }
+        if let Some(Json::Obj(m)) = j.get("excludedNames") {
+            for (k, v) in m {
+                if let (Some(n), true) = (v.as_str(), s.excluded.contains(&norm_process(k))) {
+                    s.set_name(k, n);
+                }
+            }
+        }
         Ok(s)
     }
 
     pub fn to_json(&self) -> String {
         let list: Vec<String> = self.excluded.iter().map(|e| quote(e)).collect();
+        let names: Vec<String> = self
+            .names
+            .iter()
+            .filter(|(k, _)| self.excluded.contains(*k))
+            .map(|(k, v)| format!("{}: {}", quote(k), quote(v)))
+            .collect();
         format!(
             "{{
   \"mode\": {},
   \"excluded\": [{}],
+  \"excludedNames\": {{{}}},
   \"autostart\": {},
   \"learning\": {},
   \"switchAnimation\": {}
@@ -117,6 +153,7 @@ impl Settings {
 ",
             quote(if self.fullscreen_only() { "fullscreen" } else { "all" }),
             list.join(", "),
+            names.join(", "),
             self.autostart,
             self.learning,
             self.switch_animation
@@ -192,5 +229,28 @@ mod tests {
         std::fs::write(&path, "{ broken").unwrap();
         assert_eq!(Settings::load(&path), Settings::default());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn names_old_and_new_format() {
+        // Old file (strings only): names unknown, label is the bare file.
+        let old = Settings::from_json(r#"{"excluded":["pdr.exe"]}"#).unwrap();
+        assert!(old.names.is_empty());
+        assert_eq!(display_label("pdr.exe", old.names.get("pdr.exe").map_or("", String::as_str)), "pdr.exe");
+        // New file: names round-trip; names of non-excluded processes are dropped.
+        let mut s = old.clone();
+        s.set_name("PDR.exe", "CyberLink PowerDirector 365");
+        s.set_name("gone.exe", "Gone");
+        s.set_name("pdr.exe", "  ");
+        let back = Settings::from_json(&s.to_json()).unwrap();
+        assert_eq!(back.names["pdr.exe"], "CyberLink PowerDirector 365");
+        assert!(!back.names.contains_key("gone.exe"));
+    }
+
+    #[test]
+    fn label_formatting() {
+        assert_eq!(display_label("a.exe", ""), "a.exe");
+        assert_eq!(display_label("a.exe", "A.EXE"), "a.exe");
+        assert_eq!(display_label("a.exe", "App"), "App (a.exe)");
     }
 }

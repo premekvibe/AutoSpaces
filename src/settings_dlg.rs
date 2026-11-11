@@ -1,6 +1,7 @@
 //! Settings dialog (plan 12.2): plain Win32 dialog templates from assets/autospaces.rc,
 //! created only on request (no cost while idle). Ids below must match the .rc file.
 
+use crate::core::settings::display_label;
 use crate::core::Settings;
 use crate::sysopts;
 use crate::tray::wide;
@@ -14,8 +15,8 @@ use windows_sys::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     DialogBoxParamW, EndDialog, GetDlgItem, GetWindowLongPtrW, GetWindowTextW, LoadImageW, SendDlgItemMessageW,
     SendMessageW, SetForegroundWindow, SetWindowLongPtrW, GWLP_USERDATA,
-    ICON_BIG, ICON_SMALL, IMAGE_ICON, LR_SHARED, SM_CXICON, SM_CXSMICON, SM_CYICON, SM_CYSMICON, LB_SETHORIZONTALEXTENT, IDCANCEL, IDOK, LBN_DBLCLK, LB_ADDSTRING, LB_DELETESTRING, LB_ERR,
-    LB_GETCOUNT, LB_GETCURSEL, LB_GETTEXT, LB_GETTEXTLEN, LB_SETCURSEL, WM_COMMAND, WM_INITDIALOG,
+    ICON_BIG, ICON_SMALL, IMAGE_ICON, LR_SHARED, SM_CXICON, SM_CXSMICON, SM_CYICON, SM_CYSMICON, IDCANCEL, IDOK, LBN_DBLCLK, LB_ADDSTRING, LB_DELETESTRING, LB_ERR,
+    LB_GETCOUNT, LB_GETCURSEL, LB_GETITEMDATA, LB_SETITEMDATA, LB_SETCURSEL, WM_COMMAND, WM_INITDIALOG,
     WM_SETICON, SW_SHOWNORMAL,
 };
 
@@ -45,7 +46,9 @@ pub struct Outcome {
 
 struct Dlg {
     settings: Settings,
-    learned: Vec<String>,
+    /// (process, readable name); list items carry the index as item data.
+    learned: Vec<(String, String)>,
+    excl: Vec<(String, String)>,
     forgotten: Vec<String>,
     out: Option<Outcome>,
     /// Source of the "running apps" picker.
@@ -78,7 +81,7 @@ pub fn picker_entries(raw: Vec<(String, String)>, excluded: &[String], own: &str
 }
 
 /// Opens the modal dialog; None = cancelled (or already open).
-pub fn show(settings: &Settings, learned: Vec<String>, running: fn() -> Vec<(String, String)>) -> Option<Outcome> {
+pub fn show(settings: &Settings, learned: Vec<(String, String)>, running: fn() -> Vec<(String, String)>) -> Option<Outcome> {
     let prev = OPEN.load(Relaxed);
     if prev != 0 {
         unsafe { SetForegroundWindow(prev as HWND) };
@@ -87,6 +90,7 @@ pub fn show(settings: &Settings, learned: Vec<String>, running: fn() -> Vec<(Str
     let mut dlg = Dlg {
         settings: settings.clone(),
         learned,
+        excl: settings.excluded.iter().map(|p| (p.clone(), settings.names.get(p).cloned().unwrap_or_default())).collect(),
         forgotten: Vec::new(),
         out: None,
         running,
@@ -104,38 +108,32 @@ pub fn show(settings: &Settings, learned: Vec<String>, running: fn() -> Vec<(Str
     dlg.out
 }
 
-unsafe fn list_add(dlg: HWND, id: i32, text: &str) {
-    SendDlgItemMessageW(dlg, id, LB_ADDSTRING, 0, wide(text).as_ptr() as LPARAM);
-}
-
-unsafe fn list_text(dlg: HWND, id: i32, idx: usize) -> String {
-    let n = SendDlgItemMessageW(dlg, id, LB_GETTEXTLEN, idx, 0);
-    if n < 0 {
-        return String::new();
+/// Adds a row labelled `text`; `data` (index into the dialog's own vectors) travels with it.
+unsafe fn list_add(dlg: HWND, id: i32, text: &str, data: usize) {
+    let idx = SendDlgItemMessageW(dlg, id, LB_ADDSTRING, 0, wide(text).as_ptr() as LPARAM);
+    if idx >= 0 {
+        SendDlgItemMessageW(dlg, id, LB_SETITEMDATA, idx as usize, data as LPARAM);
     }
-    let mut buf = vec![0u16; n as usize + 1];
-    let n = SendDlgItemMessageW(dlg, id, LB_GETTEXT, idx, buf.as_mut_ptr() as LPARAM);
-    String::from_utf16_lossy(&buf[..n.max(0) as usize])
 }
 
-unsafe fn list_all(dlg: HWND, id: i32) -> Vec<String> {
+unsafe fn list_data(dlg: HWND, id: i32) -> Vec<usize> {
     let n = SendDlgItemMessageW(dlg, id, LB_GETCOUNT, 0, 0).max(0) as usize;
-    (0..n).map(|i| list_text(dlg, id, i)).collect()
+    (0..n).map(|i| SendDlgItemMessageW(dlg, id, LB_GETITEMDATA, i, 0) as usize).collect()
 }
 
-/// Removes the selected row; returns its text and keeps a neighbour selected.
-unsafe fn list_remove_selected(dlg: HWND, id: i32) -> Option<String> {
+/// Removes the selected row; returns its item data and keeps a neighbour selected.
+unsafe fn list_remove_selected(dlg: HWND, id: i32) -> Option<usize> {
     let sel = SendDlgItemMessageW(dlg, id, LB_GETCURSEL, 0, 0);
     if sel == LB_ERR as isize {
         return None;
     }
-    let text = list_text(dlg, id, sel as usize);
+    let data = SendDlgItemMessageW(dlg, id, LB_GETITEMDATA, sel as usize, 0) as usize;
     SendDlgItemMessageW(dlg, id, LB_DELETESTRING, sel as usize, 0);
     let n = SendDlgItemMessageW(dlg, id, LB_GETCOUNT, 0, 0);
     if n > 0 {
         SendDlgItemMessageW(dlg, id, LB_SETCURSEL, (sel as usize).min(n as usize - 1), 0);
     }
-    Some(text)
+    Some(data)
 }
 
 unsafe fn update_buttons(dlg: HWND) {
@@ -175,11 +173,11 @@ unsafe fn init(dlg: HWND, d: &Dlg) {
     }
     let fs = d.settings.fullscreen_only();
     CheckRadioButton(dlg, ID_MODE_ALL, ID_MODE_FS, if fs { ID_MODE_FS } else { ID_MODE_ALL });
-    for p in &d.settings.excluded {
-        list_add(dlg, ID_EXCL_LIST, p);
+    for (i, (p, n)) in d.excl.iter().enumerate() {
+        list_add(dlg, ID_EXCL_LIST, &display_label(p, n), i);
     }
-    for p in &d.learned {
-        list_add(dlg, ID_LEARNED_LIST, p);
+    for (i, (p, n)) in d.learned.iter().enumerate() {
+        list_add(dlg, ID_LEARNED_LIST, &display_label(p, n), i);
     }
     CheckDlgButton(dlg, ID_LEARNING, check(d.settings.learning));
     // Autostart is read from the system, not from settings.json.
@@ -191,8 +189,12 @@ unsafe fn collect(dlg: HWND, d: &mut Dlg) {
     let mut s = d.settings.clone();
     s.set_fullscreen_only(IsDlgButtonChecked(dlg, ID_MODE_FS) == BST_CHECKED);
     s.excluded.clear();
-    for p in list_all(dlg, ID_EXCL_LIST) {
-        s.exclude(&p);
+    s.names.clear();
+    for i in list_data(dlg, ID_EXCL_LIST) {
+        if let Some((p, n)) = d.excl.get(i) {
+            s.exclude(p);
+            s.set_name(p, n);
+        }
     }
     s.learning = IsDlgButtonChecked(dlg, ID_LEARNING) == BST_CHECKED;
     s.autostart = IsDlgButtonChecked(dlg, ID_AUTOSTART) == BST_CHECKED;
@@ -224,9 +226,11 @@ unsafe extern "system" fn proc(dlg: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> i
                     EndDialog(dlg, IDCANCEL as isize);
                 }
                 ID_EXCL_ADD => {
-                    if let Some(p) = pick(dlg, d) {
-                        if !list_all(dlg, ID_EXCL_LIST).contains(&p) {
-                            list_add(dlg, ID_EXCL_LIST, &p);
+                    if let Some((p, n)) = pick(dlg, d) {
+                        let have = list_data(dlg, ID_EXCL_LIST);
+                        if !have.iter().any(|&i| d.excl.get(i).is_some_and(|e| e.0 == p)) {
+                            d.excl.push((p.clone(), n.clone()));
+                            list_add(dlg, ID_EXCL_LIST, &display_label(&p, &n), d.excl.len() - 1);
                         }
                         update_buttons(dlg);
                     }
@@ -236,8 +240,10 @@ unsafe extern "system" fn proc(dlg: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> i
                     update_buttons(dlg);
                 }
                 ID_LEARNED_DEL => {
-                    if let Some(p) = list_remove_selected(dlg, ID_LEARNED_LIST) {
-                        d.forgotten.push(p);
+                    if let Some(i) = list_remove_selected(dlg, ID_LEARNED_LIST) {
+                        if let Some((p, _)) = d.learned.get(i) {
+                            d.forgotten.push(p.clone());
+                        }
                     }
                     update_buttons(dlg);
                 }
@@ -262,16 +268,17 @@ unsafe extern "system" fn proc(dlg: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> i
 
 struct Pick {
     entries: Vec<(String, String)>,
-    chosen: Option<String>,
+    chosen: Option<(String, String)>,
 }
 
 /// Second dialog: choose from running apps. Returns the process name.
-unsafe fn pick(parent: HWND, d: &Dlg) -> Option<String> {
+unsafe fn pick(parent: HWND, d: &Dlg) -> Option<(String, String)> {
     let own = std::env::current_exe()
         .ok()
         .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_lowercase()))
         .unwrap_or_default();
-    let excl = list_all(parent, ID_EXCL_LIST);
+    let excl: Vec<String> =
+        list_data(parent, ID_EXCL_LIST).into_iter().filter_map(|i| d.excl.get(i).map(|e| e.0.clone())).collect();
     let mut st = Pick { entries: picker_entries((d.running)(), &excl, &own), chosen: None };
     DialogBoxParamW(
         GetModuleHandleW(std::ptr::null()),
@@ -289,11 +296,8 @@ unsafe extern "system" fn pick_proc(dlg: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             SetWindowLongPtrW(dlg, GWLP_USERDATA, lp);
             if let Some(st) = (lp as *mut Pick).as_ref() {
                 for (p, t) in &st.entries {
-                    list_add(dlg, ID_PICK_LIST, &format!("{p} – {t}"));
+                    list_add(dlg, ID_PICK_LIST, &display_label(p, t), 0);
                 }
-                // Horizontal scroll range for long titles: 700 px at 96 DPI, scaled to the window.
-                let ext = 700 * GetDpiForWindow(dlg).max(96) as usize / 96;
-                SendDlgItemMessageW(dlg, ID_PICK_LIST, LB_SETHORIZONTALEXTENT, ext, 0);
                 if !st.entries.is_empty() {
                     SendDlgItemMessageW(dlg, ID_PICK_LIST, LB_SETCURSEL, 0, 0);
                 }
@@ -308,7 +312,7 @@ unsafe extern "system" fn pick_proc(dlg: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                 let sel = SendDlgItemMessageW(dlg, ID_PICK_LIST, LB_GETCURSEL, 0, 0);
                 if let Some(st) = (GetWindowLongPtrW(dlg, GWLP_USERDATA) as *mut Pick).as_mut() {
                     if sel >= 0 {
-                        st.chosen = st.entries.get(sel as usize).map(|e| e.0.clone());
+                        st.chosen = st.entries.get(sel as usize).cloned();
                     }
                 }
                 EndDialog(dlg, IDOK as isize);
@@ -324,16 +328,25 @@ unsafe extern "system" fn pick_proc(dlg: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
     }
 }
 
-/// Process name + title of every running app window (candidates only).
+/// One row per running app process: (process, readable name). The name comes from the exe's
+/// version info, else the title of its first window, else it is empty.
 pub fn running_apps() -> Vec<(String, String)> {
     use crate::core::WindowSystem;
     let ws = crate::windowing::system::Win32Windows::new();
-    ws.app_windows()
-        .into_iter()
-        .map(|w| {
-            let mut buf = [0u16; 200];
-            let n = unsafe { GetWindowTextW(w, buf.as_mut_ptr(), buf.len() as i32) };
-            (ws.process(w).0, String::from_utf16_lossy(&buf[..n.max(0) as usize]))
+    let mut seen: Vec<(String, u32, String)> = Vec::new();
+    for w in ws.app_windows() {
+        let (p, pid) = ws.process(w);
+        if p.is_empty() || seen.iter().any(|s| s.0 == p) {
+            continue;
+        }
+        let mut buf = [0u16; 200];
+        let n = unsafe { GetWindowTextW(w, buf.as_mut_ptr(), buf.len() as i32) };
+        seen.push((p, pid, String::from_utf16_lossy(&buf[..n.max(0) as usize])));
+    }
+    seen.into_iter()
+        .map(|(p, pid, title)| {
+            let name = ws.app_name(pid);
+            (p, if name.is_empty() { title } else { name })
         })
         .collect()
 }

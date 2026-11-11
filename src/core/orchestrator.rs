@@ -400,6 +400,8 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
         let stamp = self.ws.exe_stamp(pid);
         if self.learned.fail(process, class, reason, &stamp) {
             self.note(format!("learned: {process} {class} blocked ({})", reason.name()));
+            let name = self.ws.app_name(pid);
+            self.learned.set_name(process, &name);
         }
     }
 

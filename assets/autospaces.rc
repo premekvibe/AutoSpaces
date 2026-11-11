@@ -54,8 +54,8 @@ STYLE DS_SHELLFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSM
 CAPTION "Vyloučit aplikaci"
 FONT 9, "MS Shell Dlg", 400, 0, 1
 BEGIN
-    LTEXT           "Aplikace s otevřeným oknem (proces – titulek):", -1, 6, 6, 228, 10
-    LISTBOX         150, 6, 18, 228, 128, LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | WS_BORDER | WS_VSCROLL | WS_HSCROLL | WS_TABSTOP
+    LTEXT           "Aplikace s otevřeným oknem:", -1, 6, 6, 228, 10
+    LISTBOX         150, 6, 18, 228, 128, LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | WS_BORDER | WS_VSCROLL | WS_TABSTOP
     DEFPUSHBUTTON   "Vyloučit", 1, 128, 150, 50, 14
     PUSHBUTTON      "Storno", 2, 184, 150, 50, 14
 END

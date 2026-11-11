@@ -138,8 +138,17 @@ fn load_settings() -> Settings {
 /// Opens the settings dialog and applies the result at once.
 fn open_settings(hwnd: HWND) {
     let Some(o) = orch() else { return };
-    let learned = o.learned_mut().list_blocked();
-    let current = o.settings.clone();
+    // Names of apps that run right now fill gaps in old records (version info is read here,
+    // when the dialog opens, never on the event path).
+    let running = settings_dlg::running_apps();
+    let mut current = o.settings.clone();
+    for (p, n) in &running {
+        if current.is_excluded(p) && !current.names.contains_key(p) {
+            current.set_name(p, n);
+        }
+        o.learned_mut().set_name(p, n);
+    }
+    let learned = o.learned_mut().list_named();
     // Modal; events keep flowing meanwhile, so the orchestrator is looked up again afterwards.
     let Some(out) = settings_dlg::show(&current, learned, settings_dlg::running_apps) else { return };
     let Some(o) = orch() else { return };
@@ -333,8 +342,11 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
         }
         tray::WM_TRAY => {
             if lp as u32 == WM_RBUTTONUP {
-                let names = orch().map(|o| o.learned_mut().list_blocked()).unwrap_or_default();
-                match tray::show_menu(hwnd, &names) {
+                let named = orch().map(|o| o.learned_mut().list_named()).unwrap_or_default();
+                let names: Vec<String> = named.iter().map(|(p, _)| p.clone()).collect();
+                let labels: Vec<String> =
+                    named.iter().map(|(p, n)| core::settings::display_label(p, n)).collect();
+                match tray::show_menu(hwnd, &labels) {
                     tray::CMD_TOGGLE => {
                         let on = !tray::ENABLED.fetch_xor(true, Relaxed);
                         if let Some(o) = orch() {
