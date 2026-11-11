@@ -484,3 +484,105 @@ Notepad, Edge, Chrome (F11), Firefox, Průzkumník, VS Code (Electron), Kalkula�
 - [ ] Zvážit, zda nepoužít `IVirtualDesktopNotification` místo polling/registry.
 - [ ] Posoudit fallback (5.2) – existuje lepší veřejný způsob přesunu cizího okna?
 - [ ] Zhodnotit odhady a pořadí fází.
+
+---
+
+## 12. Revize 3 – správa počtu ploch, nastavení, instalátor, O aplikaci
+
+Stav: fáze 0–4 hotové (viz git log). Tato kapitola má přednost před staršími částmi plánu, kde si odporují (zejména 6.3 „vypůjčená plocha se nemaže“ a pravidlo „mazat jen plochy, které aplikace vytvořila“).
+
+### 12.1 Pravidla správy ploch (zadání uživatele)
+
+Pojmy:
+- **Obsazená plocha** = je na ní aspoň jedno okno aplikace (viditelné i minimalizované; stejný filtr jako `is_candidate`). Okna vyloučených aplikací se počítají také. Okna připnutá na všechny plochy se nepočítají.
+- **Výchozí počet B** = počet ploch při startu aplikace (bez pomocných ploch převzatých ze `state.json`). Uživatel ručně přidá plochu → B+1; ručně smaže → B−1 (min. 1). Ruční změna = změna seznamu ploch, kterou aplikace sama neprovedla.
+
+Invarianty (vynucuje „kompakce“, spouští se po každé události, která může změnit obsazenost: zánik/skrytí/objevení okna, přesun okna, výstup spravovaného okna, změna seznamu ploch):
+1. **Plocha 1 se nikdy nemaže**, i když je prázdná.
+2. **Žádná prázdná plocha mezi obsazenými**: prázdná plocha (kromě první), za kterou je ještě nějaká obsazená, se smaže; následující se tím posunou.
+3. **Počet ploch ≥ B**: klesne-li pod B, přidají se prázdné plochy na konec. (Smazání mezery při počtu = B tedy znamená „smaž a vytvoř novou na konci“.)
+4. **Počet ploch ≤ max(B, index poslední obsazené)**: prázdné plochy na konci nad B se mažou.
+5. Prázdné plochy tedy existují jen na konci a jen do počtu B.
+
+Přepnutí při smazání plochy, na kterou se uživatel dívá: cíl = původní plocha okna, jehož odchodem se plocha vyprázdnila (spravované okno → `ResolveOrigin`); jinak předchozí plocha v pořadí. Použít `remove(plocha, cíl)` – jedno volání.
+
+Maximalizace: okno jde na první prázdnou plochu (jsou jen na konci), jinak se vytvoří nová na konci. Návrat (zmenšení/minimalizace): okno zpět na původní plochu, pak kompakce. Rychlá cesta z 6.3 (jedno `remove`) zůstává tam, kde plocha po odchodu okna stejně zanikne.
+
+Prodleva: kompakce vyvolaná zánikem/skrytím okna se provede po `empty_desktop_grace_ms` (výchozí 300 ms) a jen pokud je plocha stále prázdná – jinak by plochu smazala aplikace, která zavírá úvodní okno a vzápětí otevírá hlavní. Výstup spravovaného okna (restore/minimize) prodlevu nemá.
+
+Příklad (B = 3): `1 okna | 2 okna | 3 prázdná` → max. A → `… | 3 A` → max. B → `… | 3 A | 4 B` → zavřena všechna okna na 2 → `1 okna | 2 A | 3 B` → zavřeno A i B → `1 okna | 2 prázdná | 3 prázdná`.
+
+Důsledky: příznak `borrowed` a nastavení `reuse_empty_desktops` ztrácejí smysl (nahrazuje je B). Je potřeba sledovat i nespravovaná okna (události SHOW/HIDE/DESTROY už chodí), ale stále bez slovníku všech oken – při kompakci se okna jednou vyjmenují.
+
+### 12.2 Nastavení (dialog) – plán
+Nativní Win32 dialog (šablona v .rc, `DialogBoxParamW`, vzniká jen na vyžádání → žádná paměť navíc v klidu), otevírá se z nabídky ikony. Soubor `%APPDATA%\AutoSpaces\settings.json`; stav, naučený seznam a log zůstávají v `%LOCALAPPDATA%\AutoSpaces`.
+- **Co spouští přesun**: (a) všechna maximalizovaná okna i fullscreen (výchozí), (b) jen fullscreen (např. F11 v prohlížeči).
+- **Výjimky**: seznam procesů, které se nikdy nepřesouvají; přidání výběrem ze seznamu právě běžících aplikací (název procesu + titulek okna) nebo ručně; odebrání. Okna výjimek zůstávají, kde jsou, dokud je uživatel nepřesune sám.
+- **Naučené výjimky**: zobrazení a mazání (dnes v nabídce ikony), přepínač učení.
+- Spouštět po startu Windows; animované přepnutí; prodleva mazání prázdné plochy.
+
+### 12.3 Instalátor – plán
+Inno Setup, jeden `setup.exe`: `PrivilegesRequired=lowest` + `PrivilegesRequiredOverridesAllowed=dialog`.
+- Výchozí: instalace pro aktuálního uživatele do `%LOCALAPPDATA%\Programs\AutoSpaces` (bez práv správce).
+- Volitelně: pro všechny uživatele do `Program Files\AutoSpaces` (vyžádá práva správce).
+- Zástupce v nabídce Start, volitelně spouštění po startu (HKCU Run / HKLM Run), odinstalace ukončí běžící aplikaci (`AppMutex`), nastavení v profilu uživatele se při aktualizaci zachová; při odinstalaci dotaz, zda je smazat.
+- Verze z `Cargo.toml` → VERSIONINFO v exe → instalátor. Podpis exe i instalátoru.
+
+### 12.4 O aplikaci – plán
+Nativní dialog z nabídky ikony: ikona, název, verze (`CARGO_PKG_VERSION`), autor, odkaz na web/GitHub, možnosti podpory (donate) ve stejné podobě jako v aplikaci Kolik platím (odkazy otevřít přes `ShellExecuteW`).
+
+### 12.5 Upravené fáze
+| Fáze | Obsah | Stav |
+|---|---|---|
+| 0–4 | kostra, plochy, logika, naučený seznam, ikona | hotovo |
+| 4b | správa počtu ploch podle 12.1 | probíhá |
+| 5 | settings.json + dialog Nastavení (12.2), spouštění po startu | čeká |
+| 6 | dialog O aplikaci (12.4), VERSIONINFO | čeká |
+| 7 | instalátor (12.3) | čeká |
+| 8 | záložní režim pro neznámé verze Windows (5.2) | čeká |
+| 9 | testy na dalších verzích Windows, podpis, vydání | čeká |
+
+### 12.6 Podklady pro O aplikaci (zjištěno v projektu kolikplatim)
+Kolik platím nemá samostatné okno O aplikaci, jen blok podpory na hlavní stránce (`src/components/SubscriptionApp.tsx`, texty v `src/lib/i18n.tsx`):
+- Autor: odkaz „autora“ na `https://www.premysl-vavrousek.cz` (jméno v kódu vypsané není → do dialogu doplnit podle uživatele).
+- Podpora 1: BTC přes Lightning Network na adresu `premek.v@bitlifi.com` (odkaz `lightning:premek.v@bitlifi.com`).
+- Podpora 2: „účet“ – dialog s QR kódem (`src/assets/donate-qr.png`); číslo účtu je jen v obrázku. Pro AutoSpaces převzít stejný obrázek (vložit do exe jako prostředek, nebo otevřít z webu).
+- Verze se tam nezobrazuje; v AutoSpaces bude z `CARGO_PKG_VERSION`.
+- **Rozhodnuto uživatelem (2026-11-11):** autor v dialogu = „Přemysl Vavroušek“; QR obrázek převzat do `assets/donate-qr.png`.
+
+### 12.7 Rozložení ploch po startu („profil ploch“) – plán
+
+Cíl: v nastavení určit, kolik ploch má po startu existovat a které aplikace se na kterých mají otevřít (např. plocha 2 – Outlook, plocha 3 – TradingView).
+
+**Nastavení (záložka „Plochy“ v dialogu 12.2):**
+- Počet ploch po startu `N` (stane se výchozím počtem B z 12.1).
+- Tabulka pravidel: plocha č. | název plochy (jen Win11) | aplikace | argumenty | spustit při startu | vždy držet na této ploše. Více aplikací na jedné ploše je možné.
+- Výběr aplikace: z běžících oken, z nabídky Start (i aplikace ze Storu přes `shell:AppsFolder\<AUMID>`), nebo procházením k .exe.
+- Tlačítko **Převzít současné rozložení**: z aktuálně otevřených oken vytvoří pravidla.
+- Prodleva po přihlášení (výchozí 5 s), aby se aplikace nespouštěly do nenaběhlého systému.
+
+**Formát (`settings.json`):**
+```json
+"layout": { "desktopCount": 3, "startDelayMs": 5000, "rules": [
+  { "desktop": 2, "name": "Pošta",  "launch": "olk.exe",         "args": "", "match": { "process": "olk.exe" },                 "runAtStart": true, "keepOnDesktop": true },
+  { "desktop": 3, "name": "Trhy",   "launch": "TradingView.exe", "args": "", "match": { "process": "tradingview.exe", "title": "" }, "runAtStart": true, "keepOnDesktop": false } ] }
+```
+
+**Postup při startu:**
+1. Zajistit počet ploch ≥ N (`create` na konci), případně je pojmenovat (`SetDesktopName`, jen kde ho varianta má).
+2. Pro každé pravidlo s `runAtStart`: pokud okno odpovídající `match` už existuje, jen ho přesunout; jinak spustit (`ShellExecuteW`) a čekat na první vyhovující okno (událost SHOW, bez dotazování; časový limit 30 s).
+3. Okno přesunout na cílovou plochu (`move_window`), plochu nepřepínat. Uživatel zůstává na ploše 1.
+4. Neúspěch (limit vypršel, okno nejde přesunout) zapsat do logu a ukázat v dialogu u pravidla; nepočítá se do naučeného seznamu.
+
+**Souhra s pravidly 12.1:**
+- **Plochy z profilu jsou pevné** – chovají se jako plocha 1: nemažou se, ani když jsou prázdné nebo uprostřed. Pomocné plochy pro maximalizovaná okna vznikají až za nimi a pro ně pravidla 12.1 platí dál.
+- Okno aplikace z profilu se ze své přiřazené plochy při maximalizaci nepřesouvá (má plochu „svou“).
+- `keepOnDesktop`: každé další okno té aplikace, které se objeví jinde, se přesune na její plochu.
+- Dokud běží spouštění podle profilu, kompakce je pozastavená.
+
+**Rizika / k ověření:**
+- Párování okna s aplikací: spouštěč často skončí a okno patří jinému procesu (Outlook `olk.exe`, aplikace ze Storu, webové aplikace v Edge/Chrome) → párovat podle názvu procesu + volitelně části titulku, ne podle PID.
+- Aplikace s jedinou instancí, které už běží; aplikace obnovující více oken; aplikace spuštěné jako správce (nelze přesunout).
+- TradingView existuje jako desktopová aplikace i jako web v prohlížeči – druhý případ potřebuje párování podle titulku.
+
+**Zařazení:** nová fáze 5b (po dialogu Nastavení, před O aplikaci). Odhad 2–3 dny.

@@ -6,7 +6,7 @@ pub mod orchestrator;
 pub mod settings;
 pub mod state;
 
-pub use model::{Event, ManagedSpace, Schedule, State, WindowSystem};
+pub use model::{Event, Schedule, State, WindowSystem};
 pub use orchestrator::Orchestrator;
 pub use settings::Settings;
 

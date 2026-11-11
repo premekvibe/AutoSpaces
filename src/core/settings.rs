@@ -8,7 +8,9 @@ pub struct Settings {
     pub fullscreen_settle_ms: u32,
     pub trigger_on_maximize: bool,
     pub trigger_on_fullscreen: bool,
-    pub reuse_empty_desktops: bool,
+    /// A window that vanishes may be replaced at once (splash -> main window): wait this long
+    /// before deleting the desktop it leaves empty (plan 12.1).
+    pub empty_desktop_grace_ms: u32,
     /// Self-learning block list (plan 6.7); false = nothing recorded, nothing blocked.
     pub learning: bool,
     /// Days after which softly blocked apps (Flapping, ShortLived) are tried again.
@@ -24,7 +26,7 @@ impl Default for Settings {
             fullscreen_settle_ms: 60,
             trigger_on_maximize: true,
             trigger_on_fullscreen: true,
-            reuse_empty_desktops: true,
+            empty_desktop_grace_ms: 300,
             learning: true,
             learned_retry_days: 30,
         }

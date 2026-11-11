@@ -206,8 +206,19 @@ impl Learned for Rec {
     fn forget_all(&mut self) {}
 }
 
+/// One foreign window on every desktop: no empty desktop exists, so entering creates one.
+fn fill(w: &World) {
+    let n = w.count();
+    for i in 1..=n {
+        let hw = w.open(900 + i, State::Normal);
+        w.wins.borrow_mut().get_mut(&(900 + i)).unwrap().desktop = g(i as u32);
+        let _ = hw;
+    }
+}
+
 fn setup(n: u32) -> (Rc<World>, Orchestrator<FB, FW>, Log) {
     let w = World::new(n);
+    fill(&w);
     let mut o = Orchestrator::new(FB(w.clone()), FW(w.clone()), old());
     let log: Log = Rc::default();
     o.set_learned(Box::new(Rec(log.clone())));
@@ -563,7 +574,7 @@ fn adopt_removes_empty_desktops_and_readopts_live_windows() {
     // "Restart": a new orchestrator; window 2 died meanwhile.
     w.set_state(2, State::Destroyed);
     let mut o2 = Orchestrator::new(FB(w.clone()), FW(w.clone()), old());
-    o2.adopt(stored);
+    o2.adopt(stored, None);
     assert!(o2.is_managed(h(1)));
     assert!(!o2.is_managed(h(2)));
     assert_eq!(w.count(), 3); // the dead window's desktop is gone
@@ -571,7 +582,7 @@ fn adopt_removes_empty_desktops_and_readopts_live_windows() {
     let stored = o2.snapshot();
     w.set_state(1, State::Normal);
     let mut o3 = Orchestrator::new(FB(w.clone()), FW(w.clone()), old());
-    o3.adopt(stored);
+    o3.adopt(stored, None);
     assert!(!o3.is_managed(h(1)));
     assert_eq!(w.count(), 2);
 }
@@ -589,121 +600,345 @@ fn non_candidate_is_rejected_and_pinned_window_is_skipped() {
 }
 
 fn old() -> Settings {
-    Settings { reuse_empty_desktops: false, ..Settings::default() }
+    Settings::default()
 }
 
-fn setup_reuse(n: u32) -> (Rc<World>, Orchestrator<FB, FW>) {
-    let w = World::new(n);
-    let o = Orchestrator::new(FB(w.clone()), FW(w.clone()), Settings::default());
-    (w, o)
+type Orch = Orchestrator<FB, FW>;
+
+/// A fresh orchestrator "started" on the current world (baseline = desktop count).
+fn started(w: &Rc<World>) -> Orch {
+    let mut o = Orchestrator::new(FB(w.clone()), FW(w.clone()), Settings::default());
+    o.adopt(Vec::new(), None);
+    o
+}
+
+/// Places window `id` (a normal, visible one) on desktop `d`.
+fn put(w: &World, id: usize, d: u32) -> HWND {
+    let hw = w.open(id, State::Normal);
+    w.wins.borrow_mut().get_mut(&id).unwrap().desktop = g(d);
+    hw
+}
+
+fn list(w: &World) -> Vec<u32> {
+    w.desktops.borrow().iter().map(|d| d.d1).collect()
+}
+
+/// A window disappears: Destroy event, then the grace timer.
+fn vanish(w: &World, o: &mut Orch, id: usize) {
+    w.set_state(id, State::Destroyed);
+    let sch = ev(w, o, id, Event::Destroy).expect("grace timer requested");
+    assert!(sch.hwnd.is_null());
+    assert_eq!(sch.delay_ms, 300);
+    w.tick(300);
+    o.on_event(sch.hwnd, Event::Recheck);
 }
 
 #[test]
-fn empty_desktop_is_reused_without_create() {
-    let (w, mut o) = setup_reuse(2);
+fn worked_example_plan_12_1() {
+    // B = 3: 1 windows | 2 windows | 3 empty
+    let w = World::new(3);
+    put(&w, 10, 1);
+    put(&w, 20, 2);
+    put(&w, 21, 2);
+    let mut o = started(&w);
+    assert_eq!((o.baseline(), list(&w)), (3, vec![1, 2, 3]));
+    // maximize A (from desktop 2) -> first empty desktop is 3
+    w.current.set(g(2));
     w.open(1, State::Maximized);
+    w.wins.borrow_mut().get_mut(&1).unwrap().desktop = g(2);
     ev(&w, &mut o, 1, Loc);
-    assert_eq!((w.creates.get(), w.count()), (0, 2));
-    assert_eq!((w.current.get(), w.desk_of(1)), (g(2), g(2)));
-    assert!(o.snapshot()[0].borrowed);
-}
-
-#[test]
-fn borrowed_desktop_survives_restore_and_close() {
-    let (w, mut o) = setup_reuse(2);
-    w.open(1, State::Maximized);
-    ev(&w, &mut o, 1, Loc);
-    w.set_state(1, State::Normal);
-    ev(&w, &mut o, 1, Loc);
-    assert_eq!((w.count(), w.current.get(), w.desk_of(1)), (2, g(1), g(1)));
-    w.set_state(1, State::Maximized);
-    ev(&w, &mut o, 1, Loc);
-    assert_eq!(w.current.get(), g(2));
+    assert_eq!((list(&w), w.desk_of(1).d1, w.current.get().d1), (vec![1, 2, 3], 3, 3));
+    // maximize B (from desktop 2) -> a new desktop 4
+    w.current.set(g(2));
+    w.open(2, State::Maximized);
+    w.wins.borrow_mut().get_mut(&2).unwrap().desktop = g(2);
+    ev(&w, &mut o, 2, Loc);
+    assert_eq!((list(&w), w.desk_of(2).d1, w.current.get().d1), (vec![1, 2, 3, 4], 4, 4));
+    // all windows on 2 closed (the user is on 4): gap 2 is removed -> 1 windows | A | B
+    for id in [20, 21] {
+        w.set_state(id, State::Destroyed);
+    }
+    w.tick(1000);
+    o.on_event(h(0), Event::Recheck);
+    assert_eq!(list(&w), vec![1, 3, 4]);
+    assert_eq!((w.desk_of(1).d1, w.desk_of(2).d1, w.current.get().d1), (3, 4, 4));
+    // A and B closed: 1 windows | empty | empty (B = 3 kept, nothing above)
     w.set_state(1, State::Destroyed);
     ev(&w, &mut o, 1, Event::Destroy);
-    assert_eq!((w.count(), w.current.get()), (2, g(1)));
-    assert_eq!(w.creates.get(), 0);
+    w.set_state(2, State::Destroyed);
+    ev(&w, &mut o, 2, Event::Destroy);
+    assert_eq!(w.count(), 3);
+    assert_eq!(w.current.get(), w.desktops.borrow()[0]); // switched to the origin
+    assert!(o.snapshot().is_empty());
 }
 
 #[test]
-fn borrowed_not_viewed_stays_and_others_keep_it() {
-    let (w, mut o) = setup_reuse(2);
+fn desktop_one_is_never_removed_even_when_empty() {
+    let w = World::new(3);
+    put(&w, 1, 2);
+    put(&w, 2, 3);
+    let mut o = started(&w);
+    w.tick(1000);
+    o.on_event(h(0), Event::Recheck);
+    assert_eq!(list(&w), vec![1, 2, 3]); // #1 empty but kept, no gap, count == B
+    assert_eq!((w.desk_of(1).d1, w.desk_of(2).d1), (2, 3));
+}
+
+#[test]
+fn gap_at_baseline_is_removed_and_recreated_at_the_end() {
+    let w = World::new(3);
+    put(&w, 1, 1);
+    put(&w, 2, 3);
+    let mut o = started(&w);
+    o.on_event(h(0), Event::Recheck);
+    // desktop 2 was a gap: removed, a new empty one appended; count stays B
+    assert_eq!((w.count(), w.creates.get()), (3, 1));
+    assert_eq!(list(&w), vec![1, 3, 4]);
+    assert_eq!((w.desk_of(1).d1, w.desk_of(2).d1), (1, 3));
+}
+
+#[test]
+fn trailing_empties_above_baseline_go_at_or_below_stay() {
+    let w = World::new(2);
+    put(&w, 1, 1);
+    let mut o = started(&w);
+    assert_eq!(o.baseline(), 2);
+    // Two extra desktops appear without us noticing (as if left over): absorbed as manual -> B = 4
+    w.desktops.borrow_mut().push(g(7));
+    w.desktops.borrow_mut().push(g(8));
+    o.poll();
+    assert_eq!((o.baseline(), w.count()), (4, 4));
+    // The user deletes them again by hand: B shrinks back and nothing is recreated.
+    w.user_delete(g(7));
+    w.user_delete(g(8));
+    o.poll();
+    assert_eq!((o.baseline(), w.count()), (2, 2));
+    // Above B: 2 takes the empty desktop 2, 3 needs a new desktop 3 (count 3 > B = 2).
+    put(&w, 2, 1);
+    w.current.set(g(1));
+    w.wins.borrow_mut().get_mut(&2).unwrap().state = State::Maximized;
+    ev(&w, &mut o, 2, Loc);
+    w.current.set(g(1));
+    put(&w, 3, 1);
+    w.wins.borrow_mut().get_mut(&3).unwrap().state = State::Maximized;
+    ev(&w, &mut o, 3, Loc);
+    assert_eq!((w.count(), w.desk_of(2).d1, w.desk_of(3).d1), (3, 2, 3));
+    // The last one leaves: its desktop is trailing and above B -> removed.
+    w.set_state(3, State::Normal);
+    ev(&w, &mut o, 3, Loc);
+    assert_eq!(list(&w), vec![1, 2]);
+    // The next one leaves: trailing, but count == B -> kept (empty).
+    w.set_state(2, State::Normal);
+    ev(&w, &mut o, 2, Loc);
+    assert_eq!(list(&w), vec![1, 2]);
+}
+
+#[test]
+fn several_trailing_empties_above_baseline_are_all_removed() {
+    let w = World::new(2);
+    put(&w, 9, 1);
+    let mut o = started(&w);
+    for id in 1..=4 {
+        w.open(id, State::Maximized);
+        w.current.set(g(1));
+        w.wins.borrow_mut().get_mut(&id).unwrap().desktop = g(1);
+        ev(&w, &mut o, id, Loc);
+    }
+    assert_eq!(w.count(), 5);
+    for id in 1..=4 {
+        w.set_state(id, State::Destroyed); // gone without us seeing the events
+    }
+    o.on_event(h(0), Event::Recheck);
+    assert_eq!(list(&w), vec![1, 2]);
+}
+
+#[test]
+fn viewed_desktop_removal_goes_to_origin_for_managed_exit_else_previous() {
+    // Managed exit: origin d2, helper d4 (B = 2, so it is doomed); user views d4.
+    let w = World::new(2);
+    put(&w, 9, 1);
+    let mut o = started(&w);
+    w.current.set(g(2));
     w.open(1, State::Maximized);
+    w.wins.borrow_mut().get_mut(&1).unwrap().desktop = g(2);
+    put(&w, 8, 2); // another window stays on d2
     ev(&w, &mut o, 1, Loc);
-    w.current.set(g(1)); // user looks elsewhere
+    assert_eq!((w.count(), w.desk_of(1).d1, w.current.get().d1), (3, 3, 3));
     w.set_state(1, State::Normal);
     ev(&w, &mut o, 1, Loc);
-    assert_eq!((w.count(), w.current.get(), w.desk_of(1)), (2, g(1), g(1)));
+    assert_eq!((list(&w), w.desk_of(1).d1, w.current.get().d1), (vec![1, 2], 2, 2));
+    // Non-managed: user views a middle desktop that empties -> previous desktop.
+    let w = World::new(3);
+    put(&w, 1, 1);
+    put(&w, 2, 2);
+    put(&w, 3, 3);
+    let mut o = started(&w);
+    w.current.set(g(2));
+    vanish(&w, &mut o, 2);
+    assert_eq!((list(&w), w.current.get().d1), (vec![1, 3, 4], 1));
+    // The same for the managed window being minimized while its origin is gone: previous desktop.
+    assert_eq!(w.desk_of(3).d1, 3);
 }
 
 #[test]
-fn non_empty_and_origin_desktops_are_skipped() {
-    let (w, mut o) = setup_reuse(3);
-    w.open(9, State::Normal);
-    w.wins.borrow_mut().get_mut(&9).unwrap().desktop = g(2); // d2 busy
-    w.open(1, State::Maximized); // origin d1 (empty of others but is origin)
+fn grace_timer_keeps_desktop_when_window_reappears() {
+    let w = World::new(3);
+    put(&w, 1, 1);
+    put(&w, 2, 2);
+    put(&w, 3, 3);
+    let mut o = started(&w);
+    w.set_state(2, State::Destroyed);
+    let sch = ev(&w, &mut o, 2, Event::Destroy).expect("timer");
+    assert_eq!((w.count(), w.creates.get()), (3, 0)); // nothing happens before the grace ends
+    assert_eq!(list(&w), vec![1, 2, 3]);
+    // The app opens its main window on that desktop within the grace.
+    put(&w, 4, 2);
+    w.tick(300);
+    o.on_event(sch.hwnd, Event::Recheck);
+    assert_eq!((list(&w), w.creates.get()), (vec![1, 2, 3], 0));
+    // Without a replacement the gap goes (and one appears at the end: B = 3).
+    vanish(&w, &mut o, 4);
+    assert_eq!(list(&w), vec![1, 3, 4]);
+}
+
+#[test]
+fn window_shown_on_later_desktop_removes_gap_at_once() {
+    let w = World::new(3);
+    put(&w, 1, 1);
+    let mut o = started(&w);
+    assert_eq!(list(&w), vec![1, 2, 3]);
+    w.current.set(g(3));
+    put(&w, 2, 3);
+    w.tick(1000);
+    o.on_event(h(2), Event::Show); // no timer involved
+    assert_eq!(list(&w), vec![1, 3, 4]);
+    // A non-candidate window being shown does nothing.
+    w.wins.borrow_mut().get_mut(&2).unwrap().candidate = false;
+    put(&w, 3, 4);
+    w.wins.borrow_mut().get_mut(&3).unwrap().candidate = false;
+    let before = w.creates.get();
+    o.on_event(h(3), Event::Show);
+    assert_eq!(w.creates.get(), before);
+}
+
+#[test]
+fn manual_add_raises_baseline_manual_remove_lowers_it_not_below_one() {
+    let w = World::new(2);
+    put(&w, 1, 1);
+    put(&w, 2, 2);
+    let mut o = started(&w);
+    assert_eq!(o.baseline(), 2);
+    w.desktops.borrow_mut().push(g(9)); // the user adds a desktop
+    o.poll();
+    assert_eq!((o.baseline(), w.count()), (3, 3)); // kept (empty, within B)
+    w.user_delete(g(9));
+    o.poll();
+    assert_eq!((o.baseline(), w.count()), (2, 2));
+    // Occupied desktop deleted by hand: B-1, its windows moved to #1 by the fake.
+    w.user_delete(g(2));
+    o.poll();
+    assert_eq!((o.baseline(), w.count()), (1, 1));
+    w.user_delete(g(1)); // would leave none; the fake allows it, B stays at 1
+    o.poll();
+    assert_eq!(o.baseline(), 1);
+    // Our own changes are never mistaken for manual ones.
+    let w = World::new(2);
+    let mut o = started(&w);
+    w.open(1, State::Maximized);
     ev(&w, &mut o, 1, Loc);
-    assert_eq!((w.creates.get(), w.desk_of(1)), (0, g(3)));
-    // Now d1 is empty again but is the origin of the next window on d1.
-    let (w, mut o) = setup_reuse(2);
-    w.open(1, State::Maximized);
-    w.current.set(g(1));
-    w.wins.borrow_mut().get_mut(&1).unwrap().desktop = g(2);
-    w.open(2, State::Maximized); // on d1? current d1
-    w.wins.borrow_mut().get_mut(&2).unwrap().desktop = g(1);
-    w.wins.borrow_mut().get_mut(&1).unwrap().state = State::Normal;
-    w.wins.borrow_mut().get_mut(&1).unwrap().desktop = g(2);
-    ev(&w, &mut o, 2, Loc); // d2 busy, d1 is origin -> create
-    assert_eq!(w.creates.get(), 1);
+    o.poll();
+    assert_eq!(o.baseline(), 2);
 }
 
 #[test]
-fn desktop_of_another_managed_space_is_never_chosen() {
-    let (w, mut o) = setup_reuse(3);
+fn startup_compaction_and_baseline() {
+    // 1 | gap | 3(window) | 4(empty): B = 4 at start; the gap is removed and one created.
+    let w = World::new(4);
+    put(&w, 1, 1);
+    put(&w, 2, 3);
+    let o = started(&w);
+    assert_eq!((o.baseline(), w.count()), (4, 4));
+    assert_eq!(list(&w), vec![1, 3, 4, 5]);
+    // Restart after a crash: stored B is used, the re-adopted helper is not counted twice.
+    let w = World::new(2);
+    let mut o1 = started(&w);
     w.open(1, State::Maximized);
-    ev(&w, &mut o, 1, Loc); // borrows d2, user now on d2
-    w.current.set(g(1));
-    // Make d2 look empty (window minimised away from it), still managed.
-    w.wins.borrow_mut().get_mut(&1).unwrap().state = State::Minimized;
-    w.open(2, State::Maximized);
-    ev(&w, &mut o, 2, Loc);
-    assert_eq!(w.desk_of(2), g(3)); // d2 skipped, empty d3 borrowed
-    w.open(3, State::Maximized);
-    w.current.set(g(1));
-    w.wins.borrow_mut().get_mut(&3).unwrap().desktop = g(1);
-    ev(&w, &mut o, 3, Loc);
-    assert_eq!(w.creates.get(), 1);
-}
-
-#[test]
-fn setting_off_keeps_old_behaviour() {
-    let (w, mut o, _) = setup(2);
-    w.open(1, State::Maximized);
-    ev(&w, &mut o, 1, Loc);
-    assert_eq!((w.creates.get(), w.count()), (1, 3));
-    assert!(!o.snapshot()[0].borrowed);
-}
-
-#[test]
-fn borrowed_rollback_keeps_desktop() {
-    let (w, mut o) = setup_reuse(2);
-    w.open(1, State::Maximized);
-    w.move_noop.set(true);
-    ev(&w, &mut o, 1, Loc);
-    assert_eq!((w.count(), w.creates.get(), w.desk_of(1)), (2, 0, g(1)));
-}
-
-#[test]
-fn adopt_never_removes_borrowed() {
-    let (w, mut o) = setup_reuse(2);
-    w.open(1, State::Maximized);
-    ev(&w, &mut o, 1, Loc);
-    let stored = o.snapshot();
-    w.set_state(1, State::Destroyed);
+    ev(&w, &mut o1, 1, Loc); // takes the empty desktop 2 (B = 2, count stays 2)
+    assert_eq!((w.count(), o1.baseline()), (2, 2));
+    let (stored, b) = (o1.snapshot(), o1.baseline());
     let mut o2 = Orchestrator::new(FB(w.clone()), FW(w.clone()), Settings::default());
-    o2.adopt(stored);
-    assert_eq!(w.count(), 2);
-    assert!(!o2.is_managed(h(1)));
+    o2.adopt(stored.clone(), Some(b));
+    assert!(o2.is_managed(h(1)));
+    assert_eq!((o2.baseline(), w.count()), (2, 2));
+    // Without a stored B (old file): count minus re-adopted helpers.
+    let mut o3 = Orchestrator::new(FB(w.clone()), FW(w.clone()), Settings::default());
+    o3.adopt(stored, None);
+    assert_eq!(o3.baseline(), 1);
+    // The window died meanwhile: its desktop is removed, compaction recreates up to B.
+    w.set_state(1, State::Destroyed);
+    let mut o4 = Orchestrator::new(FB(w.clone()), FW(w.clone()), Settings::default());
+    o4.adopt(o2.snapshot(), Some(2));
+    assert_eq!((o4.baseline(), w.count()), (2, 2));
+}
+
+#[test]
+fn excluded_and_foreign_windows_count_as_occupied() {
+    let w = World::new(3);
+    put(&w, 1, 1);
+    put(&w, 2, 2); // e.g. a blocked/excluded process: never moved, but occupies desktop 2
+    put(&w, 3, 3);
+    w.wins.borrow_mut().get_mut(&3).unwrap().state = State::Minimized;
+    let mut o = started(&w);
+    assert_eq!((list(&w), w.creates.get()), (vec![1, 2, 3], 0));
+    // A pinned window does not occupy anything.
+    put(&w, 4, 3);
+    w.wins.borrow_mut().get_mut(&4).unwrap().desktop = Guid::ZERO;
+    w.set_state(3, State::Destroyed);
+    w.tick(1000);
+    o.on_event(h(0), Event::Recheck);
+    assert_eq!(list(&w), vec![1, 2, 3]); // 3 emptied (trailing, count == B): kept; pinned one ignored
+    let _ = o;
+}
+
+#[test]
+fn enter_and_exit_keep_empty_trailing_desktop_without_remove_create_churn() {
+    let w = World::new(2);
+    put(&w, 9, 1);
+    let mut o = started(&w);
+    w.open(1, State::Maximized);
+    ev(&w, &mut o, 1, Loc);
+    assert_eq!((w.creates.get(), list(&w), w.current.get().d1), (0, vec![1, 2], 2));
+    w.set_state(1, State::Normal);
+    ev(&w, &mut o, 1, Loc);
+    // d2 is the trailing empty desktop within B: kept, not removed and re-created.
+    assert_eq!((w.creates.get(), list(&w), w.current.get().d1, w.desk_of(1).d1), (0, vec![1, 2], 1, 1));
+    // Close in the helper: the user is moved to the origin, the empty desktop stays.
+    w.set_state(1, State::Maximized);
+    ev(&w, &mut o, 1, Loc);
+    w.set_state(1, State::Destroyed);
+    ev(&w, &mut o, 1, Event::Destroy);
+    assert_eq!((w.creates.get(), list(&w), w.current.get().d1), (0, vec![1, 2], 1));
+}
+
+#[test]
+fn compaction_never_counts_the_moved_window_twice_or_not_at_all() {
+    // The only window of d1 is maximized: d1 becomes empty but is #1, so it stays; the window
+    // is counted on its helper exactly once and nothing else is removed.
+    let w = World::new(2);
+    let mut o = started(&w);
+    w.open(1, State::Maximized);
+    ev(&w, &mut o, 1, Loc);
+    assert_eq!((list(&w), w.desk_of(1).d1), (vec![1, 2], 2));
+    // The only window of d2 is maximized: it already has a desktop to itself -> left alone.
+    let w = World::new(2);
+    put(&w, 9, 1);
+    put(&w, 1, 2);
+    let mut o = started(&w);
+    w.current.set(g(2));
+    w.wins.borrow_mut().get_mut(&1).unwrap().state = State::Maximized;
+    ev(&w, &mut o, 1, Loc);
+    assert_eq!((list(&w), w.desk_of(1).d1, o.is_managed(h(1)), o.is_rejected(h(1))), (vec![1, 2], 2, false, true));
+    let _ = o;
 }
 
 // ---------------------------------------------------------------- learned list
@@ -713,6 +948,7 @@ use std::rc::Rc as R;
 
 fn setup_store(n: u32) -> (Rc<World>, Orchestrator<FB, FW>, Rc<Cell<u64>>) {
     let w = World::new(n);
+    fill(&w);
     let mut o = Orchestrator::new(FB(w.clone()), FW(w.clone()), old());
     let t = R::new(Cell::new(1_800_000_000u64));
     let t2 = t.clone();
@@ -823,4 +1059,106 @@ fn flapping_learns_after_three_but_not_after_user_input() {
         w.set_state(1, State::Maximized);
     }
     assert_eq!(o.learned_mut().list_blocked(), ["app.exe"]);
+}
+
+#[test]
+fn windows_maximized_at_startup_are_ignored_until_restored() {
+    let w = World::new(3);
+    put(&w, 9, 1);
+    put(&w, 1, 1);
+    w.set_state(1, State::Maximized);
+    let mut o = started(&w);
+    ev(&w, &mut o, 1, Loc);
+    assert_eq!((w.creates.get(), o.is_managed(h(1)), o.is_rejected(h(1))), (0, false, true));
+    assert_eq!(w.desk_of(1).d1, 1);
+    // The user restores and maximizes again: handled normally (first empty desktop, not #1).
+    w.set_state(1, State::Normal);
+    ev(&w, &mut o, 1, Loc);
+    w.set_state(1, State::Maximized);
+    ev(&w, &mut o, 1, Loc);
+    assert!(o.is_managed(h(1)));
+    assert_eq!(w.desk_of(1).d1, 2);
+    // Tray toggle off -> maximize -> on: the window is left alone.
+    w.set_state(1, State::Normal);
+    ev(&w, &mut o, 1, Loc);
+    o.set_enabled(false);
+    put(&w, 2, 1);
+    w.set_state(2, State::Maximized);
+    o.set_enabled(true);
+    ev(&w, &mut o, 2, Loc);
+    assert!(!o.is_managed(h(2)) && o.is_rejected(h(2)));
+}
+
+#[test]
+fn window_alone_on_its_desktop_is_not_moved_but_alone_on_desktop_one_is() {
+    let w = World::new(3);
+    put(&w, 1, 2);
+    let mut o = started(&w);
+    w.set_state(1, State::Maximized);
+    w.current.set(g(2));
+    ev(&w, &mut o, 1, Loc);
+    assert!(!o.is_managed(h(1)) && o.is_rejected(h(1)));
+    assert_eq!((list(&w), w.creates.get()), (vec![1, 2, 3], 0));
+    // Not a learned-list strike either.
+    let (w, mut o, log) = setup(3);
+    w.wins.borrow_mut().remove(&902);
+    put(&w, 1, 2);
+    w.set_state(1, State::Maximized);
+    ev(&w, &mut o, 1, Loc);
+    assert!(log.borrow().is_empty() && !o.is_managed(h(1)));
+    // Alone on #1: entered.
+    let w = World::new(3);
+    put(&w, 1, 1);
+    let mut o = started(&w);
+    w.set_state(1, State::Maximized);
+    ev(&w, &mut o, 1, Loc);
+    assert!(o.is_managed(h(1)));
+}
+
+#[test]
+fn desktop_one_is_never_a_helper_even_when_empty() {
+    let w = World::new(2);
+    put(&w, 9, 2);
+    put(&w, 1, 2);
+    let mut o = started(&w);
+    w.current.set(g(2));
+    w.set_state(1, State::Maximized);
+    ev(&w, &mut o, 1, Loc);
+    assert_eq!((w.desk_of(1).d1, w.creates.get()), (3, 1)); // d1 is empty but skipped
+}
+
+#[test]
+fn give_back_all_restores_windows_switches_and_compacts() {
+    let w = World::new(2);
+    put(&w, 9, 1);
+    put(&w, 8, 2);
+    let mut o = started(&w);
+    w.current.set(g(2));
+    for id in [1, 2] {
+        put(&w, id, 2);
+        w.set_state(id, State::Maximized);
+        ev(&w, &mut o, id, Loc);
+    }
+    assert_eq!(w.count(), 4);
+    o.give_back_all();
+    assert_eq!((w.desk_of(1).d1, w.desk_of(2).d1, w.current.get().d1), (2, 2, 2));
+    assert_eq!(list(&w), vec![1, 2]);
+    assert!(o.snapshot().is_empty() && o.take_dirty());
+    // Origin vanished: falls back to the previous desktop.
+    let w = World::new(3);
+    put(&w, 9, 1);
+    put(&w, 7, 3);
+    put(&w, 8, 2);
+    let mut o = started(&w);
+    put(&w, 1, 2);
+    w.current.set(g(2));
+    w.set_state(1, State::Maximized);
+    ev(&w, &mut o, 1, Loc);
+    assert!(o.is_managed(h(1)));
+    w.set_state(8, State::Destroyed);
+    w.user_delete(g(2)); // the user removes the origin desktop; the fake sends windows to #1
+    w.wins.borrow_mut().get_mut(&1).unwrap().desktop = w.last();
+    o.give_back_all();
+    assert_eq!(w.desk_of(1).d1, 1);
+    assert_eq!(w.current.get().d1, 1);
 }

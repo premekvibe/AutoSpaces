@@ -11,13 +11,19 @@ use crate::core::{Event, Orchestrator, Schedule, Settings};
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
 use windows_sys::Win32::Foundation::{
-    GetLastError, ERROR_ALREADY_EXISTS, HWND, LPARAM, LRESULT, WPARAM,
+    GetLastError, ERROR_ALREADY_EXISTS, HANDLE, HWND, LPARAM, LRESULT, WAIT_OBJECT_0, WPARAM,
 };
+use windows_sys::Win32::System::Registry::{
+    RegCloseKey, RegNotifyChangeKeyValue, RegOpenKeyExW, HKEY, HKEY_CURRENT_USER, KEY_NOTIFY,
+    REG_NOTIFY_CHANGE_LAST_SET,
+};
+use windows_sys::Win32::System::Threading::CreateEventW;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, KillTimer,
-    PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SetTimer, TranslateMessage, MSG,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, KillTimer,
+    MsgWaitForMultipleObjectsEx, PeekMessageW, PostQuitMessage, RegisterClassW, MWMO_INPUTAVAILABLE,
+    PM_REMOVE, QS_ALLINPUT, WM_QUIT, RegisterWindowMessageW, SetTimer, TranslateMessage, MSG,
     WM_DESTROY, WM_RBUTTONUP, WM_TIMER, WNDCLASSW,
 };
 use windowing::system::Win32Windows;
@@ -35,6 +41,35 @@ static mut TIMERS: Vec<(usize, HWND)> = Vec::new();
 
 const TIMER_BASE: usize = 100;
 const TIMER_REINIT: usize = 1;
+/// Signalled by RegNotifyChangeKeyValue when the virtual-desktop registry key changes (plan 12.1).
+static mut REG_EVENT: HANDLE = std::ptr::null_mut();
+static mut REG_KEY: HKEY = std::ptr::null_mut();
+
+const VD_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Explorer\VirtualDesktops";
+
+/// (Re-)arms the asynchronous registry notification.
+unsafe fn arm_reg_notify() {
+    let key = *std::ptr::addr_of!(REG_KEY);
+    let ev = *std::ptr::addr_of!(REG_EVENT);
+    if !key.is_null() && !ev.is_null() {
+        RegNotifyChangeKeyValue(key, 0, REG_NOTIFY_CHANGE_LAST_SET, ev, 1);
+    }
+}
+
+unsafe fn init_reg_notify() {
+    let mut key: HKEY = std::ptr::null_mut();
+    if RegOpenKeyExW(HKEY_CURRENT_USER, tray::wide(VD_KEY).as_ptr(), 0, KEY_NOTIFY, &mut key) != 0 {
+        return;
+    }
+    let ev = CreateEventW(std::ptr::null(), 0, 0, std::ptr::null());
+    if ev.is_null() {
+        RegCloseKey(key);
+        return;
+    }
+    *std::ptr::addr_of_mut!(REG_KEY) = key;
+    *std::ptr::addr_of_mut!(REG_EVENT) = ev;
+    arm_reg_notify();
+}
 const REINIT_TRIES: u32 = 20;
 static REINIT_LEFT: AtomicU32 = AtomicU32::new(0);
 
@@ -104,19 +139,53 @@ fn new_orchestrator(b: desktops::InternalBackend) -> Orch {
     o
 }
 
+fn flush_state(o: &mut Orch) {
+    if o.take_dirty() {
+        if let Some(dir) = app_dir() {
+            let tmp = dir.join("state.json.tmp");
+            if std::fs::write(&tmp, core::state::to_json(&o.snapshot(), o.baseline())).is_ok() {
+                let _ = std::fs::rename(&tmp, dir.join("state.json"));
+            }
+        }
+    }
+}
+
+/// `--restore`: gives every managed window back without starting the tray.
+fn restore_cli() -> i32 {
+    use desktops::DesktopBackend;
+    let mut out = Vec::new();
+    let _apartment = desktops::Apartment::init();
+    let code = match init_backend() {
+        None => {
+            out.push("no desktop backend; nothing done".to_string());
+            1
+        }
+        Some(b) => {
+            let mut o = new_orchestrator(b);
+            let count = |o: &Orch| o.backend().desktops().map_or(0, |l| l.len());
+            out.push(format!("desktops before: {}", count(&o)));
+            let st = load_state();
+            out.push(format!("state.json: {} managed window(s), baseline {:?}", st.spaces.len(), st.baseline));
+            o.adopt(st.spaces, st.baseline);
+            o.give_back_all();
+            out.extend(o.drain_log());
+            flush_state(&mut o);
+            out.push(format!("desktops after: {} (baseline {})", count(&o), o.baseline()));
+            0
+        }
+    };
+    if let Some(dir) = app_dir() {
+        let _ = std::fs::write(dir.join("restore.txt"), out.join("\n") + "\n");
+    }
+    code
+}
+
 /// Writes `state.json` (managed spaces) when it changed; logs the orchestrator's notes.
 fn after_orchestrator(hwnd: HWND, o: &mut Orch, sch: Option<Schedule>) {
     for l in o.drain_log() {
         log_line(&l);
     }
-    if o.take_dirty() {
-        if let Some(dir) = app_dir() {
-            let tmp = dir.join("state.json.tmp");
-            if std::fs::write(&tmp, core::state::to_json(&o.snapshot())).is_ok() {
-                let _ = std::fs::rename(&tmp, dir.join("state.json"));
-            }
-        }
-    }
+    flush_state(o);
     if let Some(s) = sch {
         schedule(hwnd, s);
     }
@@ -173,7 +242,8 @@ fn reinit_backend(main: HWND) {
                 }
                 None => {
                     let mut o = new_orchestrator(b);
-                    o.adopt(load_state());
+                    let st = load_state();
+                    o.adopt(st.spaces, st.baseline);
                     *std::ptr::addr_of_mut!(ORCH) = Some(o);
                 }
             }
@@ -191,16 +261,17 @@ fn reinit_backend(main: HWND) {
     }
 }
 
-fn load_state() -> Vec<crate::core::ManagedSpace> {
+fn load_state() -> core::state::Stored {
+    let none = || core::state::Stored { spaces: Vec::new(), baseline: None };
     let Some(dir) = app_dir() else {
-        return Vec::new();
+        return none();
     };
     match std::fs::read_to_string(dir.join("state.json")) {
         Ok(t) => core::state::from_json(&t).unwrap_or_else(|e| {
             log_line(&format!("state.json ignored: {e}"));
-            Vec::new()
+            none()
         }),
-        Err(_) => Vec::new(),
+        Err(_) => none(),
     }
 }
 
@@ -223,10 +294,14 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                     tray::CMD_TOGGLE => {
                         let on = !tray::ENABLED.fetch_xor(true, Relaxed);
                         if let Some(o) = orch() {
-                            o.settings.enabled = on;
+                            o.set_enabled(on);
                         }
                     }
                     tray::CMD_EXIT => {
+                        if let Some(o) = orch() {
+                            o.give_back_all();
+                            after_orchestrator(hwnd, o, None);
+                        }
                         DestroyWindow(hwnd);
                     }
                     tray::CMD_FORGET_ALL => {
@@ -278,6 +353,16 @@ fn main() {
         drop(apartment);
         std::process::exit(code);
     }
+    if std::env::args().nth(1).as_deref() == Some("--restore") {
+        let mutex = unsafe { CreateMutexW(std::ptr::null(), 0, tray::wide("Local\\AutoSpaces_SingleInstance").as_ptr()) };
+        if mutex.is_null() || unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+            if let Some(dir) = app_dir() {
+                let _ = std::fs::write(dir.join("restore.txt"), "autospaces is running; exit it from the tray first\n");
+            }
+            std::process::exit(2);
+        }
+        std::process::exit(restore_cli());
+    }
     unsafe {
         let mutex = CreateMutexW(
             std::ptr::null(),
@@ -324,7 +409,8 @@ fn main() {
         match init_backend() {
             Some(b) => {
                 let mut o = new_orchestrator(b);
-                o.adopt(load_state());
+                let st = load_state();
+                o.adopt(st.spaces, st.baseline);
                 *std::ptr::addr_of_mut!(ORCH) = Some(o);
                 if let Some(o) = orch() {
                     after_orchestrator(hwnd, o, None);
@@ -337,12 +423,30 @@ fn main() {
         }
 
         tray::add(hwnd);
+        init_reg_notify();
         *std::ptr::addr_of_mut!(WATCHER) = Some(watcher::Watcher::start(hwnd));
 
         let mut msg: MSG = std::mem::zeroed();
-        while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
+        'run: loop {
+            let ev = *std::ptr::addr_of!(REG_EVENT);
+            let handles = [ev];
+            let n = if ev.is_null() { 0 } else { 1 };
+            let r = MsgWaitForMultipleObjectsEx(n, handles.as_ptr(), u32::MAX, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+            if n == 1 && r == WAIT_OBJECT_0 {
+                arm_reg_notify();
+                if let Some(o) = orch() {
+                    o.poll();
+                    after_orchestrator(hwnd, o, None);
+                }
+                continue;
+            }
+            while PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+                if msg.message == WM_QUIT {
+                    break 'run;
+                }
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
         }
         // Release COM proxies before the apartment is torn down.
         *std::ptr::addr_of_mut!(ORCH) = None;

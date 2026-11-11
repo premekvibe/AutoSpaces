@@ -1,5 +1,6 @@
-//! Space orchestrator (plan 6.3): enters a helper desktop when a window is maximized /
-//! fullscreen and returns it to its origin desktop when the state ends.
+//! Space orchestrator (plan 6.3, plan 12.1): enters a helper desktop when a window is
+//! maximized / fullscreen, returns it to its origin desktop when the state ends, and keeps the
+//! global number of desktops tidy ("compaction": no gaps, never below the baseline B).
 
 use super::learned::{FailReason, Learned, NoLearned};
 use super::model::{Event, ManagedSpace, Schedule, State, WindowSystem};
@@ -37,6 +38,12 @@ pub struct Orchestrator<B: DesktopBackend, W: WindowSystem> {
     /// Desktops we created but could not roll back yet.
     leaked: Vec<Guid>,
     retries: HashMap<HWND, u8>,
+    /// Baseline B (plan 12.1): the number of desktops the user wants to have; 0 = not known yet.
+    baseline: usize,
+    /// The desktop list as this app last left it; any other list means the user changed it.
+    last_list: Vec<Guid>,
+    /// A manual list change was absorbed; compaction is still owed (done by the next poll).
+    need_compact: bool,
     dirty: bool,
     /// Backend is being re-initialised (Explorer restart): nothing is learned meanwhile.
     reinit: bool,
@@ -58,6 +65,9 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
             tombstones: Vec::new(),
             leaked: Vec::new(),
             retries: HashMap::new(),
+            baseline: 0,
+            last_list: Vec::new(),
+            need_compact: false,
             dirty: false,
             reinit: false,
             log: Vec::new(),
@@ -70,6 +80,40 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
     }
     pub fn learned_mut(&mut self) -> &mut dyn Learned {
         &mut *self.learned
+    }
+    /// Maximized/fullscreen windows that exist right now are left alone until the user
+    /// restores them (startup, or the tray toggle going from off to on).
+    pub fn reject_existing(&mut self) {
+        for w in self.ws.app_windows() {
+            if !self.by_window.contains_key(&w) && matches!(self.ws.state(w), State::Maximized | State::Fullscreen) {
+                self.rejected.insert(w);
+            }
+        }
+    }
+    /// Tray toggle.
+    pub fn set_enabled(&mut self, on: bool) {
+        if on && !self.settings.enabled {
+            self.reject_existing();
+        }
+        self.settings.enabled = on;
+    }
+    /// Gives every managed window back to its (resolved) origin, switches there when the user
+    /// is viewing a helper desktop, then compacts. Leaves the managed list empty.
+    pub fn give_back_all(&mut self) {
+        let Some(list) = self.sync_list() else { return };
+        let all = self.snapshot();
+        let targets: Vec<Guid> = all.iter().map(|sp| self.resolve_origin(sp.origin, &list)).collect();
+        for (sp, target) in all.iter().zip(targets) {
+            if self.ws.is_alive(sp.hwnd, sp.pid) && self.backend.move_window(sp.hwnd, target).is_ok() {
+                self.note(format!("restore {:#x} {} -> {target}", sp.hwnd as usize, sp.process));
+            }
+            if self.backend.current().ok() == Some(sp.desktop) {
+                let _ = self.backend.switch(target, false);
+            }
+            self.forget(sp, false);
+            self.rejected.insert(sp.hwnd);
+        }
+        self.compact(None);
     }
     /// Tray: forget one process (or all when `None`); rejected windows get another chance.
     pub fn forget_learned(&mut self, process: Option<&str>) {
@@ -106,6 +150,10 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
     pub fn is_rejected(&self, hwnd: HWND) -> bool {
         self.rejected.contains(&hwnd)
     }
+    /// Baseline desktop count B (0 until known).
+    pub fn baseline(&self) -> usize {
+        self.baseline
+    }
     /// True once since the managed set changed (host then rewrites `state.json`).
     pub fn take_dirty(&mut self) -> bool {
         std::mem::take(&mut self.dirty)
@@ -130,6 +178,9 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
 
     /// Handles one window event. Returns a timer request for the host, if any.
     pub fn on_event(&mut self, hwnd: HWND, ev: Event) -> Option<Schedule> {
+        if hwnd.is_null() {
+            return self.on_grace(); // the (window-less) grace timer of a disappeared window
+        }
         match ev {
             Event::MoveSizeStart => {
                 self.dragging = Some(hwnd);
@@ -150,7 +201,47 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
             return None;
         }
         self.retry_leaked();
-        self.evaluate(hwnd, ev)
+        let managed = self.by_window.contains_key(&hwnd);
+        let sch = self.evaluate(hwnd, ev);
+        if managed || self.by_window.contains_key(&hwnd) || !self.settings.enabled {
+            return sch; // managed windows compact on their own enter/exit
+        }
+        match ev {
+            // Cannot tell whether a vanished window was a candidate: check after the grace.
+            Event::Destroy | Event::Hide if sch.is_none() => Some(Schedule {
+                hwnd: std::ptr::null_mut(),
+                delay_ms: self.settings.empty_desktop_grace_ms.max(10),
+            }),
+            // A window opening on a later desktop can turn an earlier empty one into a gap.
+            Event::Show if self.ws.is_candidate(hwnd) => {
+                self.compact(None);
+                sch
+            }
+            _ => sch,
+        }
+    }
+
+    /// The grace timer fired: compact if the desktop is still empty.
+    fn on_grace(&mut self) -> Option<Schedule> {
+        if self.settings.enabled {
+            self.compact(None);
+        }
+        None
+    }
+
+    /// Periodic cheap check (host timer): detects manual desktop-list changes and compacts.
+    pub fn poll(&mut self) {
+        if self.reinit || self.baseline == 0 {
+            return;
+        }
+        if let Ok(list) = self.backend.desktops() {
+            if list != self.last_list {
+                self.absorb(&list);
+            }
+        }
+        if self.need_compact && self.settings.enabled {
+            self.compact(None);
+        }
     }
 
     fn evaluate(&mut self, hwnd: HWND, ev: Event) -> Option<Schedule> {
@@ -240,25 +331,33 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
             Some(g) => g,
             None => cur,
         };
+        // Alone on a desktop that is not #1: it already has a desktop to itself.
+        if let Some(list) = self.sync_list() {
+            if list.first() != Some(&origin) && !self.occupancy(Some(hwnd)).contains(&origin) {
+                self.note(format!("skip {:#x}: alone on its desktop", hwnd as usize));
+                self.rejected.insert(hwnd);
+                return None;
+            }
+        }
         let viewing = cur == origin;
-        let (d, borrowed) = match self.find_empty(origin) {
-            Some(d) => (d, true),
-            None => (self.backend.create().ok()?, false),
+        let (d, created) = match self.find_empty(origin) {
+            Some(d) => (d, false),
+            None => (self.do_create().ok()?, true),
         };
         if let Err(e) = self.backend.move_window(hwnd, d) {
-            self.rollback(hwnd, d, origin, borrowed);
+            self.rollback(hwnd, d, origin, created);
             if !e.is_transient() {
                 self.reject(hwnd, &process, &class, pid, fail_reason(e, FailReason::MoveFailed(e.hr())));
             }
             return None;
         }
         if self.backend.window_desktop(hwnd) != Some(d) {
-            self.rollback(hwnd, d, origin, borrowed);
+            self.rollback(hwnd, d, origin, created);
             self.reject(hwnd, &process, &class, pid, FailReason::MoveNotApplied);
             return None;
         }
         if viewing && self.backend.switch(d, self.settings.switch_animation).is_err() {
-            self.rollback(hwnd, d, origin, borrowed);
+            self.rollback(hwnd, d, origin, created);
             return None;
         }
         self.ws.activate(hwnd);
@@ -267,10 +366,12 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
         self.spaces
             .insert(
             d,
-            ManagedSpace { desktop: d, hwnd, pid, origin, entered_at, process, class, borrowed, fullscreen },
+            ManagedSpace { desktop: d, hwnd, pid, origin, entered_at, process, class, fullscreen },
         );
         self.by_window.insert(hwnd, d);
         self.dirty = true;
+        // The origin may have become an empty gap; the window now sits on `d` (counted once).
+        self.compact(None);
         self.lock(hwnd)
     }
 
@@ -291,32 +392,24 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
         }
     }
 
-    /// An existing empty desktop (not the origin, not ours) to reuse, in desktop order.
-    /// One window enumeration, and only when there is more than one desktop.
-    fn find_empty(&self, origin: Guid) -> Option<Guid> {
-        if !self.settings.reuse_empty_desktops {
-            return None;
-        }
-        let list = self.backend.desktops().ok()?;
+    /// The first empty desktop (never #1, not the origin, not held by another managed space), in order.
+    /// Empty desktops only exist at the end (plan 12.1); None means "create one".
+    fn find_empty(&mut self, origin: Guid) -> Option<Guid> {
+        let list = self.sync_list()?;
         if list.len() < 2 {
             return None;
         }
-        let used: HashSet<Guid> = self
-            .ws
-            .app_windows()
-            .into_iter()
-            .filter_map(|w| self.backend.window_desktop(w))
-            .collect();
-        list.into_iter().find(|d| *d != origin && !self.spaces.contains_key(d) && !used.contains(d))
+        let occ = self.occupancy(None);
+        list.into_iter().skip(1).find(|d| *d != origin && !self.spaces.contains_key(d) && !occ.contains(d))
     }
 
-    /// Undo a failed enter. A borrowed desktop is never removed, only emptied again.
-    fn rollback(&mut self, hwnd: HWND, d: Guid, fallback: Guid, borrowed: bool) {
-        if borrowed {
+    /// Undo a failed enter: a desktop we created is removed, a reused one just emptied again.
+    fn rollback(&mut self, hwnd: HWND, d: Guid, fallback: Guid, created: bool) {
+        if !created {
             let _ = self.backend.move_window(hwnd, fallback);
             return;
         }
-        if self.backend.remove(d, fallback).is_err() {
+        if self.do_remove(d, fallback).is_err() {
             self.leaked.push(d);
         }
     }
@@ -334,11 +427,143 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
                 if self.count_on(d, None) > 0 {
                     continue; // someone is using it now; leave it alone
                 }
-                if self.backend.remove(d, cur).is_err() {
+                if self.do_remove(d, cur).is_err() {
                     self.leaked.push(d);
                 }
             }
         }
+    }
+
+    // ------------------------------------------------------------ desktop count management
+
+    /// Creates a desktop; the resulting list is our own doing, not a manual change.
+    fn do_create(&mut self) -> Result<Guid, Error> {
+        let d = self.backend.create()?;
+        self.refresh_last();
+        Ok(d)
+    }
+
+    fn do_remove(&mut self, d: Guid, fallback: Guid) -> Result<(), Error> {
+        self.backend.remove(d, fallback)?;
+        self.refresh_last();
+        Ok(())
+    }
+
+    fn refresh_last(&mut self) {
+        if let Ok(l) = self.backend.desktops() {
+            self.last_list = l;
+        }
+    }
+
+    /// Reads the desktop list and absorbs manual changes into B first.
+    fn sync_list(&mut self) -> Option<Vec<Guid>> {
+        let list = self.backend.desktops().ok()?;
+        self.absorb(&list);
+        Some(list)
+    }
+
+    /// Plan 12.1: a list we did not leave behind is the user's doing: a new desktop raises B,
+    /// a removed one lowers it (min 1). Helper desktops of managed windows do not count.
+    fn absorb(&mut self, list: &[Guid]) {
+        if self.baseline == 0 {
+            self.baseline = list.len().max(1);
+            self.last_list = list.to_vec();
+            self.dirty = true;
+            return;
+        }
+        if self.last_list == list {
+            return;
+        }
+        let added = list.iter().filter(|d| !self.last_list.contains(d)).count();
+        let removed = self.last_list.iter().filter(|d| !list.contains(d) && !self.spaces.contains_key(d)).count();
+        let b = (self.baseline + added).saturating_sub(removed).max(1);
+        self.note(format!("desktops changed manually (+{added} -{removed}): baseline {} -> {b}", self.baseline));
+        self.baseline = b;
+        self.last_list = list.to_vec();
+        self.need_compact = true;
+        self.dirty = true;
+    }
+
+    /// Desktops holding at least one app window (excluding `exclude`), enumerated once, plus the
+    /// desktops of live managed windows. Pinned windows and windows whose desktop is unknown
+    /// (cloaked / foreign shell windows report none) do not count.
+    fn occupancy(&self, exclude: Option<HWND>) -> HashSet<Guid> {
+        let mut occ = HashSet::new();
+        for w in self.ws.app_windows() {
+            if Some(w) == exclude {
+                continue;
+            }
+            match self.backend.window_desktop(w) {
+                Some(g) if !g.is_zero() => {
+                    occ.insert(g);
+                }
+                _ => {}
+            }
+        }
+        for sp in self.spaces.values() {
+            if Some(sp.hwnd) != exclude && self.ws.is_alive(sp.hwnd, sp.pid) {
+                occ.insert(sp.desktop);
+            }
+        }
+        occ
+    }
+
+    /// Invariants 1-5 of plan 12.1. `hint` = (desktop, where to go) for the case that the
+    /// desktop the user is viewing is removed because a managed window just left it.
+    fn compact(&mut self, hint: Option<(Guid, Guid)>) {
+        self.need_compact = false;
+        let Some(mut list) = self.sync_list() else { return };
+        let mut cur = self.backend.current().ok();
+        let occ = self.occupancy(None);
+        // Pass 1: empty desktops followed by an occupied one (#1 is never removed).
+        let mut i = 1;
+        while i < list.len() {
+            if !occ.contains(&list[i]) && list[i + 1..].iter().any(|x| occ.contains(x)) {
+                if !self.remove_at(&mut list, i, hint, &mut cur) {
+                    break;
+                }
+            } else {
+                i += 1;
+            }
+        }
+        // Pass 2: trailing empty desktops above B.
+        while list.len() > self.baseline.max(1) && list.last().is_some_and(|d| !occ.contains(d)) {
+            let last = list.len() - 1;
+            if !self.remove_at(&mut list, last, hint, &mut cur) {
+                break;
+            }
+        }
+        // Pass 3: never fewer than B.
+        while list.len() < self.baseline {
+            match self.do_create() {
+                Ok(d) => {
+                    self.note(format!("compact: created {d}"));
+                    list.push(d);
+                }
+                Err(_) => break,
+            }
+        }
+    }
+
+    /// Removes `list[k]` (k >= 1). A viewed desktop goes to the hint's target, else the previous one.
+    fn remove_at(&mut self, list: &mut Vec<Guid>, k: usize, hint: Option<(Guid, Guid)>, cur: &mut Option<Guid>) -> bool {
+        let d = list[k];
+        let target = match hint {
+            Some((hd, ht)) if hd == d && *cur == Some(d) && list.contains(&ht) && ht != d => ht,
+            _ => list[k - 1],
+        };
+        if self.do_remove(d, target).is_err() {
+            return false;
+        }
+        if self.spaces.values().any(|s| s.origin == d) || self.tombstones.iter().any(|t| t.1 == d) {
+            self.tombstone(d, list[k - 1]);
+        }
+        self.note(format!("compact: removed {d}"));
+        if *cur == Some(d) {
+            *cur = Some(target);
+        }
+        list.remove(k);
+        true
     }
 
     // ------------------------------------------------------------ exit
@@ -346,13 +571,20 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
     fn exit_space(&mut self, hwnd: HWND, d: Guid, closed: bool, state: State, list: &[Guid]) -> Option<Schedule> {
         let sp = self.spaces.get(&d)?.clone();
         let target = self.resolve_origin(sp.origin, list);
-        let others = self.count_on(d, Some(hwnd));
-        let res = if others == 0 && !sp.borrowed {
-            self.backend.remove(d, target) // one call: moves W, switches the view, deletes
+        let occ = self.occupancy(Some(hwnd));
+        let others = occ.contains(&d);
+        // Fast path (one call: moves W, switches the view, deletes) only where compaction
+        // would delete the helper desktop anyway: not #1, and above B or followed by a used one.
+        let doomed = !others
+            && list.first() != Some(&d)
+            && (list.len() > self.baseline.max(1)
+                || list.iter().skip_while(|x| **x != d).skip(1).any(|x| occ.contains(x)));
+        let res = if doomed {
+            self.do_remove(d, target)
         } else {
             let moved = if closed { Ok(()) } else { self.backend.move_window(hwnd, target) };
             moved.and_then(|()| match self.backend.current() {
-                Ok(c) if c == d && (sp.borrowed || self.settings.switch_back_when_others_remain) => {
+                Ok(c) if c == d && (!others || self.settings.switch_back_when_others_remain) => {
                     self.backend.switch(target, false)
                 }
                 Ok(_) => Ok(()),
@@ -373,7 +605,8 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
             }
         }
         self.note(format!("exit {:#x} closed={closed} others={others} -> {target}", hwnd as usize));
-        self.forget(&sp, others == 0 && !sp.borrowed);
+        self.forget(&sp, doomed);
+        self.compact(Some((d, target)));
         self.lock(hwnd)
     }
 
@@ -385,10 +618,9 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
         }
         let Some(sp) = self.spaces.get(&d).cloned() else { return };
         self.note(format!("{:#x} moved away from {d} to {cur}; released", hwnd as usize));
-        let empty = self.count_on(d, Some(hwnd)) == 0;
-        let removed = empty && !sp.borrowed && self.backend.remove(d, cur).is_ok();
-        self.forget(&sp, removed);
+        self.forget(&sp, false);
         self.rejected.insert(hwnd); // do not fight the user
+        self.compact(Some((d, cur))); // its helper desktop is an ordinary empty one now
     }
 
     /// Drops a managed entry; `desktop_gone` records a tombstone for ResolveOrigin.
@@ -430,7 +662,7 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
 
     /// Drops managed entries whose desktop no longer exists. `None` on backend error.
     pub fn reconcile(&mut self) -> Option<Vec<Guid>> {
-        let list = self.backend.desktops().ok()?;
+        let list = self.sync_list()?;
         let gone: Vec<Guid> = self.spaces.keys().filter(|d| !list.contains(d)).copied().collect();
         for d in gone {
             if let Some(sp) = self.spaces.get(&d).cloned() {
@@ -483,35 +715,46 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
 
     // ------------------------------------------------------------ startup
 
-    /// Plan 6.5: reconciles `state.json` contents with reality after a restart.
-    /// Empty helper desktops are removed, desktops whose window lives are re-adopted.
-    pub fn adopt(&mut self, stored: Vec<ManagedSpace>) {
-        let Some(list) = self.reconcile() else { return };
-        let mut adopted = Vec::new();
+    /// Plan 6.5 / 12.1: reconciles `state.json` contents with reality after a restart and
+    /// fixes the baseline B. Empty helper desktops are removed, desktops whose window lives are
+    /// re-adopted. After a crash (stored spaces exist) B is the stored one, else the current count.
+    pub fn adopt(&mut self, stored: Vec<ManagedSpace>, stored_baseline: Option<usize>) {
+        let Ok(list) = self.backend.desktops() else { return };
+        self.last_list = list.clone();
+        self.baseline = list.len().max(1);
+        let had_state = !stored.is_empty();
         for mut sp in stored {
             if !list.contains(&sp.desktop) {
                 continue;
             }
             if self.count_on(sp.desktop, None) == 0 {
-                if sp.borrowed {
-                    continue; // not ours to delete
-                }
                 let target = self.resolve_origin(sp.origin, &list);
-                let _ = self.backend.remove(sp.desktop, target);
+                let _ = self.do_remove(sp.desktop, target);
                 self.note(format!("startup: removed empty {}", sp.desktop));
                 continue;
             }
             if self.ws.is_alive(sp.hwnd, sp.pid) && self.backend.window_desktop(sp.hwnd) == Some(sp.desktop) {
                 sp.entered_at = self.ws.now();
-                adopted.push(sp.hwnd);
                 self.by_window.insert(sp.hwnd, sp.desktop);
                 self.spaces.insert(sp.desktop, sp);
             }
         }
+        self.refresh_last();
+        let count = self.last_list.len();
+        self.baseline = match stored_baseline {
+            Some(b) if had_state => b,
+            _ => count.saturating_sub(self.spaces.len()),
+        }
+        .max(1);
         self.dirty = true;
         // A window that was restored while we were not running leaves its space now.
+        let adopted: Vec<HWND> = self.by_window.keys().copied().collect();
         for h in adopted {
             let _ = self.evaluate(h, Event::Recheck);
+        }
+        self.reject_existing();
+        if self.settings.enabled {
+            self.compact(None);
         }
     }
 }

@@ -2,6 +2,9 @@
 # Run:  pwsh -NoProfile -STA -File testy\live.ps1
 # Builds nothing: expects target\release\autospaces.exe. Starts it with AUTOSPACES_LOG=1,
 # spawns ONE maximizable foreign window and checks maximize / restore / minimize / close.
+# Rules (plan 12.1): B = desktop count when the app starts. After every step the desktop count must
+# equal max(B, index of the last desktop holding an app window); a vanished origin desktop sends the
+# window / the user to the previous desktop. Only windows created by this script are touched.
 # Desktop state is read from the registry (HKCU\...\Explorer\VirtualDesktops) and the public
 # IVirtualDesktopManager.GetWindowDesktopId; latency = ShowWindow call -> expected state seen (5 ms poll).
 $ErrorActionPreference = 'Stop'
@@ -38,6 +41,10 @@ public static class AsLive {
   [DllImport("user32.dll")] static extern bool IsIconic(IntPtr h);
   [DllImport("user32.dll")] static extern bool ShowWindowAsync(IntPtr h, int cmd);
   [DllImport("user32.dll")] static extern bool PostMessage(IntPtr h, uint m, IntPtr w, IntPtr l);
+  [DllImport("user32.dll")] static extern int GetWindowTextLength(IntPtr h);
+  [DllImport("user32.dll", EntryPoint = "GetWindowLongW")] static extern int GetWindowLong(IntPtr h, int i);
+  [DllImport("user32.dll")] static extern IntPtr GetWindow(IntPtr h, uint cmd);
+  [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr h, StringBuilder s, int n);
 
   static IVDM vdm = (IVDM)new VDMClass();
   static RegistryKey key = Registry.CurrentUser.OpenSubKey(@"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\VirtualDesktops");
@@ -74,6 +81,39 @@ public static class AsLive {
 
   static int Idx(Guid[] ids, Guid g) { return Array.IndexOf(ids, g) + 1; }
 
+  public static int OrigIdx = 1;
+  // Index (1-based) of the last desktop holding a candidate window (same filter as the app).
+  public static int LastOcc(Guid[] ids) {
+    int last = 1;
+    EnumWindows((h, l) => {
+      if (!IsWindowVisible(h) || GetWindowTextLength(h) == 0) return true;
+      int style = GetWindowLong(h, -16); int ex = GetWindowLong(h, -20);
+      if ((style & 0x40000000) != 0 || (ex & 0x80) != 0) return true;
+      if (GetWindow(h, 4) != IntPtr.Zero && (ex & 0x40000) == 0) return true;
+      StringBuilder c = new StringBuilder(128); GetClassName(h, c, 128);
+      string cn = c.ToString();
+      if (cn == "Progman" || cn == "WorkerW" || cn == "Shell_TrayWnd" || cn == "Shell_SecondaryTrayWnd") return true;
+      int i = Idx(ids, WinDesk(h));
+      if (i > last) last = i;
+      return true;
+    }, IntPtr.Zero);
+    return last;
+  }
+  // Where the user / the window must be after an exit: the origin, or the desktop before it when it is gone.
+  static Guid Want(Guid[] ids, Guid origin) { return Array.IndexOf(ids, origin) >= 0 ? origin : ids[Math.Max(OrigIdx - 2, 0)]; }
+
+  // Waits until window h sits on a desktop other than 'origin' and 'other', count == max(B, last occupied).
+  public static long WaitMoved(IntPtr h, Guid other, Guid origin, int baseCount, int timeoutMs) {
+    Stopwatch sw = Stopwatch.StartNew(); string desc = "";
+    while (sw.ElapsedMilliseconds < timeoutMs) {
+      Guid[] ids = Ids(); Guid wd = WinDesk(h);
+      desc = "desktops=" + ids.Length + " window=#" + Idx(ids, wd);
+      if (wd != origin && wd != other && wd != Guid.Empty && ids.Length == Math.Max(baseCount, LastOcc(ids))) { Last = desc; return sw.ElapsedMilliseconds; }
+      Thread.Sleep(5);
+    }
+    Last = desc; return -1;
+  }
+
   // Performs the action (ShowWindow cmd, or close when cmd < 0) and polls every 5 ms until the
   // expected state shows up. Returns ms, or -1 on timeout. Last = description of the final state.
   public static long Run(IntPtr h, int cmd, bool entered, int baseCount, Guid origin, bool checkWin, int timeoutMs) {
@@ -85,8 +125,8 @@ public static class AsLive {
       Guid[] ids = Ids(); Guid cur = Cur(); Guid wd = checkWin ? WinDesk(h) : Guid.Empty;
       desc = "desktops=" + ids.Length + " current=#" + Idx(ids, cur) + (checkWin ? " window=#" + Idx(ids, wd) : "");
       bool good;
-      if (entered) good = (ids.Length == baseCount || ids.Length == baseCount + 1) && cur != origin && (!checkWin || wd == cur);
-      else good = ids.Length == baseCount && cur == origin && (!checkWin || wd == origin);
+      if (entered) good = cur != origin && (!checkWin || wd == cur) && ids.Length == Math.Max(baseCount, LastOcc(ids));
+      else { Guid want = Want(ids, origin); good = cur == want && (!checkWin || wd == want) && ids.Length == Math.Max(baseCount, LastOcc(ids)); }
       if (good) { ok = sw.ElapsedMilliseconds; break; }
       Thread.Sleep(5);
     }
@@ -102,21 +142,21 @@ function Report($name, $ms, $expect) {
   else { $script:fail++; Write-Host ("FAIL {0,-46} timeout    expected: {1}; got: {2}" -f $name, $expect, [AsLive]::Last) -ForegroundColor Red }
 }
 
-$asProc = $null; $winProc = $null; $hwnd = [IntPtr]::Zero
+$asProc = $null; $winProc = $null; $hwnd = [IntPtr]::Zero; $p1 = $null; $p2 = $null
 $baseCount = [AsLive]::Ids().Length
 $origin = [AsLive]::Cur()
 $logFile = Join-Path $env:LOCALAPPDATA 'AutoSpaces\log.txt'
 $logStart = if (Test-Path $logFile) { @(Get-Content $logFile).Count } else { 0 }
 
-function Start-TestWindow($kind) {
+function Start-TestWindow($kind, $t = $title) {
   if ($kind -eq 'conhost') {
-    $p = Start-Process conhost.exe -ArgumentList "cmd.exe /k title $title" -PassThru
+    $p = Start-Process conhost.exe -ArgumentList "cmd.exe /k title $t" -PassThru
   } else {
-    $cmd = "Add-Type -AssemblyName System.Windows.Forms; `$f = New-Object Windows.Forms.Form; `$f.Text = '$title'; `$f.Width = 640; `$f.Height = 400; [void]`$f.ShowDialog()"
+    $cmd = "Add-Type -AssemblyName System.Windows.Forms; `$f = New-Object Windows.Forms.Form; `$f.Text = '$t'; `$f.Width = 640; `$f.Height = 400; [void]`$f.ShowDialog()"
     $p = Start-Process powershell.exe -ArgumentList '-NoProfile', '-STA', '-Command', $cmd -PassThru
   }
   $h = [IntPtr]::Zero
-  for ($i = 0; $i -lt 100 -and $h -eq [IntPtr]::Zero; $i++) { Start-Sleep -Milliseconds 100; $h = [AsLive]::Find($title, $PID) }
+  for ($i = 0; $i -lt 100 -and $h -eq [IntPtr]::Zero; $i++) { Start-Sleep -Milliseconds 100; $h = [AsLive]::Find($t, $PID) }
   return @($p, $h)
 }
 
@@ -141,6 +181,7 @@ try {
   }
   Write-Host ("Test window ($kind) hwnd=0x{0:X} on desktop {1}" -f [int64]$hwnd, [AsLive]::WinDesk($hwnd))
   $origin = [AsLive]::WinDesk($hwnd)
+  [AsLive]::OrigIdx = [Array]::IndexOf([AsLive]::Ids(), $origin) + 1
   if ($origin -ne [AsLive]::Cur()) { Write-Host 'WARN: window is not on the current desktop' -ForegroundColor Yellow }
 
   # 2) AutoSpaces
@@ -148,30 +189,64 @@ try {
   $asProc = Start-Process $exe -PassThru
   Start-Sleep -Seconds 5
   $asProc.Refresh()
+  $startCount = $baseCount
+  $baseCount = [AsLive]::Ids().Length   # B as the app sees it: the count once its startup compaction has run
+  if ($baseCount -ne $startCount) { Write-Host "NOTE: startup compaction changed the desktop count $startCount -> $baseCount" -ForegroundColor Yellow }
   Write-Host ("autospaces idle after 5 s: private {0:N0} KB, working set {1:N0} KB" -f ($asProc.PrivateMemorySize64 / 1KB), ($asProc.WorkingSet64 / 1KB))
 
   # (a) maximize
   $ms = [AsLive]::Run($hwnd, 3, $true, $baseCount, $origin, $true, 3000)
-  Report '(a) maximize -> new desktop, window + current there' $ms 'window and current on a desktop other than origin (count unchanged if an empty one was reused, else +1)'
+  Report '(a) maximize -> new desktop, window + current there' $ms 'window and current on a desktop other than origin, count = max(B, last occupied)'
   Start-Sleep -Milliseconds 1200
   # (b) restore
   $ms = [AsLive]::Run($hwnd, 9, $false, $baseCount, $origin, $true, 3000)
-  Report '(b) restore -> back on origin, desktop removed' $ms 'count back, window and current on origin'
+  Report '(b) restore -> back on origin, desktop removed' $ms 'count = max(B, last occupied), window and current on origin'
   Start-Sleep -Milliseconds 1200
   # (c) maximize, minimize
   $ms = [AsLive]::Run($hwnd, 3, $true, $baseCount, $origin, $true, 3000)
-  Report '(c1) maximize again' $ms 'window and current on a desktop other than origin (count unchanged if an empty one was reused, else +1)'
+  Report '(c1) maximize again' $ms 'window and current on a desktop other than origin, count = max(B, last occupied)'
   Start-Sleep -Milliseconds 1200
   $ms = [AsLive]::Run($hwnd, 6, $false, $baseCount, $origin, $true, 3000)
-  Report '(c2) minimize -> back on origin, desktop removed' $ms 'count back, window and current on origin'
+  Report '(c2) minimize -> back on origin, desktop removed' $ms 'count = max(B, last occupied), window and current on origin'
   Start-Sleep -Milliseconds 1200
   # (d) maximize (from minimized), close
   $ms = [AsLive]::Run($hwnd, 3, $true, $baseCount, $origin, $true, 3000)
-  Report '(d1) maximize again (from minimized)' $ms 'window and current on a desktop other than origin (count unchanged if an empty one was reused, else +1)'
+  Report '(d1) maximize again (from minimized)' $ms 'window and current on a desktop other than origin, count = max(B, last occupied)'
   Start-Sleep -Milliseconds 1200
   $ms = [AsLive]::Run($hwnd, -1, $false, $baseCount, $origin, $false, 3000)
-  Report '(d2) close (WM_CLOSE) -> current on origin, desktop removed' $ms 'count back, current on origin'
-  Start-Sleep -Milliseconds 500
+  Report '(d2) close (WM_CLOSE) -> current on origin, desktop removed' $ms 'count = max(B, last occupied), current on origin'
+  Start-Sleep -Milliseconds 800
+
+  # (e) gap removal: two windows on their own desktops, the first one closes -> its desktop is a gap
+  $r = Start-TestWindow 'winforms' $title; $p1 = $r[0]; $h1 = $r[1]
+  $r = Start-TestWindow 'winforms' 'AutoSpacesLive2'; $p2 = $r[0]; $h2 = $r[1]
+  if ($h1 -eq [IntPtr]::Zero -or $h2 -eq [IntPtr]::Zero) { Write-Host 'SKIP (e): second test window not found' -ForegroundColor Yellow }
+  else {
+    $origin = [AsLive]::WinDesk($h1)
+    [AsLive]::OrigIdx = [Array]::IndexOf([AsLive]::Ids(), $origin) + 1
+    $ms = [AsLive]::Run($h1, 3, $true, $baseCount, $origin, $true, 3000)
+    Report '(e1) maximize window A -> own desktop' $ms 'A and current on a desktop other than origin'
+    Start-Sleep -Milliseconds 1200
+    [void][AsLive]::Show($h2, 3)
+    $ms = [AsLive]::WaitMoved($h2, [AsLive]::WinDesk($h1), $origin, $baseCount, 3000)
+    Report '(e2) maximize window B (from origin) -> its own desktop' $ms 'B on a third desktop, count = max(B, last occupied)'
+    Start-Sleep -Milliseconds 1200
+    $gone = [AsLive]::WinDesk($h1)
+    $idxBefore = [Array]::IndexOf([AsLive]::Ids(), [AsLive]::WinDesk($h2)) + 1
+    $ms = [AsLive]::Run($h1, -1, $false, $baseCount, $origin, $false, 3000)
+    Report '(e3) close A -> user back on origin, count rule holds' $ms 'current on origin'
+    Start-Sleep -Milliseconds 800
+    $ids = [AsLive]::Ids()
+    $idxAfter = [Array]::IndexOf($ids, [AsLive]::WinDesk($h2)) + 1
+    $okGap = ($ids -notcontains $gone) -and $idxAfter -ge 1
+    if ($okGap) { Write-Host ("PASS (e4) A's desktop is gone, B still on its own desktop (#{0} -> #{1}), desktops={2}" -f $idxBefore, $idxAfter, $ids.Length) }
+    else { $script:fail++; Write-Host ("FAIL (e4) A's desktop still exists or B lost its desktop (#{0} -> #{1})" -f $idxBefore, $idxAfter) -ForegroundColor Red }
+    $ms = [AsLive]::Run($h2, 9, $false, $baseCount, $origin, $true, 3000)
+    Report '(e5) restore B -> back on origin, count rule holds' $ms 'count = max(B, last occupied), window and current on origin'
+    Start-Sleep -Milliseconds 500
+  }
+  foreach ($pp in @($p1, $p2)) { if ($pp) { Get-Process -Id $pp.Id -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue } }
+  Start-Sleep -Milliseconds 800
 }
 finally {
   if ($asProc -and -not $asProc.HasExited) { Stop-Process -Id $asProc.Id -Force -ErrorAction SilentlyContinue }
@@ -182,6 +257,7 @@ finally {
     Get-Process -Id $winProc.Id -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
     Get-CimInstance Win32_Process -Filter "ParentProcessId=$($winProc.Id)" -ErrorAction SilentlyContinue | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
   }
+  foreach ($pp in @($p1, $p2)) { if ($pp) { Get-Process -Id $pp.Id -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue } }
   Get-Process autospaces -ErrorAction SilentlyContinue | Stop-Process -Force
   Start-Sleep -Milliseconds 300
   $now = [AsLive]::Ids().Length

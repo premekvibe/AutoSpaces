@@ -4,29 +4,35 @@ use super::model::ManagedSpace;
 use crate::desktops::Guid;
 use crate::json::{parse_json, quote, Json};
 
-pub fn to_json(spaces: &[ManagedSpace]) -> String {
-    let mut s = String::from("{\"version\":1,\"spaces\":[");
+/// What `state.json` holds: managed spaces and the baseline desktop count B (plan 12.1).
+pub struct Stored {
+    pub spaces: Vec<ManagedSpace>,
+    pub baseline: Option<usize>,
+}
+
+pub fn to_json(spaces: &[ManagedSpace], baseline: usize) -> String {
+    let mut s = format!("{{\"version\":2,\"baseline\":{baseline},\"spaces\":[");
     for (i, m) in spaces.iter().enumerate() {
         if i > 0 {
             s.push(',');
         }
         s.push_str(&format!(
-            "\n  {{\"desktop\":\"{}\",\"hwnd\":{},\"pid\":{},\"origin\":\"{}\",\"process\":{},\"class\":{},\"borrowed\":{}}}",
+            "\n  {{\"desktop\":\"{}\",\"hwnd\":{},\"pid\":{},\"origin\":\"{}\",\"process\":{},\"class\":{}}}",
             m.desktop,
             m.hwnd as usize,
             m.pid,
             m.origin,
             quote(&m.process),
-            quote(&m.class),
-            m.borrowed
+            quote(&m.class)
         ));
     }
     s.push_str("\n]}\n");
     s
 }
 
-/// Entries with bad fields are skipped; a malformed file yields an error.
-pub fn from_json(text: &str) -> Result<Vec<ManagedSpace>, String> {
+/// Entries with bad fields are skipped; a malformed file yields an error. The `borrowed`
+/// field of older files is ignored.
+pub fn from_json(text: &str) -> Result<Stored, String> {
     let root = parse_json(text)?;
     let Some(Json::Arr(list)) = root.get("spaces") else {
         return Err("missing 'spaces'".into());
@@ -52,11 +58,14 @@ pub fn from_json(text: &str) -> Result<Vec<ManagedSpace>, String> {
             entered_at: 0,
             process: text("process"),
             class: text("class"),
-            borrowed: matches!(o.get("borrowed"), Some(Json::Bool(true))),
             fullscreen: false,
         });
     }
-    Ok(out)
+    let baseline = match root.get("baseline") {
+        Some(Json::Num(n)) if *n >= 1 => Some(*n as usize),
+        _ => None,
+    };
+    Ok(Stored { spaces: out, baseline })
 }
 
 #[cfg(test)]
@@ -74,17 +83,23 @@ mod tests {
             entered_at: 99,
             process: "a\"b.exe".into(),
             class: "Cls".into(),
-            borrowed: true,
             fullscreen: false,
         }];
-        let back = from_json(&to_json(&v)).unwrap();
+        let back = from_json(&to_json(&v, 4)).unwrap();
+        assert_eq!(back.baseline, Some(4));
+        let back = back.spaces;
         assert_eq!(back.len(), 1);
         assert_eq!(back[0].desktop, g(1));
         assert_eq!(back[0].hwnd as usize, 0x1234);
         assert_eq!(back[0].process, "a\"b.exe");
-        assert!(back[0].borrowed);
-        assert!(!from_json(r#"{"spaces":[{"desktop":"00000001-0000-0000-0000-000000000000","hwnd":1,"pid":2,"origin":"00000001-0000-0000-0000-000000000000"}]}"#).unwrap()[0].borrowed);
-        assert_eq!(from_json(&to_json(&[])).unwrap().len(), 0);
+        assert_eq!(from_json(&to_json(&[], 1)).unwrap().spaces.len(), 0);
         assert!(from_json("{").is_err());
+    }
+
+    #[test]
+    fn reads_old_file_with_borrowed_and_no_baseline() {
+        let old = r#"{"version":1,"spaces":[{"desktop":"00000001-0000-0000-0000-000000000000","hwnd":1,"pid":2,"origin":"00000001-0000-0000-0000-000000000000","process":"x.exe","class":"C","borrowed":true}]}"#;
+        let st = from_json(old).unwrap();
+        assert_eq!((st.spaces.len(), st.baseline), (1, None));
     }
 }
