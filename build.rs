@@ -1,5 +1,6 @@
 //! Compiles assets/autospaces.rc with the Windows SDK `rc.exe` and links the
-//! resulting .res into the binary (embeds the application icon, ID 1).
+//! resulting .res into the binary (application icon ID 1, dialogs, QR bitmap, VERSIONINFO).
+//! The version for VERSIONINFO comes from Cargo.toml via a generated `version.h`.
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -44,10 +45,21 @@ fn find_rc() -> Option<PathBuf> {
     })
 }
 
+/// `(0,1,2,0, "0.1.2.0")` style pair for FILEVERSION and the version strings (pre-release suffix ignored).
+fn version_parts(v: &str) -> (String, String) {
+    let core = v.split(['-', '+']).next().unwrap_or("");
+    let mut n: Vec<u32> = core.split('.').filter_map(|p| p.parse().ok()).collect();
+    n.resize(4, 0);
+    let s: Vec<String> = n.iter().map(u32::to_string).collect();
+    (s.join(","), s.join("."))
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=assets/autospaces.rc");
     println!("cargo:rerun-if-changed=assets/autospaces.ico");
     println!("cargo:rerun-if-changed=assets/autospaces.manifest");
+    println!("cargo:rerun-if-changed=assets/donate-qr.bmp");
+    println!("cargo:rerun-if-changed=Cargo.toml");
     println!("cargo:rerun-if-changed=build.rs");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
@@ -56,9 +68,20 @@ fn main() {
         println!("cargo:warning=rc.exe not found (install the Windows SDK); building without an icon");
         return;
     };
-    let out = PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("autospaces.res");
+    let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+    let (comma, dotted) = version_parts(&std::env::var("CARGO_PKG_VERSION").unwrap_or_default());
+    std::fs::write(
+        out_dir.join("version.h"),
+        format!("#define AS_VER_COMMA {comma}
+#define AS_VER_STR \"{dotted}\"
+"),
+    )
+    .expect("cannot write version.h");
+    let out = out_dir.join("autospaces.res");
     let status = Command::new(&rc)
         .arg("/nologo")
+        .arg("/i")
+        .arg(&out_dir)
         .arg("/fo")
         .arg(&out)
         .arg("assets/autospaces.rc")

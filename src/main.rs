@@ -1,5 +1,6 @@
 #![windows_subsystem = "windows"]
 
+mod about_dlg;
 mod core;
 mod desktops;
 mod json;
@@ -186,6 +187,13 @@ fn open_settings(hwnd: HWND) {
     after_orchestrator(hwnd, o, sch);
 }
 
+/// Opens the About dialog (modal; shows the backend variant the app runs on, if any).
+fn open_about() {
+    use desktops::DesktopBackend;
+    let backend = orch().map(|o| o.backend().name().to_string());
+    about_dlg::show(backend.as_deref());
+}
+
 /// "Převzít současný stav" in the layout dialog.
 fn capture_layout() -> (usize, Vec<core::settings::LayoutRule>) {
     orch().map(|o| o.capture_layout()).unwrap_or_default()
@@ -359,6 +367,11 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             open_settings(hwnd);
             0
         }
+        #[cfg(debug_assertions)]
+        m if m == windows_sys::Win32::UI::WindowsAndMessaging::WM_APP + 10 => {
+            open_about();
+            0
+        }
         WM_TIMER => {
             on_timer(hwnd, wp);
             0
@@ -384,6 +397,9 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                         DestroyWindow(hwnd);
                     }
                     tray::CMD_SETTINGS => open_settings(hwnd),
+                    tray::CMD_ABOUT => {
+                        open_about();
+                    }
                     tray::CMD_FORGET_ALL => {
                         if let Some(o) = orch() {
                             o.forget_learned(None);
@@ -505,6 +521,10 @@ fn main() {
         }
 
         tray::add(hwnd);
+        #[cfg(debug_assertions)]
+        if std::env::var_os("AUTOSPACES_OPEN_ABOUT").is_some() {
+            windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(hwnd, windows_sys::Win32::UI::WindowsAndMessaging::WM_APP + 10, 0, 0);
+        }
         #[cfg(debug_assertions)]
         if std::env::var_os("AUTOSPACES_OPEN_SETTINGS").is_some() {
             windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(hwnd, windows_sys::Win32::UI::WindowsAndMessaging::WM_APP + 9, 0, 0);

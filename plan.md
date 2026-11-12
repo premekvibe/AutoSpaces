@@ -546,7 +546,7 @@ Nativní dialog z nabídky ikony: ikona, název, verze (`CARGO_PKG_VERSION`), au
 | 4b | správa počtu ploch podle 12.1 | probíhá |
 | 5 | settings.json + dialog Nastavení (12.2), spouštění po startu | hotovo |
 | 5b | profil rozložení ploch po startu (12.7) | hotovo (vyzkoušeno živě při 96 DPI) |
-| 6 | dialog O aplikaci (12.4), VERSIONINFO | čeká |
+| 6 | dialog O aplikaci (12.4), VERSIONINFO | hotovo (vyzkoušeno živě při 96 DPI; vysoké DPI neověřeno; odkaz na web a otevření peněženky živě neotevřeny) |
 | 7 | instalátor (12.3) | čeká |
 | 8 | záložní režim pro neznámé verze Windows (5.2) | čeká |
 | 9 | testy na dalších verzích Windows, podpis, vydání | čeká |

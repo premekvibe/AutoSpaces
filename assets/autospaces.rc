@@ -17,8 +17,17 @@
 #define LBS_NOTIFY 1
 #define LBS_SORT 2
 #define LBS_NOINTEGRALHEIGHT 0x100
+#define SS_ICON 0x3
+#define SS_BITMAP 0xE
+#define SS_CENTERIMAGE 0x200
+#define SS_REALSIZECONTROL 0x40
+
+// AS_VER_COMMA / AS_VER_STR come from build.rs (version in Cargo.toml is the single source).
+#include "version.h"
 
 1 ICON "autospaces.ico"
+// Donate QR code (RLE8 bitmap made by tools/make-qr-bmp.py), loaded only while the About dialog is open.
+20 BITMAP "donate-qr.bmp"
 // Per-monitor v2 DPI awareness for the whole process (plan 12.2).
 1 24 "autospaces.manifest"
 
@@ -86,4 +95,60 @@ BEGIN
     LISTBOX         150, 6, 18, 228, 128, LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | WS_BORDER | WS_VSCROLL | WS_TABSTOP
     DEFPUSHBUTTON   "Vyloučit", 1, 128, 150, 50, 14
     PUSHBUTTON      "Storno", 2, 184, 150, 50, 14
+END
+
+// About dialog (src/about_dlg.rs); title text, version, link and address are filled in at run time.
+104 DIALOGEX 0, 0, 300, 268
+STYLE DS_SHELLFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "O aplikaci AutoSpaces"
+FONT 9, "MS Shell Dlg", 400, 0, 1
+BEGIN
+    CONTROL         "", 200, "Static", SS_ICON | SS_REALSIZECONTROL | SS_CENTERIMAGE, 10, 10, 24, 24
+    LTEXT           "AutoSpaces", 201, 42, 9, 248, 16
+    LTEXT           "", 202, 42, 27, 248, 10
+    LTEXT           "AutoSpaces přesune maximalizované okno nebo okno v celoobrazovkovém režimu na vlastní plochu Windows a po jeho zavření nebo zmenšení se na původní plochu zase vrátí.", 203, 10, 46, 280, 20
+    LTEXT           "Autor: Přemysl Vavroušek", 204, 10, 70, 280, 10
+    CONTROL         "", 205, "SysLink", WS_TABSTOP, 10, 82, 280, 10
+    LTEXT           "", 206, 10, 96, 280, 10
+
+    GROUPBOX        "Podpořit autora", -1, 6, 112, 288, 132
+    CONTROL         "", 208, "Static", SS_BITMAP | SS_CENTERIMAGE, 12, 124, 112, 114
+    LTEXT           "Platba na účet: naskenujte QR kód v bankovní aplikaci.", 209, 132, 124, 156, 22
+    LTEXT           "Bitcoin přes Lightning Network:", 210, 132, 152, 156, 10
+    LTEXT           "", 211, 132, 164, 156, 10
+    PUSHBUTTON      "Kopírovat adresu", 212, 132, 180, 110, 14, WS_TABSTOP
+    PUSHBUTTON      "Otevřít v peněžence", 213, 132, 198, 110, 14, WS_TABSTOP
+    LTEXT           "", 214, 132, 216, 156, 22
+
+    DEFPUSHBUTTON   "Zavřít", 1, 244, 250, 50, 14, WS_TABSTOP
+END
+
+// Version information (Czech, Unicode): shown in the file's Properties and read by the installer.
+1 VERSIONINFO
+FILEVERSION AS_VER_COMMA
+PRODUCTVERSION AS_VER_COMMA
+FILEFLAGSMASK 0x3f
+FILEFLAGS 0
+FILEOS 0x40004
+FILETYPE 1
+FILESUBTYPE 0
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040504B0"
+        BEGIN
+            VALUE "CompanyName", "Přemysl Vavroušek"
+            VALUE "FileDescription", "AutoSpaces"
+            VALUE "FileVersion", AS_VER_STR
+            VALUE "InternalName", "AutoSpaces"
+            VALUE "LegalCopyright", "© Přemysl Vavroušek"
+            VALUE "OriginalFilename", "autospaces.exe"
+            VALUE "ProductName", "AutoSpaces"
+            VALUE "ProductVersion", AS_VER_STR
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0405, 1200
+    END
 END
