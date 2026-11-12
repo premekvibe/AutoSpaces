@@ -4,6 +4,7 @@
 //! only when an entry changes (never on the hot path before the desktop switch: failures
 //! are recorded after a rejected enter or after an exit).
 
+use super::settings::never_learn;
 use crate::json::{parse_json, quote, Json};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -36,13 +37,21 @@ impl FailReason {
             FailReason::AccessDenied => "AccessDenied",
         }
     }
-    /// Strikes needed to block (Flapping: within `FLAPPING_WINDOW_S`).
+    /// Strikes needed to block (Flapping: within `FLAPPING_WINDOW_S`). Never one: a single
+    /// failure can be a window in an unusual moment. The orchestrator counts at most one strike
+    /// per window and only for real attempts (plan 6.7), so these are distinct windows.
     fn threshold(self) -> u32 {
-        match self {
-            FailReason::MoveNotApplied | FailReason::ShortLived => 2,
-            FailReason::Flapping => 3,
-            _ => 1,
-        }
+        threshold_of(self.name())
+    }
+}
+
+/// Strikes needed to block, by reason name (also applied to entries loaded from older files).
+fn threshold_of(reason: &str) -> u32 {
+    match reason {
+        // Cheap refusals (nothing was created): only a pattern is worth remembering.
+        "NoView" | "CannotMove" | "HideShowFailed" | "Flapping" => 3,
+        // A desktop was created and removed again for nothing.
+        _ => 2,
     }
 }
 
@@ -175,7 +184,19 @@ impl LearnedStore {
         let text = std::fs::read_to_string(&path).unwrap_or_default();
         let mut s = Self::with_clock(Some(path), backend, retry_days, Box::new(unix_now));
         s.entries = from_json(&text).unwrap_or_default();
+        if s.drop_outdated() {
+            s.save();
+        }
         s
+    }
+
+    /// Drops entries the current rules would not have made: system hosts and windows, and blocks
+    /// with fewer strikes than needed now (older versions blocked after one `CannotMove`).
+    fn drop_outdated(&mut self) -> bool {
+        let before = self.entries.len();
+        self.entries
+            .retain(|k, e| !never_learn(&k.0, &k.1) && !(e.blocked && e.strikes < threshold_of(&e.reason)));
+        self.entries.len() != before
     }
 
     pub fn with_clock(path: Option<PathBuf>, backend: &str, retry_days: u32, clock: Box<dyn Fn() -> u64>) -> Self {
@@ -241,7 +262,7 @@ impl Learned for LearnedStore {
     }
 
     fn fail(&mut self, process: &str, class: &str, reason: FailReason, stamp: &str) -> bool {
-        if process.is_empty() {
+        if never_learn(process, class) {
             return false;
         }
         let now = (self.clock)();
@@ -437,6 +458,11 @@ mod tests {
         (LearnedStore::with_clock(None, backend, 30, Box::new(move || t2.get())), t)
     }
 
+    /// Fails until the entry blocks (the number of strikes depends on the reason).
+    fn block(s: &mut LearnedStore, p: &str, c: &str, r: FailReason, stamp: &str) {
+        assert!((0..5).any(|_| s.fail(p, c, r, stamp)), "{p} {c} {r:?} never blocks");
+    }
+
     fn strikes_to_block(reason: FailReason) -> u32 {
         let (mut s, _) = store("b");
         for n in 1..=5 {
@@ -451,18 +477,17 @@ mod tests {
 
     #[test]
     fn strike_thresholds_per_reason() {
+        for r in [FailReason::NoView, FailReason::CannotMove, FailReason::HideShowFailed, FailReason::Flapping] {
+            assert_eq!(strikes_to_block(r), 3, "{r:?}");
+        }
         for r in [
-            FailReason::NoView,
-            FailReason::CannotMove,
             FailReason::MoveFailed(-5),
             FailReason::AccessDenied,
-            FailReason::HideShowFailed,
+            FailReason::MoveNotApplied,
+            FailReason::ShortLived,
         ] {
-            assert_eq!(strikes_to_block(r), 1, "{r:?}");
+            assert_eq!(strikes_to_block(r), 2, "{r:?}");
         }
-        assert_eq!(strikes_to_block(FailReason::MoveNotApplied), 2);
-        assert_eq!(strikes_to_block(FailReason::ShortLived), 2);
-        assert_eq!(strikes_to_block(FailReason::Flapping), 3);
     }
 
     #[test]
@@ -480,7 +505,7 @@ mod tests {
     #[test]
     fn exe_stamp_change_drops_entry() {
         let (mut s, _) = store("b");
-        s.fail("a.exe", "C", FailReason::CannotMove, "10:20");
+        block(&mut s, "a.exe", "C", FailReason::CannotMove, "10:20");
         assert!(s.confirm("a.exe", "C", "10:20"));
         assert!(!s.confirm("a.exe", "C", "11:30"));
         assert!(!s.blocked("a.exe", "C"));
@@ -488,7 +513,7 @@ mod tests {
         s.fail("b.exe", "C", FailReason::ShortLived, "1:1");
         assert!(!s.fail("b.exe", "C", FailReason::ShortLived, "2:2"));
         // Unknown stamp (process already gone) is filled in later.
-        s.fail("c.exe", "C", FailReason::CannotMove, "");
+        block(&mut s, "c.exe", "C", FailReason::CannotMove, "");
         assert!(s.confirm("c.exe", "C", "5:5"));
         assert!(!s.confirm("c.exe", "C", "6:6"));
     }
@@ -496,7 +521,7 @@ mod tests {
     #[test]
     fn other_backend_entries_are_ignored() {
         let (mut s, _) = store("internal:a");
-        s.fail("a.exe", "C", FailReason::CannotMove, "1:1");
+        block(&mut s, "a.exe", "C", FailReason::CannotMove, "1:1");
         assert!(s.blocked("a.exe", "C"));
         s.set_backend("fallback");
         assert!(!s.blocked("a.exe", "C"));
@@ -510,7 +535,7 @@ mod tests {
         let (mut s, t) = store("b");
         s.fail("soft.exe", "C", FailReason::ShortLived, "");
         s.fail("soft.exe", "C", FailReason::ShortLived, "");
-        s.fail("hard.exe", "C", FailReason::MoveFailed(1), "");
+        block(&mut s, "hard.exe", "C", FailReason::MoveFailed(1), "");
         t.set(T0 + 29 * DAY);
         assert!(s.blocked("soft.exe", "C"));
         t.set(T0 + 31 * DAY);
@@ -523,9 +548,9 @@ mod tests {
     #[test]
     fn wildcard_class_forget_one_and_all() {
         let (mut s, _) = store("b");
-        s.fail("a.exe", "X", FailReason::CannotMove, "");
-        s.fail("a.exe", "Y", FailReason::CannotMove, "");
-        s.fail("b.exe", "X", FailReason::CannotMove, "");
+        block(&mut s, "a.exe", "X", FailReason::CannotMove, "");
+        block(&mut s, "a.exe", "Y", FailReason::CannotMove, "");
+        block(&mut s, "b.exe", "X", FailReason::CannotMove, "");
         assert!(!s.blocked("a.exe", "Z"));
         let e = s.entries[&("b.exe".to_string(), "X".to_string())].clone();
         s.entries.insert(("w.exe".into(), "*".into()), e);
@@ -545,7 +570,7 @@ mod tests {
         let t = Rc::new(Cell::new(T0));
         let t2 = t.clone();
         let mut s = LearnedStore::with_clock(Some(path.clone()), "internal:x", 30, Box::new(move || t2.get()));
-        s.fail("a\"b.exe", "Cls", FailReason::MoveFailed(0x8007_0005_u32 as i32), "99:123");
+        block(&mut s, "a\"b.exe", "Cls", FailReason::MoveFailed(0x8007_0005_u32 as i32), "99:123");
         s.fail("c.exe", "*", FailReason::Flapping, "");
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("\"hresult\":\"0x80070005\"") && text.contains("\"exeStamp\":\"99:123\""));
@@ -566,7 +591,7 @@ mod tests {
     #[test]
     fn names_old_and_new_format() {
         // Old file without "name": loads, name unknown.
-        let old = r#"{"version":1,"entries":[{"process":"pdr.exe","class":"V","reason":"CannotMove","strikes":1,"blocked":true,"backend":"b","exeStamp":"1:2","first":"2026-11-11","last":"2026-11-11"}]}"#;
+        let old = r#"{"version":1,"entries":[{"process":"pdr.exe","class":"V","reason":"CannotMove","strikes":3,"blocked":true,"backend":"b","exeStamp":"1:2","first":"2026-11-11","last":"2026-11-11"}]}"#;
         let m = from_json(old).unwrap();
         assert_eq!(m[&("pdr.exe".to_string(), "V".to_string())].name, "");
         let dir = std::env::temp_dir().join(format!("as-learned-n-{}", std::process::id()));
@@ -581,6 +606,42 @@ mod tests {
         let back = LearnedStore::load(path, "b", 30);
         assert_eq!(back.list_named(), vec![("pdr.exe".to_string(), "CyberLink PowerDirector 365".to_string())]);
         assert!(back.blocked("pdr.exe", "V"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn system_processes_are_never_learned() {
+        let (mut s, _) = store("b");
+        for _ in 0..5 {
+            assert!(!s.fail("lockapp.exe", "Windows.UI.Core.CoreWindow", FailReason::CannotMove, ""));
+            assert!(!s.fail("explorer.exe", "CabinetWClass", FailReason::MoveFailed(1), ""));
+            assert!(!s.fail("x.exe", "Windows.UI.Core.CoreWindow", FailReason::MoveFailed(1), ""));
+        }
+        assert!(s.entries.is_empty());
+    }
+
+    #[test]
+    fn one_strike_blocks_from_old_versions_are_dropped_on_load() {
+        // The learned.json of a user, as written by the previous version.
+        let old = r#"{"version":1,"entries":[
+  {"process":"audacity4.exe","class":"Qt6101QWindowIcon","reason":"CannotMove","strikes":1,"blocked":true,"backend":"b","exeStamp":"1:1","first":"2026-11-12","last":"2026-11-12"},
+  {"process":"explorer.exe","class":"LockScreenBackstopFrame","reason":"CannotMove","strikes":1,"blocked":true,"backend":"b","exeStamp":"1:1","first":"2026-11-11","last":"2026-11-11"},
+  {"process":"lockapp.exe","class":"Windows.UI.Core.CoreWindow","reason":"CannotMove","strikes":1,"blocked":true,"backend":"b","exeStamp":"1:1","first":"2026-11-11","last":"2026-11-11"},
+  {"process":"msedge.exe","class":"Chrome_WidgetWin_1","reason":"CannotMove","strikes":1,"blocked":true,"backend":"b","exeStamp":"1:1","first":"2026-11-11","last":"2026-11-11"},
+  {"process":"textinputhost.exe","class":"Windows.UI.Core.CoreWindow","reason":"CannotMove","strikes":1,"blocked":true,"backend":"b","exeStamp":"1:1","first":"2026-11-12","last":"2026-11-12"},
+  {"process":"pdr.exe","class":"V","reason":"MoveFailed","hresult":"0x80004005","strikes":2,"blocked":true,"backend":"b","exeStamp":"1:1","first":"2026-11-12","last":"2026-11-12"},
+  {"process":"half.exe","class":"V","reason":"CannotMove","strikes":1,"blocked":false,"backend":"b","exeStamp":"1:1","first":"2026-11-12","last":"2026-11-12"}
+]}"#;
+        let dir = std::env::temp_dir().join(format!("as-learned-m-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("learned.json");
+        std::fs::write(&path, old).unwrap();
+        let s = LearnedStore::load(path.clone(), "b", 30);
+        assert_eq!(s.list_blocked(), ["pdr.exe"]);
+        assert_eq!(s.entries.len(), 2, "a pending strike stays");
+        // The file itself was rewritten without them.
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("msedge.exe") && !text.contains("lockapp.exe") && text.contains("pdr.exe"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

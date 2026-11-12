@@ -328,11 +328,9 @@ impl DesktopBackend for InternalBackend {
     }
 
     fn can_move(&self, hwnd: HWND) -> Result<bool> {
-        let view = match self.view(hwnd) {
-            Ok(v) => v,
-            Err(e) if e.is_transient() => return Err(e),
-            Err(_) => return Ok(false), // no application view → not movable
-        };
+        // No view yet (TYPE_E_ELEMENTNOTFOUND) is reported as such: right after SHOW Explorer has
+        // not created it yet (measured 7-200 ms), so it must not count as "cannot move".
+        let view = self.view(hwnd)?;
         let (m, mut ok) = (&self.mgr, 0i32);
         check(unsafe { m.slot::<FnInOutBool>(self.v.slots.can_view_move)(m.raw(), view.raw(), &mut ok) })?;
         Ok(ok != 0)

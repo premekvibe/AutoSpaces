@@ -1,7 +1,7 @@
 //! Settings dialog (plan 12.2): plain Win32 dialog templates from assets/autospaces.rc,
 //! created only on request (no cost while idle). Ids below must match the .rc file.
 
-use crate::core::settings::display_label;
+use crate::core::settings::{display_label, file_name_lower, Layout, LayoutRule, MAX_LAYOUT_DESKTOPS, SYSTEM_HOSTS};
 use crate::core::Settings;
 use crate::sysopts;
 use crate::tray::wide;
@@ -13,7 +13,8 @@ use windows_sys::Win32::UI::Shell::ShellExecuteW;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows_sys::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    DialogBoxParamW, EndDialog, GetDlgItem, GetWindowLongPtrW, GetWindowTextW, LoadImageW, SendDlgItemMessageW,
+    DialogBoxParamW, EndDialog, GetDlgItem, GetDlgItemInt, SetDlgItemInt, SetDlgItemTextW, SetWindowTextW,
+    LB_RESETCONTENT, LBN_SELCHANGE, LB_SETHORIZONTALEXTENT, GetWindowLongPtrW, GetWindowTextW, LoadImageW, SendDlgItemMessageW,
     SendMessageW, SetForegroundWindow, SetWindowLongPtrW, GWLP_USERDATA,
     ICON_BIG, ICON_SMALL, IMAGE_ICON, LR_SHARED, SM_CXICON, SM_CXSMICON, SM_CYICON, SM_CYSMICON, IDCANCEL, IDOK, LBN_DBLCLK, LB_ADDSTRING, LB_DELETESTRING, LB_ERR,
     LB_GETCOUNT, LB_GETCURSEL, LB_GETITEMDATA, LB_SETITEMDATA, LB_SETCURSEL, WM_COMMAND, WM_INITDIALOG,
@@ -32,6 +33,17 @@ const ID_LEARNED_DEL: i32 = 131;
 const ID_LEARNING: i32 = 132;
 const ID_AUTOSTART: i32 = 140;
 const ID_OPEN_WINSETTINGS: i32 = 141;
+const ID_OPEN_LAYOUT: i32 = 143;
+const IDD_LAYOUT: u16 = 103;
+const ID_LAY_ENABLED: i32 = 160;
+const ID_LAY_COUNT: i32 = 161;
+const ID_LAY_TARGET: i32 = 162;
+const ID_LAY_LIST: i32 = 163;
+const ID_LAY_ADD_RUN: i32 = 164;
+const ID_LAY_ADD_FILE: i32 = 165;
+const ID_LAY_DEL: i32 = 166;
+const ID_LAY_CAPTURE: i32 = 167;
+const ID_LAY_APPLY: i32 = 168;
 const ID_PICK_LIST: i32 = 150;
 
 /// Handle of the open dialog (0 = none): a second request just brings it forward.
@@ -42,6 +54,8 @@ pub struct Outcome {
     pub settings: Settings,
     /// Learned processes to forget.
     pub forgotten: Vec<String>,
+    /// The user asked to apply the layout profile right now ("Použít teď").
+    pub apply_now: bool,
 }
 
 struct Dlg {
@@ -53,19 +67,9 @@ struct Dlg {
     out: Option<Outcome>,
     /// Source of the "running apps" picker.
     running: fn() -> Vec<(String, String)>,
+    /// Current desktops and windows as a layout profile (number of desktops, rules).
+    capture: fn() -> (usize, Vec<LayoutRule>),
 }
-
-/// System hosts that never make sense to exclude.
-const SYSTEM_HOSTS: [&str; 8] = [
-    "applicationframehost.exe",
-    "systemsettings.exe",
-    "textinputhost.exe",
-    "shellexperiencehost.exe",
-    "searchhost.exe",
-    "startmenuexperiencehost.exe",
-    "explorer.exe",
-    "autospaces.exe",
-];
 
 /// Running apps for the picker: one row per process, minus excluded ones, sorted by name.
 pub fn picker_entries(raw: Vec<(String, String)>, excluded: &[String], own: &str) -> Vec<(String, String)> {
@@ -81,7 +85,12 @@ pub fn picker_entries(raw: Vec<(String, String)>, excluded: &[String], own: &str
 }
 
 /// Opens the modal dialog; None = cancelled (or already open).
-pub fn show(settings: &Settings, learned: Vec<(String, String)>, running: fn() -> Vec<(String, String)>) -> Option<Outcome> {
+pub fn show(
+    settings: &Settings,
+    learned: Vec<(String, String)>,
+    running: fn() -> Vec<(String, String)>,
+    capture: fn() -> (usize, Vec<LayoutRule>),
+) -> Option<Outcome> {
     let prev = OPEN.load(Relaxed);
     if prev != 0 {
         unsafe { SetForegroundWindow(prev as HWND) };
@@ -94,6 +103,7 @@ pub fn show(settings: &Settings, learned: Vec<(String, String)>, running: fn() -
         forgotten: Vec::new(),
         out: None,
         running,
+        capture,
     };
     unsafe {
         DialogBoxParamW(
@@ -201,6 +211,7 @@ unsafe fn collect(dlg: HWND, d: &mut Dlg) {
     d.out = Some(Outcome {
         settings: s,
         forgotten: std::mem::take(&mut d.forgotten),
+        apply_now: false,
     });
 }
 
@@ -257,6 +268,16 @@ unsafe extern "system" fn proc(dlg: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> i
                         SW_SHOWNORMAL,
                     );
                 }
+                ID_OPEN_LAYOUT => {
+                    if layout_dialog(dlg, d) {
+                        // "Použít teď": confirm the whole settings dialog and apply the profile.
+                        collect(dlg, d);
+                        if let Some(o) = d.out.as_mut() {
+                            o.apply_now = true;
+                        }
+                        EndDialog(dlg, IDOK as isize);
+                    }
+                }
                 ID_EXCL_LIST | ID_LEARNED_LIST => update_buttons(dlg),
                 _ => return 0,
             }
@@ -269,6 +290,8 @@ unsafe extern "system" fn proc(dlg: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> i
 struct Pick {
     entries: Vec<(String, String)>,
     chosen: Option<(String, String)>,
+    title: String,
+    button: String,
 }
 
 /// Second dialog: choose from running apps. Returns the process name.
@@ -279,7 +302,12 @@ unsafe fn pick(parent: HWND, d: &Dlg) -> Option<(String, String)> {
         .unwrap_or_default();
     let excl: Vec<String> =
         list_data(parent, ID_EXCL_LIST).into_iter().filter_map(|i| d.excl.get(i).map(|e| e.0.clone())).collect();
-    let mut st = Pick { entries: picker_entries((d.running)(), &excl, &own), chosen: None };
+    pick_from(parent, picker_entries((d.running)(), &excl, &own), "Vyloučit aplikaci", "Vyloučit")
+}
+
+/// Shows the picker dialog with its own caption and confirm button; the chosen entry or None.
+unsafe fn pick_from(parent: HWND, entries: Vec<(String, String)>, title: &str, button: &str) -> Option<(String, String)> {
+    let mut st = Pick { entries, chosen: None, title: title.into(), button: button.into() };
     DialogBoxParamW(
         GetModuleHandleW(std::ptr::null()),
         std::ptr::without_provenance::<u16>(IDD_PICK as usize),
@@ -295,6 +323,8 @@ unsafe extern "system" fn pick_proc(dlg: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
         WM_INITDIALOG => {
             SetWindowLongPtrW(dlg, GWLP_USERDATA, lp);
             if let Some(st) = (lp as *mut Pick).as_ref() {
+                SetWindowTextW(dlg, wide(&st.title).as_ptr());
+                SetDlgItemTextW(dlg, IDOK, wide(&st.button).as_ptr());
                 for (p, t) in &st.entries {
                     list_add(dlg, ID_PICK_LIST, &display_label(p, t), 0);
                 }
@@ -331,6 +361,11 @@ unsafe extern "system" fn pick_proc(dlg: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
 /// One row per running app process: (process, readable name). The name comes from the exe's
 /// version info, else the title of its first window, else it is empty.
 pub fn running_apps() -> Vec<(String, String)> {
+    running_apps_full().into_iter().map(|(p, n, _)| (p, n)).collect()
+}
+
+/// Like `running_apps`, plus how to launch it (`shell:AppsFolder\<AUMID>` or the exe path).
+pub fn running_apps_full() -> Vec<(String, String, String)> {
     use crate::core::WindowSystem;
     let ws = crate::windowing::system::Win32Windows::new();
     let mut seen: Vec<(String, u32, String)> = Vec::new();
@@ -346,9 +381,180 @@ pub fn running_apps() -> Vec<(String, String)> {
     seen.into_iter()
         .map(|(p, pid, title)| {
             let name = ws.app_name(pid);
-            (p, if name.is_empty() { title } else { name })
+            (p, if name.is_empty() { title } else { name }, ws.launch_command(pid))
         })
         .collect()
+}
+
+// ---------------------------------------------------------------- layout profile (plan 12.7)
+
+struct LayDlg {
+    layout: Layout,
+    capture: fn() -> (usize, Vec<LayoutRule>),
+    apply: bool,
+}
+
+/// The layout dialog; true when the user chose "Použít teď" (the profile is stored in `d`).
+unsafe fn layout_dialog(parent: HWND, d: &mut Dlg) -> bool {
+    let mut st = LayDlg { layout: d.settings.layout.clone(), capture: d.capture, apply: false };
+    let r = DialogBoxParamW(
+        GetModuleHandleW(std::ptr::null()),
+        std::ptr::without_provenance::<u16>(IDD_LAYOUT as usize),
+        parent,
+        Some(layout_proc),
+        &mut st as *mut LayDlg as LPARAM,
+    );
+    if r != IDOK as isize {
+        return false;
+    }
+    d.settings.layout = st.layout;
+    st.apply
+}
+
+fn read_num(dlg: HWND, id: i32, default: u32) -> u32 {
+    let mut ok = 0;
+    let v = unsafe { GetDlgItemInt(dlg, id, &mut ok, 0) };
+    if ok == 0 {
+        default
+    } else {
+        v.clamp(1, MAX_LAYOUT_DESKTOPS)
+    }
+}
+
+/// Fills the list: sorted by desktop; item data = index into the rules.
+unsafe fn lay_refill(dlg: HWND, l: &mut Layout) {
+    l.rules.sort_by_key(|r| r.desktop);
+    SendDlgItemMessageW(dlg, ID_LAY_LIST, LB_RESETCONTENT, 0, 0);
+    let mut longest = 0;
+    for (i, r) in l.rules.iter().enumerate() {
+        let text = format!("Plocha {} – {}", r.desktop, r.label());
+        longest = longest.max(text.chars().count());
+        list_add(dlg, ID_LAY_LIST, &text, i);
+    }
+    // Long names scroll sideways instead of being cut off (extent in pixels, generous per char).
+    let dpi = GetDpiForWindow(dlg).max(96) as usize;
+    SendDlgItemMessageW(dlg, ID_LAY_LIST, LB_SETHORIZONTALEXTENT, longest * 8 * dpi / 96 + 16, 0);
+    lay_buttons(dlg);
+}
+
+unsafe fn lay_buttons(dlg: HWND) {
+    let has = SendDlgItemMessageW(dlg, ID_LAY_LIST, LB_GETCURSEL, 0, 0) != LB_ERR as isize;
+    EnableWindow(GetDlgItem(dlg, ID_LAY_DEL), has as i32);
+}
+
+unsafe fn lay_add(dlg: HWND, l: &mut Layout, name: &str, launch: &str, process: &str) {
+    let desktop = read_num(dlg, ID_LAY_TARGET, 2);
+    if let Some(r) = LayoutRule::new(desktop, name, launch, "", process) {
+        if !l.rules.iter().any(|x| x.desktop == r.desktop && x.process == r.process) {
+            l.rules.push(r);
+        }
+        if desktop > read_num(dlg, ID_LAY_COUNT, 1) {
+            SetDlgItemInt(dlg, ID_LAY_COUNT, desktop, 0);
+        }
+        lay_refill(dlg, l);
+    }
+}
+
+/// Standard file dialog for an exe; the chosen path.
+unsafe fn choose_exe(parent: HWND) -> Option<String> {
+    use windows_sys::Win32::UI::Controls::Dialogs::{
+        GetOpenFileNameW, OFN_FILEMUSTEXIST, OFN_HIDEREADONLY, OFN_NOCHANGEDIR, OFN_PATHMUSTEXIST, OPENFILENAMEW,
+    };
+    let mut file = [0u16; 1040];
+    let filter: Vec<u16> = "Programy (*.exe)\0*.exe\0Všechny soubory (*.*)\0*.*\0\0".encode_utf16().collect();
+    let title = wide("Vybrat aplikaci");
+    let mut ofn: OPENFILENAMEW = std::mem::zeroed();
+    ofn.lStructSize = std::mem::size_of::<OPENFILENAMEW>() as u32;
+    ofn.hwndOwner = parent;
+    ofn.lpstrFilter = filter.as_ptr();
+    ofn.lpstrFile = file.as_mut_ptr();
+    ofn.nMaxFile = file.len() as u32;
+    ofn.lpstrTitle = title.as_ptr();
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR | OFN_HIDEREADONLY;
+    if GetOpenFileNameW(&mut ofn) == 0 {
+        return None;
+    }
+    let n = file.iter().position(|&c| c == 0).unwrap_or(file.len());
+    Some(String::from_utf16_lossy(&file[..n]))
+}
+
+unsafe fn lay_collect(dlg: HWND, st: &mut LayDlg) {
+    st.layout.enabled = IsDlgButtonChecked(dlg, ID_LAY_ENABLED) == BST_CHECKED;
+    st.layout.desktop_count = read_num(dlg, ID_LAY_COUNT, 1);
+}
+
+unsafe extern "system" fn layout_proc(dlg: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
+    match msg {
+        WM_INITDIALOG => {
+            SetWindowLongPtrW(dlg, GWLP_USERDATA, lp);
+            if let Some(st) = (lp as *mut LayDlg).as_mut() {
+                CheckDlgButton(dlg, ID_LAY_ENABLED, check(st.layout.enabled));
+                SetDlgItemInt(dlg, ID_LAY_COUNT, st.layout.count() as u32, 0);
+                SetDlgItemInt(dlg, ID_LAY_TARGET, 2, 0);
+                lay_refill(dlg, &mut st.layout);
+            }
+            1
+        }
+        WM_COMMAND => {
+            let id = (wp & 0xffff) as i32;
+            let notify = ((wp >> 16) & 0xffff) as u32;
+            let Some(st) = (GetWindowLongPtrW(dlg, GWLP_USERDATA) as *mut LayDlg).as_mut() else { return 0 };
+            match id {
+                x if x == IDOK || x == ID_LAY_APPLY => {
+                    lay_collect(dlg, st);
+                    st.apply = x == ID_LAY_APPLY;
+                    EndDialog(dlg, IDOK as isize);
+                }
+                x if x == IDCANCEL => {
+                    EndDialog(dlg, IDCANCEL as isize);
+                }
+                ID_LAY_LIST => {
+                    if notify == LBN_SELCHANGE {
+                        lay_buttons(dlg);
+                    }
+                }
+                ID_LAY_ADD_RUN => {
+                    let full = running_apps_full();
+                    let own = std::env::current_exe()
+                        .ok()
+                        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_lowercase()))
+                        .unwrap_or_default();
+                    let raw: Vec<(String, String)> = full.iter().map(|(p, n, _)| (p.clone(), n.clone())).collect();
+                    let entries = picker_entries(raw, &[], &own);
+                    if let Some((p, n)) = pick_from(dlg, entries, "Přidat do rozložení", "Přidat") {
+                        let path = full.iter().find(|f| f.0 == p).map(|f| f.2.clone()).unwrap_or_default();
+                        lay_add(dlg, &mut st.layout, &n, &path, &p);
+                    }
+                }
+                ID_LAY_ADD_FILE => {
+                    if let Some(path) = choose_exe(dlg) {
+                        let name = crate::windowing::system::version_name(&path);
+                        let launch = crate::launch_for_path(&path);
+                        lay_add(dlg, &mut st.layout, &name, &launch, &file_name_lower(&path));
+                    }
+                }
+                ID_LAY_DEL => {
+                    if let Some(i) = list_remove_selected(dlg, ID_LAY_LIST) {
+                        if i < st.layout.rules.len() {
+                            st.layout.rules.remove(i);
+                        }
+                        lay_refill(dlg, &mut st.layout);
+                    }
+                }
+                ID_LAY_CAPTURE => {
+                    let (n, rules) = (st.capture)();
+                    if n > 0 {
+                        st.layout.rules = rules;
+                        SetDlgItemInt(dlg, ID_LAY_COUNT, n as u32, 0);
+                        lay_refill(dlg, &mut st.layout);
+                    }
+                }
+                _ => return 0,
+            }
+            1
+        }
+        _ => 0,
+    }
 }
 
 #[cfg(test)]

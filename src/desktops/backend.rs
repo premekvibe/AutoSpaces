@@ -14,6 +14,9 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// `IApplicationViewCollection::GetViewForHwnd`: no view for this window.
+pub const TYPE_E_ELEMENTNOTFOUND: i32 = 0x8002_802B_u32 as i32;
+
 /// HRESULTs meaning "the server (explorer.exe) is gone / not reachable right now".
 const TRANSIENT_HRESULTS: [u32; 9] = [
     0x800706BA, // RPC_S_SERVER_UNAVAILABLE
@@ -46,6 +49,12 @@ impl Error {
     pub fn is_transient(&self) -> bool {
         matches!(self, Error::Transient(_))
     }
+
+    /// The window has no application view (yet): Explorer creates it shortly after the window is
+    /// shown, and windows outside the task switcher never get one. Not a failure of the window.
+    pub fn is_no_view(&self) -> bool {
+        self.hr() == TYPE_E_ELEMENTNOTFOUND
+    }
 }
 
 impl fmt::Display for Error {
@@ -72,7 +81,8 @@ pub trait DesktopBackend {
     /// All desktops in display order.
     fn desktops(&self) -> Result<Vec<Guid>>;
     fn current(&self) -> Result<Guid>;
-    /// Cheap check, done BEFORE creating a desktop.
+    /// Cheap check, done BEFORE creating a desktop. A window without an application view yields
+    /// an error with `is_no_view()` (it may get one a moment later), not `Ok(false)`.
     fn can_move(&self, hwnd: HWND) -> Result<bool>;
     /// Creates a desktop (always appended at the end).
     fn create(&self) -> Result<Guid>;

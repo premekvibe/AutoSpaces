@@ -41,6 +41,19 @@ struct World {
     move_noop: Cell<bool>,
     creates: Cell<u32>,
     can_move_calls: Cell<u32>,
+    /// Process name per window id (default `app.exe`).
+    procs: RefCell<HashMap<usize, String>>,
+    /// Commands passed to `WindowSystem::launch`.
+    launched: RefCell<Vec<String>>,
+    launch_fails: Cell<bool>,
+    /// Foreground window id (0 = none).
+    fg: Cell<usize>,
+    /// Windows `activate` was called for.
+    activated: RefCell<Vec<usize>>,
+    /// Windows `maximize_inactive` was called for.
+    maximized: RefCell<Vec<usize>>,
+    /// Windows without a maximize box (splash screens).
+    no_max_box: RefCell<Vec<usize>>,
 }
 
 impl World {
@@ -157,7 +170,19 @@ impl WindowSystem for FW {
         self.0.wins.borrow().get(&(hwnd as usize)).is_some_and(|w| w.candidate)
     }
     fn process(&self, hwnd: HWND) -> (String, u32) {
-        ("app.exe".into(), hwnd as u32 + 1000)
+        let p = self.0.procs.borrow().get(&(hwnd as usize)).cloned().unwrap_or_else(|| "app.exe".into());
+        (p, hwnd as u32 + 1000)
+    }
+    fn exe_path(&self, pid: u32) -> String {
+        let id = pid as usize - 1000;
+        format!(r"C:\apps\{}", self.0.procs.borrow().get(&id).cloned().unwrap_or_else(|| "app.exe".into()))
+    }
+    fn app_name(&self, pid: u32) -> String {
+        format!("Name {}", pid - 1000)
+    }
+    fn launch(&self, command: &str, _args: &str) -> bool {
+        self.0.launched.borrow_mut().push(command.to_string());
+        !self.0.launch_fails.get()
     }
     fn class(&self, _hwnd: HWND) -> String {
         "Cls".into()
@@ -169,7 +194,24 @@ impl WindowSystem for FW {
             .map(|(k, _)| h(*k))
             .collect()
     }
-    fn activate(&self, _hwnd: HWND) {}
+    fn activate(&self, hwnd: HWND) {
+        self.0.activated.borrow_mut().push(hwnd as usize);
+        self.0.fg.set(hwnd as usize);
+    }
+    fn foreground(&self) -> HWND {
+        h(self.0.fg.get())
+    }
+    fn maximize_inactive(&self, hwnd: HWND) -> bool {
+        let id = hwnd as usize;
+        if self.0.no_max_box.borrow().contains(&id) {
+            return false;
+        }
+        self.0.maximized.borrow_mut().push(id);
+        if let Some(w) = self.0.wins.borrow_mut().get_mut(&id) {
+            w.state = State::Maximized;
+        }
+        true
+    }
     fn now(&self) -> u64 {
         self.0.now.get()
     }
@@ -305,6 +347,7 @@ fn resolve_origin_walks_chain_of_vanished_origins() {
 #[test]
 fn cannot_move_creates_nothing_and_rejects() {
     let (w, mut o, log) = setup(2);
+    w.input.set(true); // the user maximized it
     w.open(1, State::Maximized);
     w.wins.borrow_mut().get_mut(&1).unwrap().can_move = false;
     ev(&w, &mut o, 1, Loc);
@@ -325,6 +368,7 @@ fn cannot_move_creates_nothing_and_rejects() {
 #[test]
 fn move_failure_rolls_back() {
     let (w, mut o, log) = setup(2);
+    w.input.set(true);
     w.open(1, State::Maximized);
     w.fail_move.set(Some(PERMANENT));
     ev(&w, &mut o, 1, Loc);
@@ -337,6 +381,7 @@ fn move_failure_rolls_back() {
 #[test]
 fn move_not_applied_rolls_back() {
     let (w, mut o, log) = setup(2);
+    w.input.set(true);
     w.open(1, State::Maximized);
     w.move_noop.set(true);
     ev(&w, &mut o, 1, Loc);
@@ -956,44 +1001,126 @@ fn setup_store(n: u32) -> (Rc<World>, Orchestrator<FB, FW>, Rc<Cell<u64>>) {
     (w, o, t)
 }
 
+/// The user maximizes window `id` (a new one when it does not exist yet), which cannot move.
+fn user_maximizes_unmovable(w: &World, o: &mut Orchestrator<FB, FW>, id: usize) {
+    if !w.wins.borrow().contains_key(&id) {
+        w.open(id, State::Normal);
+    }
+    w.wins.borrow_mut().get_mut(&id).unwrap().can_move = false;
+    w.set_state(id, State::Normal);
+    ev(w, o, id, Loc);
+    w.set_state(id, State::Maximized);
+    w.input.set(true);
+    ev(w, o, id, Loc);
+}
+
 #[test]
 fn hard_failure_blocks_process_for_good_and_rejects_window() {
     let (w, mut o, _) = setup_store(2);
-    w.open(1, State::Maximized);
-    w.wins.borrow_mut().get_mut(&1).unwrap().can_move = false;
-    ev(&w, &mut o, 1, Loc);
-    assert_eq!(w.can_move_calls.get(), 1);
+    // Plan 6.7: one refusal never blocks; three windows refused right after the user maximized
+    // them do (the same window counts once however often it is tried).
+    for _ in 0..3 {
+        user_maximizes_unmovable(&w, &mut o, 1);
+    }
+    assert!(o.learned_mut().list_blocked().is_empty(), "one window, one strike");
+    user_maximizes_unmovable(&w, &mut o, 2);
+    assert!(o.learned_mut().list_blocked().is_empty());
+    user_maximizes_unmovable(&w, &mut o, 3);
     assert_eq!(o.learned_mut().list_blocked(), ["app.exe"]);
+    let calls = w.can_move_calls.get();
     // A new window of the same process is never entered: no can_move, create or move calls.
-    w.wins.borrow_mut().get_mut(&1).unwrap().can_move = true;
-    w.set_state(1, State::Normal);
-    ev(&w, &mut o, 1, Loc);
-    w.set_state(1, State::Maximized);
-    ev(&w, &mut o, 1, Loc);
-    w.open(2, State::Maximized);
-    ev(&w, &mut o, 2, Loc);
-    assert_eq!((w.can_move_calls.get(), w.creates.get(), w.count()), (1, 0, 2));
-    assert!(!o.is_managed(h(1)) && !o.is_managed(h(2)) && o.is_rejected(h(2)));
+    w.open(4, State::Maximized);
+    ev(&w, &mut o, 4, Loc);
+    assert_eq!((w.can_move_calls.get(), w.creates.get(), w.count()), (calls, 0, 2));
+    assert!(!o.is_managed(h(4)) && o.is_rejected(h(4)));
     // Forgetting lets the next maximize through.
     o.forget_learned(Some("app.exe"));
-    ev(&w, &mut o, 2, Loc);
-    assert!(o.is_managed(h(2)));
+    ev(&w, &mut o, 4, Loc);
+    assert!(o.is_managed(h(4)));
+}
+
+#[test]
+fn refusals_that_are_not_real_attempts_are_not_counted() {
+    let (w, mut o, _) = setup_store(2);
+    // Opened maximized by the app itself (no user input), many windows: nothing is learned.
+    for id in 1..=5 {
+        w.open(id, State::Maximized);
+        w.wins.borrow_mut().get_mut(&id).unwrap().can_move = false;
+        ev(&w, &mut o, id, Event::Show);
+    }
+    assert!(o.learned_mut().list_blocked().is_empty());
+    // With user input, but the window was just shown (still starting up).
+    w.input.set(true);
+    for id in 6..=8 {
+        w.open(id, State::Maximized);
+        w.wins.borrow_mut().get_mut(&id).unwrap().can_move = false;
+        o.on_event(h(id), Event::Show);
+        w.tick(100);
+        o.on_event(h(id), Loc);
+    }
+    assert!(o.learned_mut().list_blocked().is_empty());
+    // On another desktop (not the one being viewed).
+    for id in 9..=11 {
+        w.open(id, State::Normal);
+        w.wins.borrow_mut().get_mut(&id).unwrap().desktop = g(2);
+        w.wins.borrow_mut().get_mut(&id).unwrap().can_move = false;
+        w.set_state(id, State::Maximized);
+        ev(&w, &mut o, id, Loc);
+    }
+    assert!(o.learned_mut().list_blocked().is_empty());
+    // Lock screen / touch keyboard / shell windows are never even asked.
+    let calls = w.can_move_calls.get();
+    for (id, p) in [(20, "lockapp.exe"), (21, "textinputhost.exe")] {
+        w.open(id, State::Maximized);
+        w.procs.borrow_mut().insert(id, p.to_string());
+        ev(&w, &mut o, id, Loc);
+        assert!(o.is_rejected(h(id)));
+    }
+    assert_eq!(w.can_move_calls.get(), calls);
+}
+
+#[test]
+fn window_without_a_view_yet_is_waited_for_not_learned() {
+    let (w, mut o, _) = setup_store(2);
+    w.input.set(true);
+    w.open(1, State::Maximized);
+    // Explorer creates the view of a new window only after SHOW.
+    w.fail_can_move.set(Some(Error::Permanent(crate::desktops::backend::TYPE_E_ELEMENTNOTFOUND)));
+    let sch = ev(&w, &mut o, 1, Event::Show).expect("looked at again soon");
+    assert_eq!((sch.hwnd, sch.delay_ms), (h(1), 40));
+    assert!(!o.is_rejected(h(1)) && w.count() == 2);
+    w.fail_can_move.set(None);
+    w.tick(40);
+    o.on_event(h(1), Event::Recheck);
+    assert!(o.is_managed(h(1)), "entered once the view exists");
+    assert!(o.learned_mut().list_blocked().is_empty());
+    // A window that never gets a view is left alone after a while, without a strike.
+    w.open(2, State::Maximized);
+    w.fail_can_move.set(Some(Error::Permanent(crate::desktops::backend::TYPE_E_ELEMENTNOTFOUND)));
+    let mut n = 0;
+    let mut next = ev(&w, &mut o, 2, Loc);
+    while next.is_some() && n < 100 {
+        n += 1;
+        w.tick(40);
+        next = o.on_event(h(2), Event::Recheck);
+    }
+    assert!(n < 100 && o.is_rejected(h(2)));
+    assert!(o.learned_mut().list_blocked().is_empty());
 }
 
 #[test]
 fn learning_off_records_and_blocks_nothing() {
     let (w, mut o, _) = setup_store(2);
     o.settings.learning = false;
-    w.open(1, State::Maximized);
-    w.wins.borrow_mut().get_mut(&1).unwrap().can_move = false;
-    ev(&w, &mut o, 1, Loc);
+    for id in 1..=3 {
+        user_maximizes_unmovable(&w, &mut o, id);
+    }
     assert!(o.learned_mut().list_blocked().is_empty());
     // Entry made while learning was on is not applied once it is off.
     o.settings.learning = true;
-    w.set_state(1, State::Normal);
-    ev(&w, &mut o, 1, Loc);
-    w.set_state(1, State::Maximized);
-    ev(&w, &mut o, 1, Loc);
+    for id in 4..=6 {
+        user_maximizes_unmovable(&w, &mut o, id);
+    }
     assert_eq!(o.learned_mut().list_blocked(), ["app.exe"]);
     o.settings.learning = false;
     w.wins.borrow_mut().get_mut(&1).unwrap().can_move = true;
@@ -1005,8 +1132,9 @@ fn learning_off_records_and_blocks_nothing() {
 }
 
 #[test]
-fn move_not_applied_blocks_on_second_strike_and_transient_is_not_recorded() {
+fn move_not_applied_blocks_on_second_window_and_transient_is_not_recorded() {
     let (w, mut o, _) = setup_store(2);
+    w.input.set(true);
     w.open(1, State::Maximized);
     w.fail_move.set(Some(TRANSIENT));
     ev(&w, &mut o, 1, Loc);
@@ -1014,26 +1142,32 @@ fn move_not_applied_blocks_on_second_strike_and_transient_is_not_recorded() {
     w.move_noop.set(true);
     ev(&w, &mut o, 1, Loc);
     assert!(o.learned_mut().list_blocked().is_empty());
+    // The same window again: still one strike.
     w.set_state(1, State::Normal);
     ev(&w, &mut o, 1, Loc);
     w.set_state(1, State::Maximized);
     ev(&w, &mut o, 1, Loc);
+    assert!(o.learned_mut().list_blocked().is_empty());
+    // A second window of the app fails the same way: blocked.
+    w.open(2, State::Normal);
+    ev(&w, &mut o, 2, Loc);
+    w.set_state(2, State::Maximized);
+    ev(&w, &mut o, 2, Loc);
     assert_eq!(o.learned_mut().list_blocked(), ["app.exe"]);
 }
 
 #[test]
 fn nothing_is_learned_while_backend_reinitialises() {
     let (w, mut o, _) = setup_store(2);
-    w.open(1, State::Maximized);
-    w.wins.borrow_mut().get_mut(&1).unwrap().can_move = false;
     o.suspend_learning();
-    ev(&w, &mut o, 1, Loc);
+    for id in 1..=3 {
+        user_maximizes_unmovable(&w, &mut o, id);
+    }
     assert!(o.learned_mut().list_blocked().is_empty());
     o.set_backend(FB(w.clone()));
-    w.set_state(1, State::Normal);
-    ev(&w, &mut o, 1, Loc);
-    w.set_state(1, State::Maximized);
-    ev(&w, &mut o, 1, Loc);
+    for id in 4..=6 {
+        user_maximizes_unmovable(&w, &mut o, id);
+    }
     assert_eq!(o.learned_mut().list_blocked(), ["app.exe"]);
 }
 
@@ -1211,4 +1345,423 @@ fn apply_settings_keeps_the_tray_toggle() {
     o.set_enabled(false);
     o.apply_settings(Settings::default());
     assert!(!o.settings.enabled);
+}
+
+// ---------------------------------------------------------------- layout profile (plan 12.7)
+
+use super::orchestrator::{layout_start_token, layout_tick_token};
+use super::settings::{Layout, LayoutRule};
+
+fn profile(count: u32, rules: &[(u32, &str)]) -> Settings {
+    let mut s = Settings::default();
+    s.layout = Layout {
+        enabled: true,
+        desktop_count: count,
+        start_delay_ms: 1000,
+        rules: rules.iter().map(|(d, p)| LayoutRule::new(*d, "", p, "", p).unwrap()).collect(),
+    };
+    s
+}
+
+fn proc_of(w: &World, id: usize, name: &str) {
+    w.procs.borrow_mut().insert(id, name.to_string());
+}
+
+fn logged(o: &mut Orch, needle: &str) -> bool {
+    o.drain_log().iter().any(|l| l.contains(needle))
+}
+
+/// Desktop 2 mail.exe (running), desktop 3 trade.exe (missing): applied on a 1-desktop world.
+fn layout_world() -> (Rc<World>, Orch) {
+    let w = World::new(1);
+    put(&w, 1, 1);
+    proc_of(&w, 1, "mail.exe");
+    let mut o = started(&w);
+    o.apply_settings(profile(3, &[(2, "mail.exe"), (3, "trade.exe")]));
+    (w, o)
+}
+
+#[test]
+fn layout_moves_running_app_and_launches_missing_one() {
+    let (w, mut o) = layout_world();
+    let sch = o.start_layout().expect("trade.exe is awaited: a timer is requested");
+    assert_eq!(sch.hwnd, layout_tick_token());
+    assert_eq!(list(&w), vec![1, 2, 3]);
+    assert_eq!(w.desk_of(1), g(2), "running mail.exe moved");
+    assert_eq!(*w.launched.borrow(), vec!["trade.exe".to_string()], "only the missing app is launched");
+    assert_eq!(w.current.get(), g(1), "the user stays where they were");
+    assert_eq!(o.baseline(), 3);
+    assert!(o.layout_running());
+    // The launched app shows its window (on the current desktop) -> moved by the event.
+    w.open(2, State::Normal);
+    proc_of(&w, 2, "trade.exe");
+    ev(&w, &mut o, 2, Event::Show);
+    assert_eq!(w.desk_of(2), g(3));
+    assert_eq!(*w.maximized.borrow(), vec![2], "the launched app is maximized, the running one is not");
+    assert_eq!(w.state(2), State::Maximized);
+    assert!(o.layout_running(), "the launched app is followed for a while");
+    settle(&w, &mut o);
+    assert!(!o.layout_running());
+    assert_eq!(w.current.get(), g(1));
+    assert_eq!(list(&w), vec![1, 2, 3]);
+    assert!(!o.is_managed(h(2)), "registered as placed: no helper desktop");
+}
+
+/// Lets the profile run settle (timer ticks until it ends).
+fn settle(w: &World, o: &mut Orch) {
+    for _ in 0..100 {
+        w.tick(500);
+        if o.on_event(layout_tick_token(), Event::Recheck).is_none() {
+            return;
+        }
+    }
+    panic!("the profile run never ended");
+}
+
+impl World {
+    fn state(&self, id: usize) -> State {
+        self.wins.borrow()[&id].state
+    }
+}
+
+#[test]
+fn layout_desktops_are_kept_when_empty_or_in_the_middle() {
+    let (w, mut o) = layout_world();
+    o.start_layout();
+    w.open(2, State::Normal);
+    proc_of(&w, 2, "trade.exe");
+    ev(&w, &mut o, 2, Event::Show);
+    // mail.exe closes: desktop 2 is empty and desktop 3 is used, yet it is a profile desktop.
+    w.set_state(1, State::Destroyed);
+    ev(&w, &mut o, 1, Event::Destroy);
+    w.tick(1000);
+    o.on_event(std::ptr::null_mut(), Event::Recheck);
+    o.poll();
+    assert_eq!(list(&w), vec![1, 2, 3]);
+    // A helper desktop for an ordinary maximized window still comes after them (and goes again).
+    put(&w, 5, 1);
+    w.set_state(5, State::Maximized);
+    ev(&w, &mut o, 5, Loc);
+    assert_eq!(list(&w), vec![1, 2, 3, 4]);
+    assert_eq!(w.desk_of(5), g(4));
+    w.set_state(5, State::Normal);
+    ev(&w, &mut o, 5, Loc);
+    assert_eq!(list(&w), vec![1, 2, 3]);
+}
+
+#[test]
+fn layout_gives_up_after_the_limit_and_logs_it() {
+    let (w, mut o) = layout_world();
+    o.start_layout();
+    o.drain_log();
+    w.tick(10_000);
+    assert!(o.on_event(layout_tick_token(), Event::Recheck).is_some(), "still waiting");
+    assert!(o.layout_running());
+    w.tick(25_000);
+    assert!(o.on_event(layout_tick_token(), Event::Recheck).is_none());
+    assert!(!o.layout_running());
+    assert!(logged(&mut o, "gave up waiting for a window of trade.exe"));
+    assert_eq!(list(&w), vec![1, 2, 3], "desktops stay: the profile still counts for B");
+    // A late timer does nothing.
+    assert!(o.on_event(layout_tick_token(), Event::Recheck).is_none());
+}
+
+#[test]
+fn layout_timer_finds_a_window_that_was_not_yet_a_candidate_at_show() {
+    let (w, mut o) = layout_world();
+    o.start_layout();
+    w.open(2, State::Normal);
+    proc_of(&w, 2, "trade.exe");
+    w.wins.borrow_mut().get_mut(&2).unwrap().candidate = false;
+    ev(&w, &mut o, 2, Event::Show);
+    assert_eq!(w.desk_of(2), g(1), "not a candidate yet");
+    w.wins.borrow_mut().get_mut(&2).unwrap().candidate = true;
+    w.tick(500);
+    assert!(o.on_event(layout_tick_token(), Event::Recheck).is_some(), "settling");
+    assert_eq!(w.desk_of(2), g(3));
+    settle(&w, &mut o);
+    assert!(!o.layout_running());
+}
+
+/// trade.exe launched by the profile (desktop 3 of 3), the user on desktop 1 in window 50.
+fn launched_world() -> (Rc<World>, Orch) {
+    let w = World::new(1);
+    put(&w, 50, 1);
+    proc_of(&w, 50, "editor.exe");
+    w.fg.set(50);
+    let mut o = started(&w);
+    o.apply_settings(profile(3, &[(3, "trade.exe")]));
+    assert!(o.start_layout().is_some());
+    (w, o)
+}
+
+#[test]
+fn layout_main_window_after_splash_follows_it_no_extra_desktop() {
+    let (w, mut o) = launched_world();
+    // Splash screen first (no maximize box), then the main window, shown maximized.
+    w.open(2, State::Normal);
+    proc_of(&w, 2, "trade.exe");
+    w.no_max_box.borrow_mut().push(2);
+    ev(&w, &mut o, 2, Event::Show);
+    assert_eq!(w.desk_of(2), g(3));
+    w.set_state(2, State::Destroyed);
+    ev(&w, &mut o, 2, Event::Destroy);
+    w.open(3, State::Maximized);
+    proc_of(&w, 3, "trade.exe");
+    ev(&w, &mut o, 3, Event::Show);
+    assert_eq!(w.desk_of(3), g(3), "follows the app to its desktop");
+    assert!(!o.is_managed(h(3)));
+    assert_eq!(list(&w), vec![1, 2, 3], "no helper desktop, no gap between profile desktops");
+    assert_eq!(w.current.get(), g(1));
+    settle(&w, &mut o);
+    // Later the user restores and maximizes it again: it stays on its desktop (plan 12.7).
+    w.set_state(3, State::Normal);
+    ev(&w, &mut o, 3, Loc);
+    w.set_state(3, State::Maximized);
+    ev(&w, &mut o, 3, Loc);
+    assert_eq!((w.desk_of(3), list(&w)), (g(3), vec![1, 2, 3]));
+}
+
+#[test]
+fn layout_window_without_a_view_yet_is_placed_as_soon_as_it_has_one() {
+    let (w, mut o) = launched_world();
+    w.open(2, State::Maximized);
+    proc_of(&w, 2, "trade.exe");
+    w.fail_can_move.set(Some(Error::Permanent(crate::desktops::backend::TYPE_E_ELEMENTNOTFOUND)));
+    let sch = ev(&w, &mut o, 2, Event::Show).expect("fast timer");
+    assert_eq!((sch.hwnd, sch.delay_ms), (layout_tick_token(), 40));
+    assert_eq!(w.desk_of(2), g(1));
+    assert!(!o.is_managed(h(2)), "the ordinary logic did not take it either");
+    assert_eq!(w.count(), 3);
+    w.fail_can_move.set(None);
+    w.tick(40);
+    o.on_event(layout_tick_token(), Event::Recheck);
+    assert_eq!(w.desk_of(2), g(3));
+    assert_eq!(list(&w), vec![1, 2, 3]);
+}
+
+#[test]
+fn layout_view_and_focus_taken_by_an_app_are_given_back() {
+    let (w, mut o) = launched_world();
+    // The app takes the focus on the current desktop, then is moved away.
+    w.open(2, State::Normal);
+    proc_of(&w, 2, "trade.exe");
+    w.fg.set(2);
+    ev(&w, &mut o, 2, Event::Show);
+    assert_eq!(w.desk_of(2), g(3));
+    assert_eq!(w.fg.get(), 50, "focus given back to the window the user worked in");
+    // Later the app activates its window again: Windows switches the view to desktop 3.
+    w.fg.set(2);
+    w.current.set(g(3));
+    o.poll(); // the desktop registry key changed
+    assert_eq!(w.current.get(), g(1), "view returned");
+    assert_eq!(w.fg.get(), 50);
+    assert!(logged(&mut o, "view returned"));
+    // The user goes to desktop 2 on purpose (own window in front): that is respected.
+    put(&w, 60, 2);
+    proc_of(&w, 60, "notes.exe");
+    w.current.set(g(2));
+    w.fg.set(60);
+    o.poll();
+    settle(&w, &mut o);
+    assert_eq!(w.current.get(), g(2));
+}
+
+#[test]
+fn layout_app_restoring_its_own_placement_is_maximized_again() {
+    let (w, mut o) = launched_world();
+    w.open(2, State::Normal);
+    proc_of(&w, 2, "trade.exe");
+    ev(&w, &mut o, 2, Event::Show);
+    assert_eq!(w.state(2), State::Maximized);
+    for _ in 0..5 {
+        w.set_state(2, State::Normal); // the app applies its saved (normal) placement
+        ev(&w, &mut o, 2, Loc);
+    }
+    assert_eq!(w.maximized.borrow().len(), 3, "a few times, never a fight");
+}
+
+/// The same user actions with the profile off (but rules present) and with default settings
+/// end in the same desktops and windows (plan 12.7: profile off = unchanged behaviour).
+#[test]
+fn profile_off_behaves_like_no_profile() {
+    let run = |settings: Settings| {
+        let w = World::new(2);
+        put(&w, 1, 1);
+        proc_of(&w, 1, "trade.exe");
+        put(&w, 2, 2);
+        proc_of(&w, 2, "mail.exe");
+        let mut o = started(&w);
+        o.apply_settings(settings);
+        assert!(o.layout_start_schedule().is_none());
+        let mut trace = Vec::new();
+        for (id, st) in [(1, State::Maximized), (2, State::Maximized), (1, State::Normal), (2, State::Normal)] {
+            w.set_state(id, st);
+            ev(&w, &mut o, id, Loc);
+            trace.push((list(&w), w.current.get().d1, w.desk_of(1).d1, w.desk_of(2).d1));
+        }
+        trace
+    };
+    let mut off = profile(3, &[(2, "mail.exe"), (1, "trade.exe")]);
+    off.layout.enabled = false;
+    assert_eq!(run(off), run(Settings::default()));
+}
+
+#[test]
+fn profile_window_restarted_stays_on_its_desktop_only_while_profile_on() {
+    let (w, mut o) = layout_world(); // mail.exe on desktop 2, trade.exe launched for desktop 3
+    o.start_layout();
+    w.open(2, State::Normal);
+    proc_of(&w, 2, "trade.exe");
+    ev(&w, &mut o, 2, Event::Show);
+    settle(&w, &mut o);
+    // A second mail.exe window on desktop 2 (opened later, not placed by the profile), maximized.
+    put(&w, 7, 2);
+    proc_of(&w, 7, "mail.exe");
+    w.current.set(g(2));
+    w.set_state(7, State::Maximized);
+    ev(&w, &mut o, 7, Loc);
+    assert_eq!((w.desk_of(7), list(&w)), (g(2), vec![1, 2, 3]), "stays on its profile desktop");
+    // Profile off: the ordinary rules of plan 12.1 apply again (own helper desktop).
+    let mut s = o.settings.clone();
+    s.layout.enabled = false;
+    o.apply_settings(s);
+    w.set_state(7, State::Normal);
+    ev(&w, &mut o, 7, Loc);
+    w.set_state(7, State::Maximized);
+    ev(&w, &mut o, 7, Loc);
+    assert!(o.is_managed(h(7)));
+}
+
+#[test]
+fn layout_launch_failure_is_logged_and_does_not_wait() {
+    let (w, mut o) = layout_world();
+    w.launch_fails.set(true);
+    assert!(o.start_layout().is_none());
+    assert!(!o.layout_running());
+    assert!(logged(&mut o, "cannot launch trade.exe"));
+    assert_eq!(w.desk_of(1), g(2));
+}
+
+#[test]
+fn layout_window_opening_maximized_goes_to_its_desktop_not_to_a_helper_one() {
+    let (w, mut o) = layout_world();
+    o.start_layout();
+    w.open(2, State::Maximized);
+    proc_of(&w, 2, "trade.exe");
+    ev(&w, &mut o, 2, Event::Show);
+    assert_eq!(w.desk_of(2), g(3));
+    assert!(!o.is_managed(h(2)));
+    // Maximizing it later (or again) does not take it away either.
+    w.set_state(2, State::Normal);
+    ev(&w, &mut o, 2, Loc);
+    w.set_state(2, State::Maximized);
+    ev(&w, &mut o, 2, Loc);
+    assert!(!o.is_managed(h(2)));
+    assert_eq!(w.desk_of(2), g(3));
+    assert_eq!(list(&w), vec![1, 2, 3]);
+}
+
+#[test]
+fn layout_never_switches_the_view_away() {
+    let w = World::new(2);
+    put(&w, 1, 2);
+    proc_of(&w, 1, "a.exe");
+    w.current.set(g(2));
+    let mut o = started(&w);
+    o.apply_settings(profile(3, &[(3, "a.exe")]));
+    assert!(o.start_layout().is_none(), "running app: nothing to wait for");
+    assert_eq!(w.desk_of(1), g(3));
+    assert_eq!(w.current.get(), g(2));
+    assert!(w.launched.borrow().is_empty());
+    assert_eq!(list(&w), vec![1, 2, 3]);
+}
+
+#[test]
+fn layout_failed_move_is_logged_and_not_retried() {
+    let (w, mut o) = layout_world();
+    w.fail_move.set(Some(PERMANENT));
+    o.start_layout();
+    assert!(logged(&mut o, "move failed"));
+    assert_eq!(w.desk_of(1), g(1));
+    // The rule for the missing app is still awaited; nothing else touches mail.exe.
+    assert!(o.layout_running());
+}
+
+#[test]
+fn layout_with_two_rules_for_one_app_uses_two_windows() {
+    let w = World::new(1);
+    for id in [1, 2] {
+        put(&w, id, 1);
+        proc_of(&w, id, "n.exe");
+    }
+    let mut o = started(&w);
+    o.apply_settings(profile(3, &[(2, "n.exe"), (3, "n.exe")]));
+    assert!(o.start_layout().is_none());
+    let mut d: Vec<u32> = [1, 2].iter().map(|i| w.desk_of(*i).d1).collect();
+    d.sort();
+    assert_eq!(d, vec![2, 3]);
+}
+
+#[test]
+fn layout_start_schedule_only_when_enabled() {
+    let w = World::new(1);
+    let mut o = started(&w);
+    assert!(o.layout_start_schedule().is_none());
+    o.apply_settings(profile(2, &[]));
+    let s = o.layout_start_schedule().unwrap();
+    assert_eq!((s.hwnd, s.delay_ms), (layout_start_token(), 1000));
+    // The start timer applies the profile: an empty rule list just completes the desktops.
+    assert!(o.on_event(layout_start_token(), Event::Recheck).is_none());
+    assert_eq!(list(&w), vec![1, 2]);
+}
+
+#[test]
+fn layout_profile_off_releases_the_pinned_desktops() {
+    let (w, mut o) = layout_world();
+    o.start_layout();
+    w.open(2, State::Normal);
+    proc_of(&w, 2, "trade.exe");
+    ev(&w, &mut o, 2, Event::Show);
+    let mut s = o.settings.clone();
+    s.layout.enabled = false;
+    o.apply_settings(s);
+    w.set_state(1, State::Destroyed);
+    ev(&w, &mut o, 1, Event::Destroy);
+    w.tick(1000);
+    o.on_event(std::ptr::null_mut(), Event::Recheck);
+    // The gap (desktop 2) is closed again; B = 3 still holds, so a new one is added at the end.
+    assert_eq!(list(&w), vec![1, 3, 4]);
+}
+
+#[test]
+fn capture_layout_reads_desktops_and_windows() {
+    let w = World::new(2);
+    for (id, d, p) in [(1, 2, "mail.exe"), (2, 2, "mail.exe"), (3, 1, "explorer.exe"), (4, 1, "calc.exe")] {
+        put(&w, id, d);
+        proc_of(&w, id, p);
+    }
+    let o = started(&w);
+    let (n, rules) = o.capture_layout();
+    assert_eq!(n, 2);
+    let got: Vec<(u32, &str)> = rules.iter().map(|r| (r.desktop, r.process.as_str())).collect();
+    assert_eq!(got, vec![(1, "calc.exe"), (2, "mail.exe")]);
+    assert_eq!(rules[0].launch, r"C:\apps\calc.exe");
+    assert_eq!(rules[0].name, "Name 4");
+}
+
+#[test]
+fn capture_layout_ignores_helper_desktops() {
+    let w = World::new(1);
+    put(&w, 1, 1);
+    let mut o = started(&w);
+    w.set_state(1, State::Maximized);
+    ev(&w, &mut o, 1, Loc);
+    assert!(o.is_managed(h(1)));
+    put(&w, 2, 1);
+    proc_of(&w, 2, "calc.exe");
+    let (n, rules) = o.capture_layout();
+    assert_eq!(n, 1, "the helper desktop is not part of the profile");
+    assert_eq!(rules.len(), 1);
+    assert_eq!(rules[0].desktop, 1);
 }

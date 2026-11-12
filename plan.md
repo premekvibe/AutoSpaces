@@ -397,6 +397,14 @@ Okna, která **vůbec nejdou maximalizovat** (nemají `WS_MAXIMIZEBOX`), událos
 
 **Implementace:** v paměti `HashMap<(proces, třída), Entry>` (desítky záznamů, zanedbatelná paměť), dotaz O(1) na začátku `EnterSpace`. Zápis na disk jen při změně. Odděleno od ručního `excludedProcesses` v nastavení (ten má vždy přednost a nikdy se nemaže).
 
+**Revize 3 (konzervativní učení, po chybných záznamech u uživatele: Edge, Audacity, zamykací obrazovka …):**
+- *Příčina:* `GetViewForHwnd` při události SHOW ještě nevrací view (Explorer ho vytvoří 7–200 ms po zobrazení, změřeno) a backend to hlásil jako `CanViewMoveDesktops = false`. Okno otevřené rovnou maximalizované (Audacity, Music Maker, nové okno Edge) tak napoprvé zablokovalo celou aplikaci; okna zamykací obrazovky a dotykové klávesnice view nemají nikdy.
+- „Bez view“ (`TYPE_E_ELEMENTNOTFOUND`) není selhání: okno se zkouší znovu po 40 ms (nejvýš 25×), pak se jen nechá být – nikdy se nezapisuje.
+- Systémová okna se vůbec nezpracovávají: procesy jen shellu (`textinputhost`, `shellexperiencehost`, `searchhost`, `startmenuexperiencehost`, `lockapp`, `logonui`) a třídy `Windows.UI.Core.CoreWindow`, `LockScreenBackstopFrame`, `Progman`, `WorkerW`, `Shell_TrayWnd` … Nikdy se neučí nic o `SYSTEM_HOSTS` (i `explorer.exe`, `applicationframehost.exe` – hostí mnoho aplikací; jejich okna se ale dál zpracovávají).
+- Selhání se počítá jen při skutečném pokusu: okno je kandidát, není cloaked, je na právě zobrazené ploše, uživatel ho právě maximalizoval (vstup ≤ 1 s), je zobrazené déle než 2 s, neběží profil ploch ani restart Exploreru. Každé okno dá nejvýš jeden zásah, takže jedno problémové okno aplikaci samo nezablokuje.
+- Prahy: `NoView`, `CannotMove`, `HideShowFailed` 3 zásahy (různá okna); `MoveFailed`, `AccessDenied`, `MoveNotApplied`, `ShortLived` 2; `Flapping` 3 během 10 min.
+- Při načtení se zahodí záznamy, které by podle těchto pravidel nevznikly (systémové procesy a třídy, blokace s menším počtem zásahů než je práh) a soubor se přepíše.
+
 ---
 
 ## 7. Fáze a akceptační kritéria
@@ -536,7 +544,8 @@ Nativní dialog z nabídky ikony: ikona, název, verze (`CARGO_PKG_VERSION`), au
 |---|---|---|
 | 0–4 | kostra, plochy, logika, naučený seznam, ikona | hotovo |
 | 4b | správa počtu ploch podle 12.1 | probíhá |
-| 5 | settings.json + dialog Nastavení (12.2), spouštění po startu | čeká |
+| 5 | settings.json + dialog Nastavení (12.2), spouštění po startu | hotovo |
+| 5b | profil rozložení ploch po startu (12.7) | hotovo (vyzkoušeno živě při 96 DPI) |
 | 6 | dialog O aplikaci (12.4), VERSIONINFO | čeká |
 | 7 | instalátor (12.3) | čeká |
 | 8 | záložní režim pro neznámé verze Windows (5.2) | čeká |
@@ -586,6 +595,16 @@ Cíl: v nastavení určit, kolik ploch má po startu existovat a které aplikace
 - TradingView existuje jako desktopová aplikace i jako web v prohlížeči – druhý případ potřebuje párování podle titulku.
 
 **Zařazení:** nová fáze 5b (po dialogu Nastavení, před O aplikaci). Odhad 2–3 dny.
+
+**Revize po zkoušce se skutečnými aplikacemi (Outlook, TradingView):**
+- *Příčiny chyb:* aplikace po přesunu aktivovaly své okno a Windows přepnul pohled na jeho plochu (profil končil hned po přesunu prvního okna, takže nic nevracel); okno se nemaximalizovalo; hlavní okno po úvodní obrazovce už nebylo okno profilu, otevřelo se maximalizované na aktuální ploše a běžná logika mu založila pomocnou plochu za plochami profilu (vypadalo to jako prázdná plocha mezi nimi); při SHOW ještě neexistuje view, takže přesun selhal a pravidlo se zahodilo.
+- *Spouštění:* klasické aplikace `CreateProcessW` se `STARTF_USESHOWWINDOW` + `SW_SHOWMINNOACTIVE` (první okno minimalizované a neaktivní; `ShellExecute` exe naopak natáhl do procesu desítky DLL rozšíření shellu). Balíčkové aplikace (WindowsApps) přes `shell:AppsFolder\<AUMID>` (AUMID z `GetApplicationUserModelId` u běžícího procesu, u vybraného exe z `AppxManifest.xml`); staré záznamy s cestou do WindowsApps se při načtení převedou. Po dobu běhu profilu `LockSetForegroundWindow` (best effort, uvolní ho jakýkoli vstup uživatele).
+- *Umístění:* okno se přesune, jakmile má view (do té doby časovač 40 ms), zaregistruje se jako umístěné profilem (běžná logika ho nikdy nedá na pomocnou plochu) a spuštěné aplikace se maximalizují bez aktivace: minimalizované okno přes `SetWindowPlacement(WPF_RESTORETOMAXIMIZED)` + `SW_SHOWNOACTIVATE`, ostatní `ShowWindowAsync(SW_MAXIMIZE)` až po vrácení fokusu (ověřeno: bez přepnutí pohledu). O minimalizaci cizího okna AutoSpaces nikdy nežádá (mod animace minimalizace ve Windhawku by do procesu nahrál Direct3D, +63 MB). Obnoví-li si aplikace vlastní umístění, maximalizuje se znovu (nejvýš 3×).
+- *Doběh:* po prvním okně se aplikace 10 s „sleduje“ – další její nová okna (hlavní okno po úvodní obrazovce) jdou na stejnou plochu. Po celou dobu hlídač vrací pohled (bez animace) a fokus uživateli, pokud se přepnul kvůli oknu profilu; přepnutí na jinou plochu s vlastním oknem v popředí bere jako vůli uživatele.
+- Maximalizované okno aplikace z profilu na ploše svého pravidla tam zůstává (i nové okno té aplikace). Vypnutý profil = žádná z těchto cest se nepoužije (test `profile_off_behaves_like_no_profile`).
+- *Ověřeno živě* (Poznámkový blok přes AUMID, msinfo32): obě okna na svých plochách maximalizovaná do 2 s, 0 přepnutí pohledu, fokus uživateli nezmizel ani v jednom 15ms vzorku.
+
+**Odchylky při implementaci (fáze 5b):** profil je samostatný dialog „Rozložení ploch…“ (ne záložka) a pravidlo má jen plochu, název, `launch`, `args` a `match.process` – `runAtStart` je vždy zapnuté a `keepOnDesktop`, `match.title`, názvy ploch a tabulka s argumenty chybí; neúspěch je jen v logu, ne v dialogu. Oproti návrhu přibyl přepínač `enabled`, tlačítko „Použít teď“ a okno profilu se při čekání hledá i 500ms časovačem (jen po dobu čekání), protože při události SHOW ještě nemusí být kandidátem; plochy profilu se při výběru pomocné plochy pro maximalizované okno také přeskakují.
 
 ### 12.8 Přepínání do existujícího okna
 

@@ -74,4 +74,35 @@ pub trait WindowSystem {
     fn app_name(&self, _pid: u32) -> String {
         String::new()
     }
+    /// Full path of the exe of process `pid`; empty when unknown.
+    fn exe_path(&self, _pid: u32) -> String {
+        String::new()
+    }
+    /// How to start the app of process `pid` again: `shell:AppsFolder\<AUMID>` for packaged apps
+    /// (their exe path contains the version), else the exe path; empty when unknown.
+    fn launch_command(&self, pid: u32) -> String {
+        self.exe_path(pid)
+    }
+    /// Starts an application (`ShellExecute`, without activation where the app allows it);
+    /// false when it could not be started.
+    /// Must return quickly: the window is awaited by events, not by blocking.
+    fn launch(&self, _command: &str, _args: &str) -> bool {
+        false
+    }
+    /// While the profile launches apps: keeps other processes from taking the foreground
+    /// (`LockSetForegroundWindow`; best effort, lifted by any user input).
+    fn hold_foreground(&self, _on: bool) {}
+    /// The window is cloaked (e.g. it lives on another virtual desktop).
+    fn is_cloaked(&self, _hwnd: HWND) -> bool {
+        false
+    }
+    /// The foreground window (null when none).
+    fn foreground(&self) -> HWND {
+        std::ptr::null_mut()
+    }
+    /// Maximizes without activating (asynchronous; the window's thread may be busy).
+    /// False when the window cannot be maximized (no maximize box, e.g. a splash screen).
+    fn maximize_inactive(&self, _hwnd: HWND) -> bool {
+        false
+    }
 }

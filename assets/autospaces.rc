@@ -12,6 +12,8 @@
 #define WS_BORDER 0x800000
 #define WS_VSCROLL 0x200000
 #define WS_HSCROLL 0x100000
+#define ES_NUMBER 0x2000
+#define ES_AUTOHSCROLL 0x80
 #define LBS_NOTIFY 1
 #define LBS_SORT 2
 #define LBS_NOINTEGRALHEIGHT 0x100
@@ -45,8 +47,33 @@ BEGIN
     PUSHBUTTON      "Otevřít nastavení Windows…", 141, 14, 232, 120, 14
     LTEXT           "Aby klik na ikonu běžící aplikace přepnul na její plochu, nastavte ve Windows v části Plochy „Na hlavním panelu zobrazovat všechna otevřená okna“ na „Na všech plochách“. Shift + klik na ikonu spustí novou instanci aplikace.", 142, 14, 250, 278, 28
 
+    PUSHBUTTON      "Rozložení ploch…", 143, 6, 288, 100, 14, WS_TABSTOP
     DEFPUSHBUTTON   "OK", 1, 190, 288, 50, 14
     PUSHBUTTON      "Storno", 2, 246, 288, 50, 14
+END
+
+103 DIALOGEX 0, 0, 330, 226
+STYLE DS_SHELLFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "AutoSpaces – Rozložení ploch po startu"
+FONT 9, "MS Shell Dlg", 400, 0, 1
+BEGIN
+    AUTOCHECKBOX    "Po spuštění AutoSpaces rozmístit aplikace na plochy", 160, 6, 6, 318, 10, WS_TABSTOP
+    LTEXT           "Počet ploch po startu:", -1, 6, 24, 100, 10
+    EDITTEXT        161, 108, 22, 26, 12, ES_NUMBER | ES_AUTOHSCROLL | WS_TABSTOP
+    LTEXT           "Nová aplikace na plochu č.:", -1, 152, 24, 128, 10
+    EDITTEXT        162, 284, 22, 26, 12, ES_NUMBER | ES_AUTOHSCROLL | WS_TABSTOP
+
+    GROUPBOX        "Aplikace na plochách", -1, 6, 40, 318, 112
+    LISTBOX         163, 14, 52, 222, 94, LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | WS_BORDER | WS_VSCROLL | WS_HSCROLL | WS_TABSTOP
+    PUSHBUTTON      "Přidat z běžících…", 164, 242, 52, 76, 14, WS_TABSTOP
+    PUSHBUTTON      "Přidat soubor .exe…", 165, 242, 70, 76, 14, WS_TABSTOP
+    PUSHBUTTON      "Odebrat", 166, 242, 88, 76, 14, WS_TABSTOP
+
+    LTEXT           "Při startu AutoSpaces doplní počet ploch, okna běžících aplikací přesune na zvolené plochy a ostatní aplikace spustí. Okno, které se do 30 sekund neobjeví, se vzdá a zapíše do protokolu. Pohled zůstane na vaší ploše.", -1, 6, 158, 318, 34
+    PUSHBUTTON      "Převzít současný stav", 167, 6, 196, 100, 14, WS_TABSTOP
+    PUSHBUTTON      "Použít teď", 168, 112, 196, 60, 14, WS_TABSTOP
+    DEFPUSHBUTTON   "OK", 1, 218, 196, 50, 14
+    PUSHBUTTON      "Storno", 2, 274, 196, 50, 14
 END
 
 102 DIALOGEX 0, 0, 240, 170

@@ -129,10 +129,26 @@ fn settings_path() -> Option<std::path::PathBuf> {
 }
 
 fn load_settings() -> Settings {
-    match settings_path() {
-        Some(p) => Settings::load(&p),
-        None => Settings::default(),
+    let Some(p) = settings_path() else { return Settings::default() };
+    let mut s = Settings::load(&p);
+    // Plan 12.7: older versions stored packaged apps by their versioned WindowsApps path.
+    if s.layout.migrate_packaged(read_manifest) {
+        match s.save(&p) {
+            Ok(()) => log_line("settings.json: packaged apps of the layout profile now start by AUMID"),
+            Err(e) => log_line(&format!("settings.json not saved: {e}")),
+        }
     }
+    s
+}
+
+/// `AppxManifest.xml` of a package folder.
+fn read_manifest(folder: &str) -> Option<String> {
+    std::fs::read_to_string(std::path::Path::new(folder).join("AppxManifest.xml")).ok()
+}
+
+/// Launch command for an exe the user picked: packaged apps by AUMID (plan 12.7).
+pub fn launch_for_path(path: &str) -> String {
+    core::settings::packaged_launch(path, read_manifest).unwrap_or_else(|| path.to_string())
 }
 
 /// Opens the settings dialog and applies the result at once.
@@ -150,7 +166,7 @@ fn open_settings(hwnd: HWND) {
     }
     let learned = o.learned_mut().list_named();
     // Modal; events keep flowing meanwhile, so the orchestrator is looked up again afterwards.
-    let Some(out) = settings_dlg::show(&current, learned, settings_dlg::running_apps) else { return };
+    let Some(out) = settings_dlg::show(&current, learned, settings_dlg::running_apps, capture_layout) else { return };
     let Some(o) = orch() else { return };
     for p in &out.forgotten {
         o.forget_learned(Some(p));
@@ -165,7 +181,14 @@ fn open_settings(hwnd: HWND) {
         }
     }
     o.apply_settings(out.settings);
-    after_orchestrator(hwnd, o, None);
+    // "Použít teď": the profile is applied at once (the timer, if any, only runs while apps are awaited).
+    let sch = if out.apply_now { o.start_layout() } else { None };
+    after_orchestrator(hwnd, o, sch);
+}
+
+/// "Převzít současný stav" in the layout dialog.
+fn capture_layout() -> (usize, Vec<core::settings::LayoutRule>) {
+    orch().map(|o| o.capture_layout()).unwrap_or_default()
 }
 
 fn new_orchestrator(b: desktops::InternalBackend) -> Orch {
@@ -470,7 +493,9 @@ fn main() {
                 o.adopt(st.spaces, st.baseline);
                 *std::ptr::addr_of_mut!(ORCH) = Some(o);
                 if let Some(o) = orch() {
-                    after_orchestrator(hwnd, o, None);
+                    // Layout profile (plan 12.7): applied after the configured delay, only when enabled.
+                    let sch = o.layout_start_schedule();
+                    after_orchestrator(hwnd, o, sch);
                 }
             }
             None => {
