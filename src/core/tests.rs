@@ -52,6 +52,8 @@ struct World {
     activated: RefCell<Vec<usize>>,
     /// Windows `maximize_inactive` was called for.
     maximized: RefCell<Vec<usize>>,
+    /// Windows `stop_flash` was called for (in order).
+    unflashed: RefCell<Vec<usize>>,
     /// Windows without a maximize box (splash screens).
     no_max_box: RefCell<Vec<usize>>,
 }
@@ -200,6 +202,9 @@ impl WindowSystem for FW {
     }
     fn foreground(&self) -> HWND {
         h(self.0.fg.get())
+    }
+    fn stop_flash(&self, hwnd: HWND) {
+        self.0.unflashed.borrow_mut().push(hwnd as usize);
     }
     fn maximize_inactive(&self, hwnd: HWND) -> bool {
         let id = hwnd as usize;
@@ -1407,6 +1412,27 @@ fn layout_moves_running_app_and_launches_missing_one() {
     assert!(!o.is_managed(h(2)), "registered as placed: no helper desktop");
 }
 
+#[test]
+fn layout_stops_taskbar_flashing_of_placed_windows_while_watched() {
+    let (w, mut o) = layout_world();
+    o.start_layout();
+    assert_eq!(*w.unflashed.borrow(), vec![1], "right after the move");
+    w.open(2, State::Normal);
+    proc_of(&w, 2, "trade.exe");
+    ev(&w, &mut o, 2, Event::Show);
+    assert!(w.unflashed.borrow().contains(&2));
+    w.unflashed.borrow_mut().clear();
+    // Later attempts of the app to activate (a flashing button) are cleared by the timer.
+    w.tick(500);
+    assert!(o.on_event(layout_tick_token(), Event::Recheck).is_some());
+    let mut got = w.unflashed.borrow().clone();
+    got.sort();
+    assert_eq!(got, vec![1, 2]);
+    settle(&w, &mut o);
+    assert!(!o.layout_running());
+    assert!(w.unflashed.borrow().len() > 2, "and once more when the run ends");
+}
+
 /// Lets the profile run settle (timer ticks until it ends).
 fn settle(w: &World, o: &mut Orch) {
     for _ in 0..100 {
@@ -1737,15 +1763,16 @@ fn layout_profile_off_releases_the_pinned_desktops() {
 #[test]
 fn capture_layout_reads_desktops_and_windows() {
     let w = World::new(2);
-    for (id, d, p) in [(1, 2, "mail.exe"), (2, 2, "mail.exe"), (3, 1, "explorer.exe"), (4, 1, "calc.exe")] {
+    for (id, d, p) in [(1, 2, "mail.exe"), (2, 2, "mail.exe"), (3, 1, "explorer.exe"), (4, 2, "calc.exe"), (5, 1, "notepad.exe")] {
         put(&w, id, d);
         proc_of(&w, id, p);
     }
     let o = started(&w);
     let (n, rules) = o.capture_layout();
-    assert_eq!(n, 2);
+    assert_eq!(n, 3, "two applications need three desktops");
     let got: Vec<(u32, &str)> = rules.iter().map(|r| (r.desktop, r.process.as_str())).collect();
-    assert_eq!(got, vec![(1, "calc.exe"), (2, "mail.exe")]);
+    // Desktop 1 (notepad) stays the user's; the order gives the numbers.
+    assert_eq!(got, vec![(2, "calc.exe"), (3, "mail.exe")]);
     assert_eq!(rules[0].launch, r"C:\apps\calc.exe");
     assert_eq!(rules[0].name, "Name 4");
 }
@@ -1762,6 +1789,5 @@ fn capture_layout_ignores_helper_desktops() {
     proc_of(&w, 2, "calc.exe");
     let (n, rules) = o.capture_layout();
     assert_eq!(n, 1, "the helper desktop is not part of the profile");
-    assert_eq!(rules.len(), 1);
-    assert_eq!(rules[0].desktop, 1);
+    assert!(rules.is_empty(), "desktop 1 is not captured");
 }

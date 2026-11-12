@@ -35,6 +35,9 @@ const LAYOUT_TIMEOUT_MS: u64 = 30_000;
 const LAYOUT_TICK_MS: u32 = 500;
 /// ... and this often while a window waits for its application view.
 const LAYOUT_FAST_TICK_MS: u32 = 40;
+/// Once windows are placed the timer also clears their flashing taskbar buttons: a refused
+/// activation flashes the button at once, so this is what the user can see of it at most.
+const LAYOUT_FLASH_TICK_MS: u32 = 120;
 /// After its first window, a launched app is followed this long: further windows (main window
 /// after a splash screen) go to its desktop, and focus / view taken by it are given back.
 const LAYOUT_SETTLE_MS: u64 = 10_000;
@@ -1064,6 +1067,8 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
         self.rejected.insert(hwnd);
         // Focus back to the user first: the maximize then stays inside the app (no view switch).
         self.layout_guard(run);
+        // An app asking for the foreground under our lock gets a flashing taskbar button instead.
+        self.ws.stop_flash(hwnd);
         if launched {
             self.layout_maximize(run, run.claimed.len() - 1);
         }
@@ -1127,13 +1132,22 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
             self.end_layout(run);
             return None;
         }
-        let delay_ms = if run.fast { LAYOUT_FAST_TICK_MS } else { LAYOUT_TICK_MS };
+        let delay_ms = if run.fast {
+            LAYOUT_FAST_TICK_MS
+        } else if run.claimed.is_empty() {
+            LAYOUT_TICK_MS
+        } else {
+            LAYOUT_FLASH_TICK_MS
+        };
         self.layout = Some(run);
         Some(Schedule { hwnd: layout_tick_token(), delay_ms })
     }
 
     fn end_layout(&mut self, mut run: LayoutRun) {
         self.ws.hold_foreground(false);
+        for c in &run.claimed {
+            self.ws.stop_flash(c.hwnd);
+        }
         self.layout_guard(&mut run);
         self.note("layout: done".into());
         self.dirty = true;
@@ -1160,6 +1174,7 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
 
     fn layout_claim(&mut self, run: &mut LayoutRun, hwnd: HWND) -> bool {
         if let Some(c) = run.claimed.iter().position(|c| c.hwnd == hwnd) {
+            self.ws.stop_flash(hwnd);
             self.layout_maximize(run, c);
             return true;
         }
@@ -1199,6 +1214,9 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
         let mut run = self.layout.take()?;
         run.fast = false;
         let now = self.ws.now();
+        for c in &run.claimed {
+            self.ws.stop_flash(c.hwnd);
+        }
         let wins = self.ws.app_windows();
         for (i, deadline, launched) in std::mem::take(&mut run.pending) {
             let process = run.rules[i].process.clone();
@@ -1254,6 +1272,9 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
                 continue;
             }
             let desktop = rank as u32 + 1;
+            if desktop == 1 {
+                continue; // desktop 1 stays the user's
+            }
             if rules.iter().any(|r| r.desktop == desktop && r.process == process) {
                 continue;
             }
@@ -1263,7 +1284,9 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
             }
         }
         rules.sort_by(|a, b| (a.desktop, &a.process).cmp(&(b.desktop, &b.process)));
-        (ordinary.len(), rules)
+        // Same shape as a saved list: the order gives the desktops (2, 3 ...), gaps close.
+        crate::core::settings::renumber_rules(&mut rules);
+        (ordinary.len().max(rules.len() + 1), rules)
     }
 
     // ------------------------------------------------------------ startup

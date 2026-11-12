@@ -178,6 +178,14 @@ impl LayoutRule {
     }
 }
 
+/// Numbers rules by their position: the first gets desktop 2, the next 3 ... (desktop 1 is the
+/// user's). Rules beyond the last allowed desktop share it.
+pub fn renumber_rules(rules: &mut [LayoutRule]) {
+    for (i, r) in rules.iter_mut().enumerate() {
+        r.desktop = (i as u32 + 2).min(MAX_LAYOUT_DESKTOPS);
+    }
+}
+
 impl Layout {
     /// Rules launching an exe inside WindowsApps (its path holds the version and breaks with the
     /// next update) are switched to `shell:AppsFolder\<AUMID>` where it can be resolved.
@@ -193,10 +201,24 @@ impl Layout {
         changed
     }
 
-    /// Desktops the profile needs: the chosen count, raised to the highest target desktop.
+    /// Fewest desktops the list needs: desktop 1 stays the user's, every application takes the
+    /// next one (applications + 1).
+    pub fn min_count(&self) -> u32 {
+        (self.rules.len() as u32 + 1).clamp(1, MAX_LAYOUT_DESKTOPS)
+    }
+
+    /// Desktops the profile needs: the chosen count, raised to the highest target desktop and to
+    /// `min_count` (extra desktops beyond that stay empty).
     pub fn count(&self) -> usize {
         let top = self.rules.iter().map(|r| r.desktop).max().unwrap_or(1);
-        self.desktop_count.max(top).clamp(1, MAX_LAYOUT_DESKTOPS) as usize
+        self.desktop_count.max(top).max(self.min_count()).clamp(1, MAX_LAYOUT_DESKTOPS) as usize
+    }
+
+    /// Settles the list order into desktops: the order of `rules` is the order of desktops (first
+    /// application = desktop 2, second = 3 ...); `desktop_count` is raised to `min_count`.
+    pub fn renumber(&mut self) {
+        renumber_rules(&mut self.rules);
+        self.desktop_count = self.desktop_count.max(self.min_count()).clamp(1, MAX_LAYOUT_DESKTOPS);
     }
 
     fn from_json(j: &Json) -> Layout {
@@ -222,6 +244,9 @@ impl Layout {
                 }
             }
         }
+        // Files with hand-written desktop numbers: ordered by them (stable), then renumbered.
+        l.rules.sort_by_key(|r| r.desktop);
+        l.renumber();
         l
     }
 
@@ -229,10 +254,11 @@ impl Layout {
         let rules: Vec<String> = self
             .rules
             .iter()
-            .map(|r| {
+            .enumerate()
+            .map(|(i, r)| {
                 format!(
                     "    {{\"desktop\": {}, \"name\": {}, \"launch\": {}, \"args\": {}, \"match\": {{\"process\": {}}}}}",
-                    r.desktop,
+                    (i as u32 + 2).min(MAX_LAYOUT_DESKTOPS),
                     quote(&r.name),
                     quote(&r.launch),
                     quote(&r.args),
@@ -243,7 +269,10 @@ impl Layout {
         let list = if rules.is_empty() { String::new() } else { format!("\n{}\n  ", rules.join(",\n")) };
         format!(
             "{{\"enabled\": {}, \"desktopCount\": {}, \"startDelayMs\": {}, \"rules\": [{}]}}",
-            self.enabled, self.desktop_count, self.start_delay_ms, list
+            self.enabled,
+            self.desktop_count.max(self.min_count()),
+            self.start_delay_ms,
+            list
         )
     }
 }
@@ -549,7 +578,7 @@ mod tests {
             l.rules.iter().map(|r| (r.desktop, r.process.as_str(), r.launch.as_str())).collect();
         assert_eq!(
             got,
-            vec![(1, "one.exe", r"C:\a\One.exe"), (1, "two.exe", "two.exe"), (2, "one.exe", r"C:\a\One.exe")]
+            vec![(2, "one.exe", r"C:\a\One.exe"), (3, "two.exe", "two.exe"), (4, "one.exe", r"C:\a\One.exe")]
         );
         // `layout` of the wrong type is ignored altogether.
         assert_eq!(Settings::from_json(r#"{"layout":[1]}"#).unwrap().layout, Layout::default());
@@ -566,7 +595,48 @@ mod tests {
         assert_eq!(file_name_lower(r#""C:\X y\App.EXE""#), "app.exe");
     }
 
-    const OLK: &str = r"C:\Program Files\WindowsApps\Microsoft.OutlookForWindows_1.2026.1026.100_x64__8wekyb3d8bbwe\olk.exe";
+    #[test]
+    fn layout_order_gives_desktops_and_old_numbers_are_renumbered() {
+        // Hand-written numbers (gaps, unordered, desktop 1): sorted by them, then 2, 3, 4 ...
+        let s = Settings::from_json(
+            r#"{"layout":{"enabled":true,"desktopCount":2,"rules":[
+                {"desktop":7,"launch":"c.exe"},{"desktop":3,"launch":"a.exe"},
+                {"desktop":3,"launch":"b.exe"},{"desktop":1,"launch":"z.exe"}]}}"#,
+        )
+        .unwrap();
+        let got: Vec<(u32, &str)> = s.layout.rules.iter().map(|r| (r.desktop, r.process.as_str())).collect();
+        assert_eq!(got, vec![(2, "z.exe"), (3, "a.exe"), (4, "b.exe"), (5, "c.exe")]);
+        assert_eq!(s.layout.desktop_count, 5, "raised to applications + 1");
+        // Reordering in the list renumbers; saving writes the numbers from the order.
+        let mut l = s.layout.clone();
+        l.rules.swap(0, 3);
+        l.renumber();
+        let got: Vec<(u32, &str)> = l.rules.iter().map(|r| (r.desktop, r.process.as_str())).collect();
+        assert_eq!(got, vec![(2, "c.exe"), (3, "a.exe"), (4, "b.exe"), (5, "z.exe")]);
+        l.rules.swap(1, 2); // not renumbered in memory: the file still follows the order
+        let text = Settings { layout: l, ..Settings::default() }.to_json();
+        let back = Settings::from_json(&text).unwrap().layout;
+        let got: Vec<(u32, &str)> = back.rules.iter().map(|r| (r.desktop, r.process.as_str())).collect();
+        assert_eq!(got, vec![(2, "c.exe"), (3, "b.exe"), (4, "a.exe"), (5, "z.exe")]);
+    }
+
+    #[test]
+    fn layout_desktop_count_has_a_minimum_but_may_be_higher() {
+        let mut l = Layout::default();
+        assert_eq!((l.min_count(), l.count()), (1, 1));
+        l.rules.push(LayoutRule::new(2, "", "a.exe", "", "").unwrap());
+        l.rules.push(LayoutRule::new(3, "", "b.exe", "", "").unwrap());
+        assert_eq!((l.min_count(), l.count()), (3, 3), "two apps need three desktops");
+        l.desktop_count = 6;
+        assert_eq!(l.count(), 6, "empty desktops on top are allowed");
+        l.desktop_count = 1;
+        l.renumber();
+        assert_eq!(l.desktop_count, 3, "never below the minimum");
+        let text = Settings { layout: Layout { desktop_count: 1, ..l.clone() }, ..Settings::default() }.to_json();
+        assert_eq!(Settings::from_json(&text).unwrap().layout.desktop_count, 3);
+    }
+
+    const OLK: &str =r"C:\Program Files\WindowsApps\Microsoft.OutlookForWindows_1.2026.1026.100_x64__8wekyb3d8bbwe\olk.exe";
 
     #[test]
     fn packaged_paths_become_apps_folder_commands() {

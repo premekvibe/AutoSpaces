@@ -52,28 +52,29 @@ BEGIN
     PUSHBUTTON      "Storno", 2, 246, 288, 50, 14
 END
 
-103 DIALOGEX 0, 0, 330, 226
+103 DIALOGEX 0, 0, 330, 242
 STYLE DS_SHELLFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
 CAPTION "AutoSpaces – Rozložení ploch po startu"
 FONT 9, "MS Shell Dlg", 400, 0, 1
 BEGIN
     AUTOCHECKBOX    "Po spuštění AutoSpaces rozmístit aplikace na plochy", 160, 6, 6, 318, 10, WS_TABSTOP
-    LTEXT           "Počet ploch po startu:", -1, 6, 24, 100, 10
-    EDITTEXT        161, 108, 22, 26, 12, ES_NUMBER | ES_AUTOHSCROLL | WS_TABSTOP
-    LTEXT           "Nová aplikace na plochu č.:", -1, 152, 24, 128, 10
-    EDITTEXT        162, 284, 22, 26, 12, ES_NUMBER | ES_AUTOHSCROLL | WS_TABSTOP
+    LTEXT           "Počet ploch po startu (nejméně 1):", 171, 6, 24, 190, 10
+    EDITTEXT        161, 200, 22, 26, 12, ES_NUMBER | ES_AUTOHSCROLL | WS_TABSTOP
 
-    GROUPBOX        "Aplikace na plochách", -1, 6, 40, 318, 112
+    GROUPBOX        "Aplikace na plochách (první = plocha 2, druhá = plocha 3 …)", -1, 6, 40, 318, 134
     LISTBOX         163, 14, 52, 222, 94, LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | WS_BORDER | WS_VSCROLL | WS_HSCROLL | WS_TABSTOP
     PUSHBUTTON      "Přidat z běžících…", 164, 242, 52, 76, 14, WS_TABSTOP
     PUSHBUTTON      "Přidat soubor .exe…", 165, 242, 70, 76, 14, WS_TABSTOP
     PUSHBUTTON      "Odebrat", 166, 242, 88, 76, 14, WS_TABSTOP
+    PUSHBUTTON      "Nahoru", 169, 242, 110, 76, 14, WS_TABSTOP
+    PUSHBUTTON      "Dolů", 170, 242, 128, 76, 14, WS_TABSTOP
+    LTEXT           "Pořadí změníte přetažením položky myší v seznamu, nebo tlačítky Nahoru a Dolů. Plocha 1 zůstává vám.", 172, 14, 152, 304, 20
 
-    LTEXT           "Při startu AutoSpaces doplní počet ploch, okna běžících aplikací přesune na zvolené plochy a ostatní aplikace spustí. Okno, které se do 30 sekund neobjeví, se vzdá a zapíše do protokolu. Pohled zůstane na vaší ploše.", -1, 6, 158, 318, 34
-    PUSHBUTTON      "Převzít současný stav", 167, 6, 196, 100, 14, WS_TABSTOP
-    PUSHBUTTON      "Použít teď", 168, 112, 196, 60, 14, WS_TABSTOP
-    DEFPUSHBUTTON   "OK", 1, 218, 196, 50, 14
-    PUSHBUTTON      "Storno", 2, 274, 196, 50, 14
+    LTEXT           "Při startu AutoSpaces doplní počet ploch, okna běžících aplikací přesune na zvolené plochy a ostatní aplikace spustí. Okno, které se do 30 sekund neobjeví, se vzdá a zapíše do protokolu. Pohled zůstane na vaší ploše.", -1, 6, 180, 318, 34
+    PUSHBUTTON      "Převzít současný stav", 167, 6, 220, 100, 14, WS_TABSTOP
+    PUSHBUTTON      "Použít teď", 168, 112, 220, 60, 14, WS_TABSTOP
+    DEFPUSHBUTTON   "OK", 1, 218, 220, 50, 14
+    PUSHBUTTON      "Storno", 2, 274, 220, 50, 14
 END
 
 102 DIALOGEX 0, 0, 240, 170

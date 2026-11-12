@@ -1,16 +1,19 @@
 //! Settings dialog (plan 12.2): plain Win32 dialog templates from assets/autospaces.rc,
 //! created only on request (no cost while idle). Ids below must match the .rc file.
 
-use crate::core::settings::{display_label, file_name_lower, Layout, LayoutRule, MAX_LAYOUT_DESKTOPS, SYSTEM_HOSTS};
+use crate::core::settings::{display_label, file_name_lower, renumber_rules, Layout, LayoutRule, MAX_LAYOUT_DESKTOPS, SYSTEM_HOSTS};
 use crate::core::Settings;
 use crate::sysopts;
 use crate::tray::wide;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows_sys::Win32::UI::Controls::{CheckDlgButton, CheckRadioButton, IsDlgButtonChecked, BST_CHECKED, BST_UNCHECKED};
+use windows_sys::Win32::UI::Controls::{
+    CheckDlgButton, CheckRadioButton, DrawInsert, IsDlgButtonChecked, LBItemFromPt, MakeDragList, BST_CHECKED, BST_UNCHECKED,
+    DL_BEGINDRAG, DL_DRAGGING, DL_DROPPED, DL_MOVECURSOR, DL_STOPCURSOR, DRAGLISTINFO,
+};
 use windows_sys::Win32::UI::Shell::ShellExecuteW;
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus};
 use windows_sys::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     DialogBoxParamW, EndDialog, GetDlgItem, GetDlgItemInt, SetDlgItemInt, SetDlgItemTextW, SetWindowTextW,
@@ -18,7 +21,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     SendMessageW, SetForegroundWindow, SetWindowLongPtrW, GWLP_USERDATA,
     ICON_BIG, ICON_SMALL, IMAGE_ICON, LR_SHARED, SM_CXICON, SM_CXSMICON, SM_CYICON, SM_CYSMICON, IDCANCEL, IDOK, LBN_DBLCLK, LB_ADDSTRING, LB_DELETESTRING, LB_ERR,
     LB_GETCOUNT, LB_GETCURSEL, LB_GETITEMDATA, LB_SETITEMDATA, LB_SETCURSEL, WM_COMMAND, WM_INITDIALOG,
-    WM_SETICON, SW_SHOWNORMAL,
+    WM_SETICON, SW_SHOWNORMAL, DWLP_MSGRESULT, MessageBoxW, RegisterWindowMessageW, MB_ICONINFORMATION, MB_OK,
 };
 
 const IDD_SETTINGS: u16 = 101;
@@ -37,7 +40,10 @@ const ID_OPEN_LAYOUT: i32 = 143;
 const IDD_LAYOUT: u16 = 103;
 const ID_LAY_ENABLED: i32 = 160;
 const ID_LAY_COUNT: i32 = 161;
-const ID_LAY_TARGET: i32 = 162;
+const ID_LAY_UP: i32 = 169;
+const ID_LAY_DOWN: i32 = 170;
+const ID_LAY_COUNT_LABEL: i32 = 171;
+const EN_KILLFOCUS: u32 = 0x0200;
 const ID_LAY_LIST: i32 = 163;
 const ID_LAY_ADD_RUN: i32 = 164;
 const ID_LAY_ADD_FILE: i32 = 165;
@@ -392,11 +398,15 @@ struct LayDlg {
     layout: Layout,
     capture: fn() -> (usize, Vec<LayoutRule>),
     apply: bool,
+    /// Registered message of the drag list box ("commctrl_DragListMsg").
+    drag_msg: u32,
+    /// Row being dragged.
+    drag_src: Option<usize>,
 }
 
 /// The layout dialog; true when the user chose "Použít teď" (the profile is stored in `d`).
 unsafe fn layout_dialog(parent: HWND, d: &mut Dlg) -> bool {
-    let mut st = LayDlg { layout: d.settings.layout.clone(), capture: d.capture, apply: false };
+    let mut st = LayDlg { layout: d.settings.layout.clone(), capture: d.capture, apply: false, drag_msg: 0, drag_src: None };
     let r = DialogBoxParamW(
         GetModuleHandleW(std::ptr::null()),
         std::ptr::without_provenance::<u16>(IDD_LAYOUT as usize),
@@ -407,6 +417,7 @@ unsafe fn layout_dialog(parent: HWND, d: &mut Dlg) -> bool {
     if r != IDOK as isize {
         return false;
     }
+    st.layout.renumber();
     d.settings.layout = st.layout;
     st.apply
 }
@@ -421,9 +432,19 @@ fn read_num(dlg: HWND, id: i32, default: u32) -> u32 {
     }
 }
 
-/// Fills the list: sorted by desktop; item data = index into the rules.
-unsafe fn lay_refill(dlg: HWND, l: &mut Layout) {
-    l.rules.sort_by_key(|r| r.desktop);
+/// The desktop count may exceed the minimum (empty desktops on top) but never fall below it.
+unsafe fn lay_fix_count(dlg: HWND, l: &Layout) {
+    let min = l.min_count();
+    SetDlgItemTextW(dlg, ID_LAY_COUNT_LABEL, wide(&format!("Počet ploch po startu (nejméně {min}):")).as_ptr());
+    if read_num(dlg, ID_LAY_COUNT, 1) < min {
+        SetDlgItemInt(dlg, ID_LAY_COUNT, min, 0);
+    }
+}
+
+/// Fills the list in the order of the rules (the order gives the desktops: the first application
+/// is desktop 2, ...); item data = index into the rules. `sel` is selected afterwards.
+unsafe fn lay_refill(dlg: HWND, l: &mut Layout, sel: Option<usize>) {
+    renumber_rules(&mut l.rules);
     SendDlgItemMessageW(dlg, ID_LAY_LIST, LB_RESETCONTENT, 0, 0);
     let mut longest = 0;
     for (i, r) in l.rules.iter().enumerate() {
@@ -434,24 +455,44 @@ unsafe fn lay_refill(dlg: HWND, l: &mut Layout) {
     // Long names scroll sideways instead of being cut off (extent in pixels, generous per char).
     let dpi = GetDpiForWindow(dlg).max(96) as usize;
     SendDlgItemMessageW(dlg, ID_LAY_LIST, LB_SETHORIZONTALEXTENT, longest * 8 * dpi / 96 + 16, 0);
-    lay_buttons(dlg);
+    if let Some(s) = sel.filter(|s| *s < l.rules.len()) {
+        SendDlgItemMessageW(dlg, ID_LAY_LIST, LB_SETCURSEL, s, 0);
+    }
+    lay_fix_count(dlg, l);
+    lay_buttons(dlg, l);
 }
 
-unsafe fn lay_buttons(dlg: HWND) {
-    let has = SendDlgItemMessageW(dlg, ID_LAY_LIST, LB_GETCURSEL, 0, 0) != LB_ERR as isize;
+unsafe fn lay_buttons(dlg: HWND, l: &Layout) {
+    let sel = SendDlgItemMessageW(dlg, ID_LAY_LIST, LB_GETCURSEL, 0, 0);
+    let has = sel != LB_ERR as isize;
+    let i = sel.max(0) as usize;
     EnableWindow(GetDlgItem(dlg, ID_LAY_DEL), has as i32);
+    EnableWindow(GetDlgItem(dlg, ID_LAY_UP), (has && i > 0) as i32);
+    EnableWindow(GetDlgItem(dlg, ID_LAY_DOWN), (has && i + 1 < l.rules.len()) as i32);
 }
 
+/// Moves a row (drag or Nahoru / Dolů): the desktops follow the new order at once.
+unsafe fn lay_move(dlg: HWND, l: &mut Layout, from: usize, to: usize) {
+    if from >= l.rules.len() || to >= l.rules.len() || from == to {
+        return;
+    }
+    let r = l.rules.remove(from);
+    l.rules.insert(to, r);
+    lay_refill(dlg, l, Some(to));
+}
+
+/// New applications go to the end of the list: the next desktop.
 unsafe fn lay_add(dlg: HWND, l: &mut Layout, name: &str, launch: &str, process: &str) {
-    let desktop = read_num(dlg, ID_LAY_TARGET, 2);
-    if let Some(r) = LayoutRule::new(desktop, name, launch, "", process) {
-        if !l.rules.iter().any(|x| x.desktop == r.desktop && x.process == r.process) {
+    if l.rules.len() + 1 >= MAX_LAYOUT_DESKTOPS as usize {
+        let text = format!("V rozložení může být nejvýše {} aplikací.", MAX_LAYOUT_DESKTOPS - 1);
+        MessageBoxW(dlg, wide(&text).as_ptr(), wide("AutoSpaces").as_ptr(), MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    if let Some(r) = LayoutRule::new(l.rules.len() as u32 + 2, name, launch, "", process) {
+        if !l.rules.iter().any(|x| x.process == r.process && x.launch == r.launch) {
             l.rules.push(r);
+            lay_refill(dlg, l, Some(l.rules.len() - 1));
         }
-        if desktop > read_num(dlg, ID_LAY_COUNT, 1) {
-            SetDlgItemInt(dlg, ID_LAY_COUNT, desktop, 0);
-        }
-        lay_refill(dlg, l);
     }
 }
 
@@ -480,18 +521,69 @@ unsafe fn choose_exe(parent: HWND) -> Option<String> {
 
 unsafe fn lay_collect(dlg: HWND, st: &mut LayDlg) {
     st.layout.enabled = IsDlgButtonChecked(dlg, ID_LAY_ENABLED) == BST_CHECKED;
-    st.layout.desktop_count = read_num(dlg, ID_LAY_COUNT, 1);
+    st.layout.desktop_count = read_num(dlg, ID_LAY_COUNT, 1).max(st.layout.min_count());
+    st.layout.renumber();
+}
+
+/// Drag list box notification (`MakeDragList`): the row follows the mouse, the insert mark shows
+/// where it lands. Returns the dialog message result.
+unsafe fn lay_drag(dlg: HWND, st: &mut LayDlg, info: &DRAGLISTINFO) -> isize {
+    let lb = info.hWnd;
+    let result = match info.uNotification {
+        DL_BEGINDRAG => {
+            let item = LBItemFromPt(lb, info.ptCursor, 0);
+            if item < 0 {
+                0
+            } else {
+                st.drag_src = Some(item as usize);
+                SendMessageW(lb, LB_SETCURSEL, item as usize, 0);
+                lay_buttons(dlg, &st.layout);
+                1
+            }
+        }
+        DL_DRAGGING => {
+            let item = LBItemFromPt(lb, info.ptCursor, 1);
+            DrawInsert(dlg, lb, item);
+            if item >= 0 {
+                DL_MOVECURSOR as isize
+            } else {
+                DL_STOPCURSOR as isize
+            }
+        }
+        DL_DROPPED => {
+            DrawInsert(dlg, lb, -1);
+            let item = LBItemFromPt(lb, info.ptCursor, 0);
+            if let (Some(from), true) = (st.drag_src.take(), item >= 0) {
+                lay_move(dlg, &mut st.layout, from, item as usize);
+            }
+            0
+        }
+        _ => {
+            // DL_CANCELDRAG
+            DrawInsert(dlg, lb, -1);
+            st.drag_src = None;
+            0
+        }
+    };
+    SetWindowLongPtrW(dlg, DWLP_MSGRESULT as i32, result);
+    1
 }
 
 unsafe extern "system" fn layout_proc(dlg: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
+    if let Some(st) = (GetWindowLongPtrW(dlg, GWLP_USERDATA) as *mut LayDlg).as_mut() {
+        if st.drag_msg != 0 && msg == st.drag_msg && lp != 0 {
+            return lay_drag(dlg, st, &*(lp as *const DRAGLISTINFO));
+        }
+    }
     match msg {
         WM_INITDIALOG => {
             SetWindowLongPtrW(dlg, GWLP_USERDATA, lp);
             if let Some(st) = (lp as *mut LayDlg).as_mut() {
                 CheckDlgButton(dlg, ID_LAY_ENABLED, check(st.layout.enabled));
                 SetDlgItemInt(dlg, ID_LAY_COUNT, st.layout.count() as u32, 0);
-                SetDlgItemInt(dlg, ID_LAY_TARGET, 2, 0);
-                lay_refill(dlg, &mut st.layout);
+                MakeDragList(GetDlgItem(dlg, ID_LAY_LIST));
+                st.drag_msg = RegisterWindowMessageW(wide("commctrl_DragListMsg").as_ptr());
+                lay_refill(dlg, &mut st.layout, None);
             }
             1
         }
@@ -499,6 +591,8 @@ unsafe extern "system" fn layout_proc(dlg: HWND, msg: u32, wp: WPARAM, lp: LPARA
             let id = (wp & 0xffff) as i32;
             let notify = ((wp >> 16) & 0xffff) as u32;
             let Some(st) = (GetWindowLongPtrW(dlg, GWLP_USERDATA) as *mut LayDlg).as_mut() else { return 0 };
+            let sel = SendDlgItemMessageW(dlg, ID_LAY_LIST, LB_GETCURSEL, 0, 0);
+            let sel = (sel != LB_ERR as isize).then_some(sel as usize);
             match id {
                 x if x == IDOK || x == ID_LAY_APPLY => {
                     lay_collect(dlg, st);
@@ -510,7 +604,12 @@ unsafe extern "system" fn layout_proc(dlg: HWND, msg: u32, wp: WPARAM, lp: LPARA
                 }
                 ID_LAY_LIST => {
                     if notify == LBN_SELCHANGE {
-                        lay_buttons(dlg);
+                        lay_buttons(dlg, &st.layout);
+                    }
+                }
+                ID_LAY_COUNT => {
+                    if notify == EN_KILLFOCUS {
+                        lay_fix_count(dlg, &st.layout);
                     }
                 }
                 ID_LAY_ADD_RUN => {
@@ -534,19 +633,27 @@ unsafe extern "system" fn layout_proc(dlg: HWND, msg: u32, wp: WPARAM, lp: LPARA
                     }
                 }
                 ID_LAY_DEL => {
-                    if let Some(i) = list_remove_selected(dlg, ID_LAY_LIST) {
-                        if i < st.layout.rules.len() {
-                            st.layout.rules.remove(i);
-                        }
-                        lay_refill(dlg, &mut st.layout);
+                    if let Some(i) = sel.filter(|i| *i < st.layout.rules.len()) {
+                        st.layout.rules.remove(i);
+                        let next = i.min(st.layout.rules.len().saturating_sub(1));
+                        lay_refill(dlg, &mut st.layout, Some(next));
+                    }
+                }
+                ID_LAY_UP | ID_LAY_DOWN => {
+                    if let Some(i) = sel {
+                        let to = if id == ID_LAY_UP { i.saturating_sub(1) } else { i + 1 };
+                        lay_move(dlg, &mut st.layout, i, to);
+                        // A button that just got disabled must not keep the keyboard focus.
+                        SetFocus(GetDlgItem(dlg, ID_LAY_LIST));
                     }
                 }
                 ID_LAY_CAPTURE => {
                     let (n, rules) = (st.capture)();
                     if n > 0 {
                         st.layout.rules = rules;
+                        st.layout.desktop_count = n as u32;
                         SetDlgItemInt(dlg, ID_LAY_COUNT, n as u32, 0);
-                        lay_refill(dlg, &mut st.layout);
+                        lay_refill(dlg, &mut st.layout, None);
                     }
                 }
                 _ => return 0,

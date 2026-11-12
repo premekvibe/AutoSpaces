@@ -100,6 +100,9 @@ pub trait WindowSystem {
     fn foreground(&self) -> HWND {
         std::ptr::null_mut()
     }
+    /// Stops the taskbar button flashing (`FlashWindowEx(FLASHW_STOP)`). An app that asks for the
+    /// foreground while `hold_foreground` is on gets no activation, Windows flashes it instead.
+    fn stop_flash(&self, _hwnd: HWND) {}
     /// Maximizes without activating (asynchronous; the window's thread may be busy).
     /// False when the window cannot be maximized (no maximize box, e.g. a splash screen).
     fn maximize_inactive(&self, _hwnd: HWND) -> bool {

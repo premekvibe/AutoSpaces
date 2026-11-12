@@ -273,6 +273,11 @@ impl WindowSystem for Win32Windows {
     fn foreground(&self) -> HWND {
         unsafe { GetForegroundWindow() }
     }
+    fn stop_flash(&self, hwnd: HWND) {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{FlashWindowEx, FLASHWINFO, FLASHW_STOP};
+        let fi = FLASHWINFO { cbSize: std::mem::size_of::<FLASHWINFO>() as u32, hwnd, dwFlags: FLASHW_STOP, uCount: 0, dwTimeout: 0 };
+        unsafe { FlashWindowEx(&fi) };
+    }
     fn maximize_inactive(&self, hwnd: HWND) -> bool {
         use windows_sys::Win32::UI::WindowsAndMessaging::{
             GetWindowLongW, GetWindowPlacement, IsIconic, IsZoomed, SetWindowPlacement, ShowWindowAsync, GWL_STYLE,
