@@ -5,7 +5,7 @@ use windows_sys::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetClassNameW, GetWindow, GetWindowLongW, GetWindowRect, GetWindowTextLengthW, IsIconic,
+    GetClassNameW, GetForegroundWindow, GetWindow, GetWindowLongW, GetWindowRect, GetWindowTextLengthW, IsIconic,
     IsWindow, IsWindowVisible, IsZoomed, GWL_EXSTYLE, GWL_STYLE, GW_OWNER, WS_CAPTION,
     WS_CHILD, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
 };
@@ -50,6 +50,14 @@ unsafe fn is_fullscreen(hwnd: HWND) -> bool {
     }
     let m = mi.rcMonitor;
     r.left <= m.left && r.top <= m.top && r.right >= m.right && r.bottom >= m.bottom
+}
+
+/// True when the foreground window covers its whole monitor (a game, video, presentation).
+pub fn foreground_is_fullscreen() -> bool {
+    unsafe {
+        let h = GetForegroundWindow();
+        !h.is_null() && !SHELL_CLASSES.contains(&class_name(h).as_str()) && is_fullscreen(h)
+    }
 }
 
 pub fn class_name(hwnd: HWND) -> String {

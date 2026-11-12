@@ -944,7 +944,6 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
     }
 
     /// True while launched profile applications are still awaited or settling.
-    #[cfg(test)]
     pub fn layout_running(&self) -> bool {
         self.layout.is_some()
     }

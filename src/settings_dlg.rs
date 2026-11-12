@@ -55,6 +55,11 @@ const ID_PICK_LIST: i32 = 150;
 /// Handle of the open dialog (0 = none): a second request just brings it forward.
 static OPEN: AtomicUsize = AtomicUsize::new(0);
 
+/// True while the settings dialog is open.
+pub fn is_open() -> bool {
+    OPEN.load(Relaxed) != 0
+}
+
 /// What the user confirmed.
 pub struct Outcome {
     pub settings: Settings,

@@ -21,6 +21,7 @@
 #define SS_BITMAP 0xE
 #define SS_CENTERIMAGE 0x200
 #define SS_REALSIZECONTROL 0x40
+#define SS_OWNERDRAW 0xD
 
 // AS_VER_COMMA / AS_VER_STR come from build.rs (version in Cargo.toml is the single source).
 #include "version.h"
@@ -28,6 +29,8 @@
 1 ICON "autospaces.ico"
 // Donate QR code (RLE8 bitmap made by tools/make-qr-bmp.py), loaded only while the About dialog is open.
 20 BITMAP "donate-qr.bmp"
+// Revolut QR (RLE8, tools/make-qr-bmp.py), likewise loaded only while shown.
+21 BITMAP "donate-revolut.bmp"
 // Per-monitor v2 DPI awareness for the whole process (plan 12.2).
 1 24 "autospaces.manifest"
 
@@ -97,8 +100,9 @@ BEGIN
     PUSHBUTTON      "Storno", 2, 184, 150, 50, 14
 END
 
-// About dialog (src/about_dlg.rs); title text, version, link and address are filled in at run time.
-104 DIALOGEX 0, 0, 300, 268
+// About dialog and support reminder (src/about_dlg.rs, one template for both); texts, version, link,
+// address and the Bitcoin/Lightning logo (owner-drawn, 220) are set at run time.
+104 DIALOGEX 0, 0, 300, 300
 STYLE DS_SHELLFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
 CAPTION "O aplikaci AutoSpaces"
 FONT 9, "MS Shell Dlg", 400, 0, 1
@@ -111,16 +115,21 @@ BEGIN
     CONTROL         "", 205, "SysLink", WS_TABSTOP, 10, 82, 280, 10
     LTEXT           "", 206, 10, 96, 280, 10
 
-    GROUPBOX        "Podpořit autora", -1, 6, 112, 288, 132
-    CONTROL         "", 208, "Static", SS_BITMAP | SS_CENTERIMAGE, 12, 124, 112, 114
-    LTEXT           "Platba na účet: naskenujte QR kód v bankovní aplikaci.", 209, 132, 124, 156, 22
-    LTEXT           "Bitcoin přes Lightning Network:", 210, 132, 152, 156, 10
-    LTEXT           "", 211, 132, 164, 156, 10
-    PUSHBUTTON      "Kopírovat adresu", 212, 132, 180, 110, 14, WS_TABSTOP
-    PUSHBUTTON      "Otevřít v peněžence", 213, 132, 198, 110, 14, WS_TABSTOP
-    LTEXT           "", 214, 132, 216, 156, 22
+    GROUPBOX        "Podpořit autora", 219, 6, 112, 288, 146
+    AUTORADIOBUTTON "Revolut", 215, 14, 124, 100, 10, WS_GROUP | WS_TABSTOP
+    AUTORADIOBUTTON "Účet v CZK", 216, 124, 124, 100, 10
+    CONTROL         "", 208, "Static", SS_BITMAP | SS_CENTERIMAGE, 12, 138, 112, 114
+    LTEXT           "", 209, 132, 138, 156, 22
+    CONTROL         "", 220, "Static", SS_OWNERDRAW, 132, 165, 12, 12
+    LTEXT           "Bitcoin přes Lightning Network:", 210, 148, 166, 140, 10
+    LTEXT           "", 211, 132, 178, 156, 10
+    PUSHBUTTON      "Kopírovat adresu", 212, 132, 194, 110, 14, WS_TABSTOP
+    PUSHBUTTON      "Otevřít v peněžence", 213, 132, 212, 110, 14, WS_TABSTOP
+    LTEXT           "", 214, 132, 230, 156, 22
 
-    DEFPUSHBUTTON   "Zavřít", 1, 244, 250, 50, 14, WS_TABSTOP
+    AUTOCHECKBOX    "Tento dialog už nikdy nezobrazovat", 217, 6, 264, 232, 10, WS_TABSTOP
+    LTEXT           "Možnost podpory najdete kdykoli v nabídce ikony v oznamovací oblasti, položka „O aplikaci…“.", 218, 6, 277, 232, 20
+    DEFPUSHBUTTON   "Zavřít", 1, 244, 264, 50, 14, WS_TABSTOP
 END
 
 // Version information (Czech, Unicode): shown in the file's Properties and read by the installer.

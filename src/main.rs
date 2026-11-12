@@ -12,7 +12,7 @@ mod windowing;
 
 use crate::core::{Event, Orchestrator, Schedule, Settings};
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
 use windows_sys::Win32::Foundation::{
     GetLastError, ERROR_ALREADY_EXISTS, HANDLE, HWND, LPARAM, LRESULT, WAIT_OBJECT_0, WPARAM,
 };
@@ -44,6 +44,14 @@ static mut TIMERS: Vec<(usize, HWND)> = Vec::new();
 
 const TIMER_BASE: usize = 100;
 const TIMER_REINIT: usize = 1;
+/// One-shot timer of the support reminder (plan 12.9).
+const TIMER_SUPPORT: usize = 2;
+/// Retry delay when the user is busy (full-screen app, layout profile, another dialog).
+const SUPPORT_RETRY_SECS: u64 = 5 * 60;
+/// Tick count at start (uptime of this run) and whether the reminder was shown in this run.
+static START_TICK_MS: AtomicU64 = AtomicU64::new(0);
+static SUPPORT_SHOWN: AtomicBool = AtomicBool::new(false);
+static mut SUPPORT: Option<core::support::Support> = None;
 /// Signalled by RegNotifyChangeKeyValue when the virtual-desktop registry key changes (plan 12.1).
 static mut REG_EVENT: HANDLE = std::ptr::null_mut();
 static mut REG_KEY: HKEY = std::ptr::null_mut();
@@ -101,6 +109,93 @@ fn app_dir() -> Option<std::path::PathBuf> {
     let dir = std::path::Path::new(&base).join("AutoSpaces");
     let _ = std::fs::create_dir_all(&dir);
     Some(dir)
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+fn uptime_secs() -> u64 {
+    let start = START_TICK_MS.load(Relaxed);
+    (unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount64() }.saturating_sub(start)) / 1000
+}
+
+fn support() -> &'static mut core::support::Support {
+    unsafe { (*std::ptr::addr_of_mut!(SUPPORT)).get_or_insert_with(Default::default) }
+}
+
+fn save_support() {
+    if let Some(dir) = app_dir() {
+        let tmp = dir.join("support.json.tmp");
+        if std::fs::write(&tmp, support().to_json()).is_ok() {
+            let _ = std::fs::rename(&tmp, dir.join("support.json"));
+        }
+    }
+}
+
+/// Reads support.json (tolerantly), records the first run and arms the reminder timer.
+fn support_init(main: HWND) {
+    START_TICK_MS.store(unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount64() }, Relaxed);
+    let text = app_dir().and_then(|d| std::fs::read_to_string(d.join("support.json")).ok());
+    let missing = text.is_none();
+    *support() = text.map_or_else(Default::default, |t| core::support::Support::from_json(&t));
+    if support().normalize(now_secs()) || missing {
+        save_support();
+    }
+    support_arm(main, None);
+}
+
+/// Arms the one-shot timer for the earliest moment the reminder may appear (`retry`: a fixed delay).
+fn support_arm(main: HWND, retry: Option<u64>) {
+    use core::support::Verdict;
+    let secs = match retry {
+        Some(r) => r,
+        None => match support().verdict(now_secs(), uptime_secs(), SUPPORT_SHOWN.load(Relaxed)) {
+            Verdict::Done => return,
+            Verdict::Show => 1,
+            Verdict::WaitSecs(w) => w + 1,
+        },
+    };
+    // Longest possible timer is about 24 days; the check simply re-arms itself when it fires early.
+    let ms = (secs.saturating_mul(1000)).clamp(1000, 0x7FFF_FFFF) as u32;
+    unsafe { SetTimer(main, TIMER_SUPPORT, ms, None) };
+}
+
+/// True when the user should not be interrupted right now.
+fn support_busy() -> bool {
+    windowing::classifier::foreground_is_fullscreen()
+        || orch().is_some_and(|o| o.layout_running())
+        || unsafe { !(*std::ptr::addr_of!(TIMERS)).is_empty() }
+        || about_dlg::is_open()
+        || settings_dlg::is_open()
+}
+
+/// The support timer fired: show the reminder when due and the moment is calm, else try again.
+fn on_support_timer(main: HWND) {
+    use core::support::Verdict;
+    unsafe { KillTimer(main, TIMER_SUPPORT) };
+    let now = now_secs();
+    if support().normalize(now) {
+        save_support();
+    }
+    match support().verdict(now, uptime_secs(), SUPPORT_SHOWN.load(Relaxed)) {
+        Verdict::Done => {}
+        Verdict::WaitSecs(_) => support_arm(main, None),
+        Verdict::Show => show_support(main, false),
+    }
+}
+
+fn show_support(main: HWND, forced: bool) {
+    if !forced && support_busy() {
+        support_arm(main, Some(SUPPORT_RETRY_SECS));
+        return;
+    }
+    if about_dlg::show_support(main) {
+        SUPPORT_SHOWN.store(true, Relaxed);
+        log_line("support reminder shown");
+    } else {
+        support_arm(main, Some(SUPPORT_RETRY_SECS));
+    }
 }
 
 fn log_line(line: &str) {
@@ -300,6 +395,10 @@ fn on_timer(main: HWND, id: usize) {
             reinit_backend(main);
             return;
         }
+        if id == TIMER_SUPPORT {
+            on_support_timer(main);
+            return;
+        }
         KillTimer(main, id);
         let timers = &mut *std::ptr::addr_of_mut!(TIMERS);
         if let Some(pos) = timers.iter().position(|t| t.0 == id) {
@@ -365,6 +464,20 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
         #[cfg(debug_assertions)]
         m if m == windows_sys::Win32::UI::WindowsAndMessaging::WM_APP + 9 => {
             open_settings(hwnd);
+            0
+        }
+        about_dlg::WM_SUPPORT_CLOSED => {
+            support().closed(now_secs(), wp != 0);
+            save_support();
+            log_line(&format!("support reminder closed, never again: {}", wp != 0));
+            if wp == 0 {
+                support_arm(hwnd, None);
+            }
+            0
+        }
+        #[cfg(debug_assertions)]
+        m if m == windows_sys::Win32::UI::WindowsAndMessaging::WM_APP + 11 => {
+            show_support(hwnd, true);
             0
         }
         #[cfg(debug_assertions)]
@@ -521,6 +634,11 @@ fn main() {
         }
 
         tray::add(hwnd);
+        support_init(hwnd);
+        #[cfg(debug_assertions)]
+        if std::env::var_os("AUTOSPACES_SHOW_SUPPORT").is_some() {
+            windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(hwnd, windows_sys::Win32::UI::WindowsAndMessaging::WM_APP + 11, 0, 0);
+        }
         #[cfg(debug_assertions)]
         if std::env::var_os("AUTOSPACES_OPEN_ABOUT").is_some() {
             windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(hwnd, windows_sys::Win32::UI::WindowsAndMessaging::WM_APP + 10, 0, 0);
@@ -549,6 +667,9 @@ fn main() {
             while PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
                 if msg.message == WM_QUIT {
                     break 'run;
+                }
+                if about_dlg::handle_message(&msg) {
+                    continue;
                 }
                 TranslateMessage(&msg);
                 DispatchMessageW(&msg);

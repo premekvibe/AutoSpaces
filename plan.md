@@ -612,3 +612,10 @@ Cíl: v nastavení určit, kolik ploch má po startu existovat a které aplikace
 - V dialogu nastavení (12.2) je tlačítko „Otevřít nastavení Windows…“ (`ms-settings:multitasking`) s krátkým návodem: v části Plochy nastavit „Na hlavním panelu zobrazovat všechna otevřená okna“ na „Na všech plochách“. Přímý zápis do registru se **nedělá** (rozhodnutí uživatele): na sestavení 26340 Windows volbu neukládají do `VirtualDesktopTaskbarFilter`, ale do nedokumentovaného binárního záznamu CloudStore, a zápis do původní hodnoty se na panelu neprojevil.
 - **Nová instance:** Shift + klik na ikonu v hlavním panelu (standard Windows); dialog to uvede jako nápovědu (klik na ikonu běžící aplikace přepne na její plochu). Alt zamítnut (Alt + dvojklik = Vlastnosti).
 - Vedlejší účinek: hlavní panel ukazuje okna ze všech ploch.
+
+### 12.9 Připomínka podpory – pravidla
+- Dialog „O aplikaci“ a připomínka sdílejí šablonu i blok plateb (Revolut výchozí / Účet v CZK / Lightning s logem); připomínka je nemodální, zobrazí se bez aktivace na aktuální ploše.
+- Podmínky: od prvního spuštění uplynulo aspoň 30 dní **a** aplikace v tomto běhu běží aspoň 30 minut. Jednorázový časovač (žádný polling); při vypršení se podmínky znovu ověří.
+- Stav v `%LOCALAPPDATA%\AutoSpaces\support.json` (`firstRun`, `nextAfter`, `never`), načítá se tolerantně; ostatní soubory se nemění. Čas zpět: první spuštění v budoucnosti se bere jako „teď“, vzdálené `nextAfter` se omezí na 30 dní.
+- Po zavření: zaškrtnuté „už nikdy nezobrazovat“ = nikdy; jinak nejdřív za dalších 30 dní (po 30 minutách běhu). Nejvýš jednou za běh.
+- Ohleduplnost: při celoobrazovkovém okně v popředí, běžícím profilu rozložení, čekajících přechodech nebo otevřeném jiném dialogu se odloží o 5 minut. Rozhodovací logika je čistá funkce času (`core/support.rs`, testy). Ladicí sestavení: proměnná `AUTOSPACES_SHOW_SUPPORT=1` zobrazí připomínku hned.

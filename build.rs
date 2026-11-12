@@ -59,6 +59,7 @@ fn main() {
     println!("cargo:rerun-if-changed=assets/autospaces.ico");
     println!("cargo:rerun-if-changed=assets/autospaces.manifest");
     println!("cargo:rerun-if-changed=assets/donate-qr.bmp");
+    println!("cargo:rerun-if-changed=assets/donate-revolut.bmp");
     println!("cargo:rerun-if-changed=Cargo.toml");
     println!("cargo:rerun-if-changed=build.rs");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
