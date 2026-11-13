@@ -148,10 +148,10 @@ strings! {
         "AutoSpaces – přesouvání vypnuto v settings.json",
         "AutoSpaces – moving is switched off in settings.json"
     ],
-    MenuDiagnostics => ["Diagnostika pro nahlášení…", "Diagnostics for a report…"],
+    MenuReport => ["Nahlásit problém…", "Report a problem…"],
     NoticeUnsupported => [
-        "Tato verze Windows (sestavení {0}) není podporována, AutoSpaces proto nic nepřesouvá. Podrobnosti pro nahlášení najdete v nabídce ikony: Diagnostika.",
-        "This version of Windows (build {0}) is not supported, so AutoSpaces moves nothing. Details for a report are in the tray menu: Diagnostics."
+        "Tato verze Windows (sestavení {0}) není podporována, AutoSpaces proto nic nepřesouvá. Nahlásit ji můžete v nabídce ikony: Nahlásit problém.",
+        "This version of Windows (build {0}) is not supported, so AutoSpaces moves nothing. You can report it in the tray menu: Report a problem."
     ],
     NoticeForcedOff => [
         "Rozhraní ploch je vypnuto klíčem \"backend\": \"{0}\" v settings.json, AutoSpaces nic nepřesouvá.",
@@ -168,6 +168,10 @@ strings! {
     AppName => ["AutoSpaces", "AutoSpaces"],
     FileExplorer => ["Průzkumník souborů", "File Explorer"],
     LangAuto => ["Automaticky", "Automatic"],
+    // Tabs of the settings dialog
+    TabGeneral => ["Obecné", "General"],
+    TabApps => ["Aplikace", "Apps"],
+    TabAdvanced => ["Pokročilé", "Advanced"],
     // Long paragraphs of the dialogs (RC would cut them at 256 characters)
     SettingsHint => [
         "Aby klik na ikonu běžící aplikace přepnul na její plochu, nastavte ve Windows v části Plochy „Na hlavním panelu zobrazovat všechna otevřená okna“ na „Na všech plochách“. Shift + klik na ikonu spustí novou instanci aplikace.",
@@ -177,6 +181,23 @@ strings! {
         "Při startu AutoSpaces doplní počet ploch, okna běžících aplikací přesune na zvolené plochy a ostatní aplikace spustí. Okno, které se do 30 sekund neobjeví, se vzdá a zapíše do protokolu. Pohled zůstane na vaší ploše.",
         "At startup, AutoSpaces adds any missing desktops, moves the windows of running apps to the chosen desktops and launches the other apps. If a window does not appear within 30 seconds, AutoSpaces gives up on it and notes it in the log. Your view stays on your own desktop."
     ],
+    ReportIntro => [
+        "AutoSpaces vytvoří textový soubor report.txt s údaji, které pomohou chybu najít: verze AutoSpaces a Windows, nastavení, naučené výjimky a poslední řádky záznamu činnosti. Neobsahuje titulky oken ani jméno uživatele či počítače a nikam se neodesílá. Před odesláním si ho můžete prohlédnout. Pak otevřete hlášení na GitHubu a soubor do něj přetáhněte.",
+        "AutoSpaces will create a text file, report.txt, with information that helps to find the problem: the AutoSpaces and Windows versions, your settings, learned exceptions and the last lines of the activity log. It contains no window titles and no user or computer name, and it is not sent anywhere. You can look at it before you send it. Then open the report form on GitHub and drag the file into it."
+    ],
+    ReportLogWarn => [
+        "Záznam činnosti je vypnutý. Pro užitečnou diagnostiku ho zapněte, chybu zopakujte a teprve potom soubor vytvořte.",
+        "Activity logging is off. For a useful report, turn it on, repeat the problem and only then create the file."
+    ],
+    ReportLogNowOn => [
+        "Záznam činnosti je zapnutý. Nyní chybu zopakujte a potom soubor vytvořte.",
+        "Activity logging is on. Now repeat the problem, then create the file."
+    ],
+    ReportCreated => [
+        "Soubor report.txt je vytvořen a ukázán ve složce. Přetáhněte ho do hlášení na GitHubu.",
+        "report.txt has been created and is shown in its folder. Drag it into your report on GitHub."
+    ],
+    ReportFailed => ["Soubor se nepodařilo vytvořit.", "The file could not be created."],
     PickExcludeTitle => ["Vyloučit aplikaci", "Exclude app"],
     PickExcludeButton => ["Vyloučit", "Exclude"],
     PickLayoutTitle => ["Přidat do rozložení", "Add to layout"],

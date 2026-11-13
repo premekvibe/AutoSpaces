@@ -153,6 +153,16 @@ pub fn file_name_lower(path: &str) -> String {
     path.trim().trim_matches('"').rsplit(['\\', '/']).next().unwrap_or("").trim().to_lowercase()
 }
 
+/// How a launch command is shown in logs and reports: `shell:AppsFolder\<AUMID>` as it is, anything
+/// else only as the file name, never the folder (it may contain the user's name).
+pub fn launch_label(cmd: &str) -> String {
+    let c = cmd.trim().trim_matches('"');
+    if c.to_ascii_lowercase().starts_with("shell:") {
+        return c.to_string();
+    }
+    file_name_lower(c)
+}
+
 impl LayoutRule {
     /// Builds a rule; None when neither a process nor a launch command can be derived.
     pub fn new(desktop: u32, name: &str, launch: &str, args: &str, process: &str) -> Option<LayoutRule> {
@@ -522,6 +532,15 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn launch_label_hides_folders() {
+        assert_eq!(launch_label(r"C:\Users\Jan\AppData\Local\Foo\Bar.EXE"), "bar.exe");
+        assert_eq!(launch_label(r#""C:\Program Files\X\x.exe""#), "x.exe");
+        assert_eq!(launch_label("olk.exe"), "olk.exe");
+        assert_eq!(launch_label(r"shell:AppsFolder\Fam_8wekyb3d8bbwe!App"), r"shell:AppsFolder\Fam_8wekyb3d8bbwe!App");
+        assert_eq!(launch_label(""), "");
+    }
 
     #[test]
     fn defaults_for_empty_and_partial() {

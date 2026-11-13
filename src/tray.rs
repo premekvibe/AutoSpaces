@@ -27,8 +27,8 @@ pub const CMD_FORGET_BASE: usize = 1000;
 /// "Zapnuto" toggle, in memory only.
 pub static ENABLED: AtomicBool = AtomicBool::new(true);
 
-/// Opens the diagnostics written when no desktop backend is available (plan 5.3).
-pub const CMD_DIAGNOSTICS: usize = 6;
+/// Opens the "Report a problem" dialog (plan 12.12).
+pub const CMD_REPORT: usize = 6;
 
 /// Backend state shown by the icon: 0 = normal, 1 = unsupported Windows, 2 = switched off in settings.
 pub const MODE_NORMAL: usize = 0;
@@ -51,7 +51,7 @@ fn copy_into(dst: &mut [u16], s: &str) {
     }
 }
 
-/// Changes the icon's mode (tooltip; the diagnostics item of the menu).
+/// Changes the icon's mode (tooltip).
 pub fn set_mode(hwnd: HWND, mode: usize) {
     MODE.store(mode, Relaxed);
     let mut nid = data(hwnd);
@@ -154,9 +154,7 @@ pub fn show_menu(hwnd: HWND, learned: &[String]) -> usize {
         AppendMenuW(menu, MF_STRING | on, CMD_TOGGLE, wide(t(Key::MenuEnabled)).as_ptr());
         AppendMenuW(menu, MF_POPUP, sub as usize, wide(t(Key::MenuLearned)).as_ptr());
         AppendMenuW(menu, MF_STRING, CMD_SETTINGS, wide(t(Key::MenuSettings)).as_ptr());
-        if MODE.load(Relaxed) == MODE_UNSUPPORTED {
-            AppendMenuW(menu, MF_STRING, CMD_DIAGNOSTICS, wide(t(Key::MenuDiagnostics)).as_ptr());
-        }
+        AppendMenuW(menu, MF_STRING, CMD_REPORT, wide(t(Key::MenuReport)).as_ptr());
         AppendMenuW(menu, MF_STRING, CMD_ABOUT, wide(t(Key::MenuAbout)).as_ptr());
         AppendMenuW(menu, MF_STRING, CMD_EXIT, wide(t(Key::MenuExit)).as_ptr());
         let mut pt = POINT { x: 0, y: 0 };

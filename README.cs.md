@@ -36,7 +36,7 @@ Nastavení je v `%APPDATA%\AutoSpaces\settings.json`; naučené výjimky a stav 
 | Windows 11 21H2, 22H2, 23H2 | Zahrnuto, zatím nevyzkoušeno na skutečném systému |
 | Windows 10 1809–22H2 | Zahrnuto, zatím nevyzkoušeno na skutečném systému |
 
-Windows nenabízejí veřejné rozhraní pro přesun okna cizí aplikace mezi virtuálními plochami, proto AutoSpaces používá vnitřní rozhraní systému. To se mezi verzemi Windows liší a může se změnit aktualizací. Kvůli bezpečnosti si ho AutoSpaces při startu ověří voláními, která jen čtou, a porovná výsledek s registrem; teprve pak ho začne používat. Když ověření neprojde, AutoSpaces nic nepřesouvá, oznámí, že tato verze Windows není podporována, a v nabídce ikony nabídne *Diagnostika pro nahlášení…*.
+Windows nenabízejí veřejné rozhraní pro přesun okna cizí aplikace mezi virtuálními plochami, proto AutoSpaces používá vnitřní rozhraní systému. To se mezi verzemi Windows liší a může se změnit aktualizací. Kvůli bezpečnosti si ho AutoSpaces při startu ověří voláními, která jen čtou, a porovná výsledek s registrem; teprve pak ho začne používat. Když ověření neprojde, AutoSpaces nic nepřesouvá, oznámí, že tato verze Windows není podporována, a v nabídce ikony nabídne *Nahlásit problém…*.
 
 ## Instalace
 
@@ -78,4 +78,4 @@ AutoSpaces je svobodný software pod licencí [GNU General Public License verze 
 
 ## Nahlášení problému
 
-Založte prosím hlášení na [github.com/premekvibe/AutoSpaces/issues](https://github.com/premekvibe/AutoSpaces/issues).
+Založte prosím hlášení na [github.com/premekvibe/AutoSpaces/issues](https://github.com/premekvibe/AutoSpaces/issues). Nabídka ikony → *Nahlásit problém…* vytvoří diagnostický soubor (`report.txt`, bez titulků oken a bez vašeho jména), který můžete přetáhnout do hlášení.

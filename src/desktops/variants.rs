@@ -238,10 +238,11 @@ pub fn parse_variants(text: &str) -> Result<Vec<Variant>, String> {
 pub fn load() -> (Vec<Variant>, String) {
     let embedded = || parse_variants(EMBEDDED).unwrap_or_default();
     let path = std::env::current_exe().ok().and_then(|p| Some(p.parent()?.join("variants.json")));
-    match path.and_then(|p| std::fs::read_to_string(&p).ok().map(|t| (p, t))) {
-        Some((p, text)) => match parse_variants(&text) {
-            Ok(v) => (v, format!("variants: {}", p.display())),
-            Err(e) => (embedded(), format!("variants: embedded ({} ignored: {e})", p.display())),
+    // Notes name the file only: the folder may contain the user's name (they go to logs and reports).
+    match path.and_then(|p| std::fs::read_to_string(p).ok()) {
+        Some(text) => match parse_variants(&text) {
+            Ok(v) => (v, "variants: variants.json next to the exe".to_string()),
+            Err(e) => (embedded(), format!("variants: embedded (variants.json next to the exe ignored: {e})")),
         },
         None => (embedded(), "variants: embedded".into()),
     }

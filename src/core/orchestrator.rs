@@ -4,7 +4,7 @@
 
 use super::learned::{FailReason, Learned, NoLearned};
 use super::model::{Event, ManagedSpace, Schedule, State, WindowSystem};
-use super::settings::{is_system_window, never_learn, LayoutRule, Settings, SYSTEM_HOSTS};
+use super::settings::{is_system_window, launch_label, never_learn, LayoutRule, Settings, SYSTEM_HOSTS};
 use crate::desktops::backend::Error;
 use crate::desktops::{DesktopBackend, Guid};
 use std::collections::{HashMap, HashSet};
@@ -1340,10 +1340,10 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
             let (cmd, args) = (run.rules[i].launch.clone(), run.rules[i].args.clone());
             if self.ws.launch(&cmd, &args) {
                 let target = self.layout_target(run.rules[i].desktop).map_or("?".into(), |d| self.desk_label(d));
-                self.note(format!("layout: launched {cmd} for desktop {} ({target})", run.rules[i].desktop));
+                self.note(format!("layout: launched {} for desktop {} ({target})", launch_label(&cmd), run.rules[i].desktop));
                 run.pending.push((i, deadline, true));
             } else {
-                self.note(format!("layout: cannot launch {cmd}"));
+                self.note(format!("layout: cannot launch {}", launch_label(&cmd)));
             }
         }
     }

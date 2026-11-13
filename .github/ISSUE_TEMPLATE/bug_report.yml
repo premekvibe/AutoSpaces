@@ -1,0 +1,65 @@
+name: Bug report / Nahlášení chyby
+description: Something does not work as expected. / Něco nefunguje, jak má.
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for reporting a problem. You can write in English or Czech.
+        Děkujeme za nahlášení problému. Můžete psát anglicky nebo česky.
+
+        **Tip:** in the tray icon menu choose *Report a problem…* (*Nahlásit problém…*) and create the diagnostic file. For a useful file, turn on activity logging first, repeat the problem and only then create it.
+        Nabídka ikony → *Nahlásit problém…* vytvoří diagnostický soubor. Aby byl užitečný, nejdřív zapněte záznam činnosti, chybu zopakujte a teprve pak soubor vytvořte.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened? / Co se stalo?
+      description: Describe the problem. / Popište problém.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect? / Co jste čekali?
+      description: What should have happened instead? / Co se mělo stát místo toho?
+    validations:
+      required: false
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce / Kroky k zopakování
+      description: |
+        Which app, which window, what you did. / Která aplikace, které okno, co jste dělali.
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: false
+  - type: input
+    id: autospaces-version
+    attributes:
+      label: AutoSpaces version / Verze AutoSpaces
+      description: Shown in About… (tray icon menu) and at the top of report.txt. / Zobrazí se v „O aplikaci…“ (nabídka ikony) a na začátku souboru report.txt.
+      placeholder: "0.1.0"
+    validations:
+      required: true
+  - type: input
+    id: windows-version
+    attributes:
+      label: Windows version / Verze Windows
+      description: Build number, e.g. 11 24H2, build 26100. Press Win+R, type winver. / Číslo sestavení, např. 11 24H2, sestavení 26100. Stiskněte Win+R a zadejte winver.
+      placeholder: "Windows 11 24H2 (build 26100.xxxx)"
+    validations:
+      required: true
+  - type: textarea
+    id: report
+    attributes:
+      label: Diagnostic file (report.txt) / Diagnostický soubor (report.txt)
+      description: |
+        Drag report.txt into this box (or click to attach it). It holds no window titles and no user or computer name; you can open it in Notepad first.
+        Přetáhněte sem soubor report.txt (nebo ho připojte kliknutím). Neobsahuje titulky oken ani jméno uživatele či počítače; můžete si ho předem otevřít v Poznámkovém bloku.
+      placeholder: Drag report.txt here. / Přetáhněte sem report.txt.
+    validations:
+      required: false

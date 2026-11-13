@@ -5,6 +5,8 @@ mod core;
 mod desktops;
 mod i18n;
 mod json;
+mod report;
+mod report_dlg;
 mod selftest;
 mod settings_dlg;
 mod sysopts;
@@ -89,11 +91,11 @@ static REINIT_LEFT: AtomicU32 = AtomicU32::new(0);
 enum NoBackend {
     /// Switched off by the hidden `"backend"` key (plan 5.2: the fallback is not built).
     Forced(core::settings::BackendPref),
-    /// No variant passed (plan 5.3); `transient` = Explorer not reachable, worth retrying.
-    Unsupported { build: u32, transient: bool },
+    /// No variant passed (plan 5.3).
+    Unsupported { build: u32 },
 }
 
-/// Diagnostics of the last failed selection, for `unsupported.txt`.
+/// Diagnostics of the last variant selection, for the report (plan 12.12).
 static mut LAST_DIAG: Vec<String> = Vec::new();
 /// The "not supported" notification is shown once per run.
 static NOTICE_SHOWN: AtomicBool = AtomicBool::new(false);
@@ -120,23 +122,29 @@ fn init_backend() -> Result<desktops::InternalBackend, NoBackend> {
         Ok(b) => {
             let tag = if b.verified() { "" } else { " (UNVERIFIED variant, self-test passed)" };
             log_line(&format!("backend: {}{tag}", b.name()));
+            diag.push(format!("result: {}{tag}", b.name()));
+            unsafe { *std::ptr::addr_of_mut!(LAST_DIAG) = diag };
             Ok(b)
         }
         Err(u) => {
             log_line(&format!("backend: {u}"));
             diag.push(format!("result: {u}"));
+            diag.push(
+                if u.transient {
+                    "cause: Explorer's virtual desktop service could not be reached (it may not run on this system)"
+                } else {
+                    "cause: no known variant of the virtual desktop interface passed the read-only self-test"
+                }
+                .to_string(),
+            );
             unsafe { *std::ptr::addr_of_mut!(LAST_DIAG) = diag };
-            Err(NoBackend::Unsupported { build: u.build, transient: u.transient })
+            Err(NoBackend::Unsupported { build: u.build })
         }
     }
 }
 
-fn diagnostics_path() -> Option<std::path::PathBuf> {
-    app_dir().map(|d| d.join("unsupported.txt"))
-}
-
-/// The app runs without a backend: nothing is moved. The icon says so, a notification explains it
-/// once per run, and `unsupported.txt` holds what is needed to add a variant (plan 5.3).
+/// The app runs without a backend: nothing is moved. The icon says so and a notification explains it
+/// once per run; "Report a problem" in the menu creates what is needed to add a variant (plan 5.3).
 fn enter_no_backend(main: HWND, why: &NoBackend) {
     let (mode, text) = match why {
         NoBackend::Forced(p) => (tray::MODE_FORCED_OFF, i18n::tf(i18n::Key::NoticeForcedOff, &[p.code()])),
@@ -144,38 +152,9 @@ fn enter_no_backend(main: HWND, why: &NoBackend) {
             (tray::MODE_UNSUPPORTED, i18n::tf(i18n::Key::NoticeUnsupported, &[&build.to_string()]))
         }
     };
-    if let NoBackend::Unsupported { build, transient } = why {
-        let diag = unsafe { (*std::ptr::addr_of!(LAST_DIAG)).clone() };
-        let cause = if *transient {
-            "Explorer's virtual desktop service could not be reached (it may not run on this system)"
-        } else {
-            "no known variant of the virtual desktop interface passed the read-only self-test"
-        };
-        let report = format!(
-            "AutoSpaces {} - this Windows build is not supported (build {build}); nothing is moved.\n\
-             Cause: {cause}.\n\
-             Please send this file to the author (see About) so that the build can be added.\n\n{}\n",
-            env!("CARGO_PKG_VERSION"),
-            diag.join("\n")
-        );
-        if let Some(p) = diagnostics_path() {
-            let _ = std::fs::write(p, report);
-        }
-    }
     tray::set_mode(main, mode);
     if !NOTICE_SHOWN.swap(true, Relaxed) {
         tray::notify(main, &text);
-    }
-}
-
-fn open_diagnostics() {
-    use windows_sys::Win32::UI::Shell::ShellExecuteW;
-    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
-    if let Some(p) = diagnostics_path().filter(|p| p.exists()) {
-        let path = tray::wide(&p.to_string_lossy());
-        unsafe {
-            ShellExecuteW(std::ptr::null_mut(), tray::wide("open").as_ptr(), path.as_ptr(), std::ptr::null(), std::ptr::null(), SW_SHOWNORMAL)
-        };
     }
 }
 
@@ -243,6 +222,7 @@ fn support_busy() -> bool {
         || unsafe { !(*std::ptr::addr_of!(TIMERS)).is_empty() }
         || about_dlg::is_open()
         || settings_dlg::is_open()
+        || report_dlg::is_open()
 }
 
 /// The support timer fired: show the reminder when due and the moment is calm, else try again.
@@ -301,6 +281,96 @@ fn log_line(line: &str) {
 /// Log on when built for debugging, `AUTOSPACES_LOG=1`, or `"log": true` in settings.json.
 fn logging_wanted(settings_log: bool) -> bool {
     cfg!(debug_assertions) || settings_log || std::env::var("AUTOSPACES_LOG").is_ok_and(|v| v == "1")
+}
+
+/// Is the activity log switched on by the user (`"log"` in settings.json or `AUTOSPACES_LOG=1`)?
+/// Debug builds always log, which does not count here.
+fn log_switched_on() -> bool {
+    orch().map(|o| o.settings.log).or_else(|| settings_path().map(|p| Settings::load(&p).log)).unwrap_or(false)
+        || std::env::var("AUTOSPACES_LOG").is_ok_and(|v| v == "1")
+}
+
+/// "Turn on logging" in the report dialog: the log starts at once and stays on in settings.json.
+fn enable_logging() {
+    LOGGING.store(true, Relaxed);
+    let settings = match orch() {
+        Some(o) => {
+            o.settings.log = true;
+            o.settings.clone()
+        }
+        None => {
+            let mut s = settings_path().map_or_else(Settings::default, |p| Settings::load(&p));
+            s.log = true;
+            s
+        }
+    };
+    if let Some(p) = settings_path() {
+        if let Err(e) = settings.save(&p) {
+            log_line(&format!("settings.json not saved: {e}"));
+        }
+    }
+    log_line("activity logging switched on from the report dialog");
+}
+
+/// Writes `%LOCALAPPDATA%\AutoSpaces\report.txt` (plan 12.12); its path.
+fn create_report() -> Option<std::path::PathBuf> {
+    use core::settings::BackendPref;
+    use desktops::DesktopBackend;
+    let dir = app_dir()?;
+    let env = report::Env::from_process();
+    let (monitors, primary_size, primary_dpi) = report::display_info();
+    let build = desktops::internal::os_build();
+    let (variant, variant_verified) = match orch() {
+        Some(o) => (Some(o.backend().name().to_string()), o.backend().verified()),
+        None => (None, false),
+    };
+    let file_settings = settings_path().map(|p| Settings::load(&p));
+    let pref = orch().map(|o| o.settings.language).or(file_settings.as_ref().map(|s| s.language)).unwrap_or_default();
+    let mut selection = unsafe { (*std::ptr::addr_of!(LAST_DIAG)).clone() };
+    let mode = match tray::mode() {
+        tray::MODE_UNSUPPORTED => format!("unsupported Windows build {build}; nothing is moved"),
+        tray::MODE_FORCED_OFF => {
+            let code = file_settings.as_ref().map_or(BackendPref::None, |s| s.backend).code();
+            selection.push(format!("switched off by \"backend\": \"{code}\" in settings.json"));
+            format!("switched off by \"backend\": \"{code}\" in settings.json; nothing is moved")
+        }
+        _ if variant.is_some() => "normal".to_string(),
+        _ => "starting (no desktop interface yet)".to_string(),
+    };
+    let read = |name: &str| std::fs::read(dir.join(name)).ok().map(|b| String::from_utf8_lossy(&b).into_owned());
+    // A log that was just rotated leaves too few lines: the older file completes the tail.
+    let log = read("log.txt").map(|cur| match read("log.old.txt") {
+        Some(old) if cur.lines().count() < report::LOG_TAIL_LINES => format!("{}\n{cur}", old.trim_end()),
+        _ => cur,
+    });
+    let data = report::ReportData {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        windows_build: build,
+        ubr: desktops::registry::ubr(),
+        ui_language: format!("{} (setting: {})", i18n::current().code(), pref.code()),
+        monitors,
+        primary_size,
+        primary_dpi,
+        mode,
+        variant,
+        variant_verified,
+        selection,
+        // From the registry: Explorer's COM interface refuses calls made from inside a dialog's button handler.
+        desktops: Some(
+            desktops::registry::desktop_ids().map_or("1 (no desktop list in the registry)".to_string(), |l| l.len().to_string()),
+        ),
+        logging: log_switched_on(),
+        settings_json: settings_path().and_then(|p| std::fs::read(p).ok()).map(|b| String::from_utf8_lossy(&b).into_owned()),
+        learned_json: read("learned.json"),
+        log,
+    };
+    let path = dir.join("report.txt");
+    std::fs::write(&path, report::build_report(&data, &env)).ok()?;
+    Some(path)
+}
+
+fn open_report() {
+    report_dlg::show(report_dlg::Hooks { create: create_report, logging_on: log_switched_on, enable_logging });
 }
 
 fn orch() -> Option<&'static mut Orch> {
@@ -641,6 +711,11 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             open_about();
             0
         }
+        #[cfg(debug_assertions)]
+        m if m == windows_sys::Win32::UI::WindowsAndMessaging::WM_APP + 12 => {
+            open_report();
+            0
+        }
         WM_TIMER => {
             on_timer(hwnd, wp);
             0
@@ -663,7 +738,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                     tray::CMD_ABOUT => {
                         open_about();
                     }
-                    tray::CMD_DIAGNOSTICS => open_diagnostics(),
+                    tray::CMD_REPORT => open_report(),
                     tray::CMD_FORGET_ALL => {
                         if let Some(o) = orch() {
                             o.forget_learned(None);
@@ -711,6 +786,15 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
 const SINGLE_INSTANCE: &str = r"Local\AutoSpaces_SingleInstance";
 const WINDOW_CLASS: &str = "AutoSpacesHiddenWindow";
 
+/// Debug builds only: `AUTOSPACES_INSTANCE=x` lets a test copy run beside an installed instance.
+fn instance_mutex_name() -> String {
+    #[cfg(debug_assertions)]
+    if let Ok(x) = std::env::var("AUTOSPACES_INSTANCE") {
+        return format!("{SINGLE_INSTANCE}_{x}");
+    }
+    SINGLE_INSTANCE.to_string()
+}
+
 fn main() {
     LOGGING.store(logging_wanted(settings_path().is_some_and(|p| Settings::load(&p).log)), Relaxed);
     if std::env::args().nth(1).as_deref() == Some("--selftest") {
@@ -733,11 +817,7 @@ fn main() {
         std::process::exit(restore_cli());
     }
     unsafe {
-        let mutex = CreateMutexW(
-            std::ptr::null(),
-            0,
-            tray::wide("Local\\AutoSpaces_SingleInstance").as_ptr(),
-        );
+        let mutex = CreateMutexW(std::ptr::null(), 0, tray::wide(&instance_mutex_name()).as_ptr());
         if mutex.is_null() || GetLastError() == ERROR_ALREADY_EXISTS {
             return;
         }
@@ -810,6 +890,10 @@ fn main() {
         #[cfg(debug_assertions)]
         if std::env::var_os("AUTOSPACES_OPEN_ABOUT").is_some() {
             windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(hwnd, windows_sys::Win32::UI::WindowsAndMessaging::WM_APP + 10, 0, 0);
+        }
+        #[cfg(debug_assertions)]
+        if std::env::var_os("AUTOSPACES_OPEN_REPORT").is_some() {
+            windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(hwnd, windows_sys::Win32::UI::WindowsAndMessaging::WM_APP + 12, 0, 0);
         }
         #[cfg(debug_assertions)]
         if std::env::var_os("AUTOSPACES_OPEN_SETTINGS").is_some() {

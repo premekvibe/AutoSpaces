@@ -7,22 +7,28 @@ use crate::i18n::{self, t, tf, Key, Pref, LANGS};
 use crate::sysopts;
 use crate::tray::wide;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
-use windows_sys::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows_sys::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MapWindowPoints, MONITORINFO, MONITOR_DEFAULTTONEAREST};
+use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Controls::{
-    CheckDlgButton, CheckRadioButton, DrawInsert, IsDlgButtonChecked, LBItemFromPt, MakeDragList, BST_CHECKED, BST_UNCHECKED,
-    DL_BEGINDRAG, DL_DRAGGING, DL_DROPPED, DL_MOVECURSOR, DL_STOPCURSOR, DRAGLISTINFO,
+    CheckDlgButton, CheckRadioButton, DrawInsert, EnableThemeDialogTexture, IsDlgButtonChecked, LBItemFromPt, MakeDragList,
+    BST_CHECKED, BST_UNCHECKED, DL_BEGINDRAG, DL_DRAGGING, DL_DROPPED, DL_MOVECURSOR, DL_STOPCURSOR, DRAGLISTINFO, ETDT_ENABLE, ETDT_USETABTEXTURE,
+    InitCommonControlsEx, ICC_TAB_CLASSES, INITCOMMONCONTROLSEX, NMHDR, TCIF_TEXT, TCITEMW, TCM_ADJUSTRECT, TCM_GETCURSEL, TCM_INSERTITEMW, TCM_SETCURSEL, TCN_SELCHANGE,
 };
 use windows_sys::Win32::UI::Shell::ShellExecuteW;
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, GetKeyState, SetFocus, VK_CONTROL, VK_SHIFT, VK_TAB};
 use windows_sys::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL, EndDialog, GetDlgItem, GetDlgItemInt, SetDlgItemInt, SetDlgItemTextW, SetWindowTextW,
     LB_RESETCONTENT, LBN_SELCHANGE, LB_SETHORIZONTALEXTENT, GetWindowLongPtrW, GetWindowTextW, LoadImageW, SendDlgItemMessageW,
-    SendMessageW, SetForegroundWindow, SetWindowLongPtrW, GWLP_USERDATA,
+    SendMessageW, SetForegroundWindow, SetWindowLongPtrW, GWLP_USERDATA, GWLP_ID,
     ICON_BIG, ICON_SMALL, IMAGE_ICON, LR_SHARED, SM_CXICON, SM_CXSMICON, SM_CYICON, SM_CYSMICON, IDCANCEL, IDOK, LBN_DBLCLK, LB_ADDSTRING, LB_DELETESTRING, LB_ERR,
     LB_GETCOUNT, LB_GETCURSEL, LB_GETITEMDATA, LB_SETITEMDATA, LB_SETCURSEL, WM_COMMAND, WM_INITDIALOG,
     WM_SETICON, SW_SHOWNORMAL, DWLP_MSGRESULT, MessageBoxW, RegisterWindowMessageW, MB_ICONINFORMATION, MB_OK,
+    CallNextHookEx, GetAncestor, GetClientRect, GetParent, GetWindowRect, SetWindowPos, SetWindowsHookExW, ShowWindow,
+    UnhookWindowsHookEx, GA_ROOT, MSG, MSGF_DIALOGBOX, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOW, WH_MSGFILTER,
+    WM_KEYDOWN, WM_NOTIFY,
 };
 
 const IDD_SETTINGS: u16 = 101;
@@ -41,6 +47,7 @@ const ID_OPEN_WINSETTINGS: i32 = 141;
 const ID_OPEN_LAYOUT: i32 = 143;
 const ID_LANGUAGE: i32 = 144;
 const ID_HINT: i32 = 142;
+const ID_LOG: i32 = 147;
 const IDD_LAYOUT: u16 = 103;
 const ID_LAY_ENABLED: i32 = 160;
 const ID_LAY_COUNT: i32 = 161;
@@ -56,9 +63,16 @@ const ID_LAY_DEL: i32 = 166;
 const ID_LAY_CAPTURE: i32 = 167;
 const ID_LAY_APPLY: i32 = 168;
 const ID_PICK_LIST: i32 = 150;
+/// Tab control of the settings dialog and its pages: child dialogs 106..108 (ids 310.. inside the dialog).
+const ID_TAB: i32 = 300;
+const ID_PAGE0: i32 = 310;
+const IDD_PAGE0: u16 = 106;
+const PAGES: usize = 3;
 
 /// Handle of the open dialog (0 = none): a second request just brings it forward.
 static OPEN: AtomicUsize = AtomicUsize::new(0);
+/// Message hook that gives Ctrl+Tab / Ctrl+Shift+Tab to the tab control while the dialog is open.
+static HOOK: AtomicUsize = AtomicUsize::new(0);
 
 /// True while the settings dialog is open.
 pub fn is_open() -> bool {
@@ -124,10 +138,146 @@ pub fn show(
         capture,
     };
     unsafe {
+        InitCommonControlsEx(&INITCOMMONCONTROLSEX { dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32, dwICC: ICC_TAB_CLASSES });
+        let hook = SetWindowsHookExW(WH_MSGFILTER, Some(key_hook), std::ptr::null_mut(), GetCurrentThreadId());
+        HOOK.store(hook as usize, Relaxed);
         i18n::dialog_box(IDD_SETTINGS, std::ptr::null_mut(), Some(proc), &mut dlg as *mut Dlg as LPARAM);
+        if !hook.is_null() {
+            UnhookWindowsHookEx(hook);
+        }
+        HOOK.store(0, Relaxed);
     }
     OPEN.store(0, Relaxed);
     dlg.out
+}
+
+/// The page (child dialog) that holds control `id`; the control is looked up in it, not in the main dialog.
+unsafe fn pg(dlg: HWND, id: i32) -> HWND {
+    for i in 0..PAGES as i32 {
+        let page = GetDlgItem(dlg, ID_PAGE0 + i);
+        if !page.is_null() && !GetDlgItem(page, id).is_null() {
+            return page;
+        }
+    }
+    dlg
+}
+
+/// Index of the tab reached from `cur` by `step` (wraps around).
+fn next_tab(cur: isize, step: isize, count: usize) -> usize {
+    (cur + step).rem_euclid(count.max(1) as isize) as usize
+}
+
+/// Shows the page of tab `i`, hides the others.
+unsafe fn show_page(dlg: HWND, i: usize) {
+    for k in 0..PAGES {
+        let page = GetDlgItem(dlg, ID_PAGE0 + k as i32);
+        ShowWindow(page, if k == i { SW_SHOW } else { SW_HIDE });
+    }
+}
+
+/// Ctrl+Tab / Ctrl+Shift+Tab: the next / previous tab, keyboard focus on the tab control.
+unsafe fn switch_tab(dlg: HWND, step: isize) {
+    let tab = GetDlgItem(dlg, ID_TAB);
+    let cur = SendMessageW(tab, TCM_GETCURSEL, 0, 0);
+    let next = next_tab(cur, step, PAGES);
+    SendMessageW(tab, TCM_SETCURSEL, next, 0);
+    show_page(dlg, next);
+    SetFocus(tab);
+}
+
+unsafe extern "system" fn key_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    if code == MSGF_DIALOGBOX as i32 && lp != 0 {
+        let m = &*(lp as *const MSG);
+        let dlg = OPEN.load(Relaxed) as HWND;
+        if m.message == WM_KEYDOWN
+            && m.wParam == VK_TAB as usize
+            && GetKeyState(VK_CONTROL as i32) < 0
+            && !dlg.is_null()
+            && GetAncestor(m.hwnd, GA_ROOT) == dlg
+        {
+            switch_tab(dlg, if GetKeyState(VK_SHIFT as i32) < 0 { -1 } else { 1 });
+            return 1;
+        }
+    }
+    CallNextHookEx(HOOK.load(Relaxed) as _, code, wp, lp)
+}
+
+/// Where a window of `win` (left, top, right, bottom) must go to lie inside `work`, and how many pixels
+/// of height must be cut because it is taller than `work`: (x, y, cut).
+fn fit_in_work(win: [i32; 4], work: [i32; 4]) -> (i32, i32, i32) {
+    let (w, h) = (win[2] - win[0], win[3] - win[1]);
+    let cut = (h - (work[3] - work[1])).max(0);
+    let h = h - cut;
+    let x = if w >= work[2] - work[0] { work[0] } else { win[0].clamp(work[0], work[2] - w) };
+    let y = win[1].clamp(work[1], (work[3] - h).max(work[1]));
+    (x, y, cut)
+}
+
+unsafe fn rect_in(dlg: HWND, child: HWND) -> RECT {
+    let mut r: RECT = std::mem::zeroed();
+    GetWindowRect(child, &mut r);
+    MapWindowPoints(std::ptr::null_mut(), dlg, &mut r as *mut RECT as *mut POINT, 2);
+    r
+}
+
+/// Puts the pages exactly into the display area of the tab control.
+unsafe fn layout_pages(dlg: HWND) {
+    let tab = GetDlgItem(dlg, ID_TAB);
+    let mut r: RECT = std::mem::zeroed();
+    GetClientRect(tab, &mut r);
+    SendMessageW(tab, TCM_ADJUSTRECT, 0, &mut r as *mut RECT as LPARAM);
+    let mut o = POINT { x: 0, y: 0 };
+    MapWindowPoints(tab, dlg, &mut o, 1);
+    for k in 0..PAGES as i32 {
+        let page = GetDlgItem(dlg, ID_PAGE0 + k);
+        // Right after the tab control in the z-order: the tab key goes tab -> page -> OK -> Cancel.
+        SetWindowPos(page, tab, o.x + r.left, o.y + r.top, r.right - r.left, r.bottom - r.top, SWP_NOACTIVATE);
+    }
+}
+
+/// Safety net: the whole dialog inside the work area of its monitor; when it is taller than the work area, the
+/// tab control gets shorter so that the top edge and the OK / Cancel buttons stay visible.
+unsafe fn fit_to_work_area(dlg: HWND) {
+    let mut mi: MONITORINFO = std::mem::zeroed();
+    mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+    if GetMonitorInfoW(MonitorFromWindow(dlg, MONITOR_DEFAULTTONEAREST), &mut mi) == 0 {
+        return;
+    }
+    let mut r: RECT = std::mem::zeroed();
+    GetWindowRect(dlg, &mut r);
+    let wk = mi.rcWork;
+    let (x, y, cut) = fit_in_work([r.left, r.top, r.right, r.bottom], [wk.left, wk.top, wk.right, wk.bottom]);
+    if cut > 0 {
+        let tab = GetDlgItem(dlg, ID_TAB);
+        let t = rect_in(dlg, tab);
+        let cut = cut.min((t.bottom - t.top - 80).max(0));
+        SetWindowPos(tab, std::ptr::null_mut(), t.left, t.top, t.right - t.left, t.bottom - t.top - cut, SWP_NOZORDER | SWP_NOACTIVATE);
+        for id in [IDOK, IDCANCEL] {
+            let b = GetDlgItem(dlg, id);
+            let br = rect_in(dlg, b);
+            SetWindowPos(b, std::ptr::null_mut(), br.left, br.top - cut, 0, 0, SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSIZE);
+        }
+        layout_pages(dlg);
+        SetWindowPos(dlg, std::ptr::null_mut(), x, y, r.right - r.left, r.bottom - r.top - cut, SWP_NOZORDER | SWP_NOACTIVATE);
+    } else {
+        SetWindowPos(dlg, std::ptr::null_mut(), x, y, 0, 0, SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSIZE);
+    }
+}
+
+unsafe extern "system" fn page_proc(dlg: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
+    match msg {
+        WM_INITDIALOG => {
+            // The tab page background of the visual styles (no grey rectangles behind the labels).
+            EnableThemeDialogTexture(dlg, ETDT_ENABLE | ETDT_USETABTEXTURE);
+            0
+        }
+        WM_COMMAND => {
+            // Everything is handled by the settings dialog itself.
+            SendMessageW(GetParent(dlg), WM_COMMAND, wp, lp);
+            1
+        }
+        _ => 0,
+    }
 }
 
 /// Adds a row labelled `text`; `data` (index into the dialog's own vectors) travels with it.
@@ -160,8 +310,8 @@ unsafe fn list_remove_selected(dlg: HWND, id: i32) -> Option<usize> {
 
 unsafe fn update_buttons(dlg: HWND) {
     for (list, btn) in [(ID_EXCL_LIST, ID_EXCL_DEL), (ID_LEARNED_LIST, ID_LEARNED_DEL)] {
-        let has = SendDlgItemMessageW(dlg, list, LB_GETCURSEL, 0, 0) != LB_ERR as isize;
-        EnableWindow(GetDlgItem(dlg, btn), has as i32);
+        let has = SendDlgItemMessageW(pg(dlg, list), list, LB_GETCURSEL, 0, 0) != LB_ERR as isize;
+        EnableWindow(GetDlgItem(pg(dlg, btn), btn), has as i32);
     }
 }
 
@@ -177,8 +327,8 @@ fn check(on: bool) -> u32 {
     }
 }
 
-unsafe fn init(dlg: HWND, d: &Dlg) {
-    // Icons at the size of the window's own DPI (shared handles: nothing to free).
+/// Gives the dialog the application icon at the size of its own DPI (shared handles: nothing to free).
+pub(crate) unsafe fn set_icons(dlg: HWND) {
     let dpi = GetDpiForWindow(dlg).max(96);
     for (kind, cx, cy) in [(ICON_BIG, SM_CXICON, SM_CYICON), (ICON_SMALL, SM_CXSMICON, SM_CYSMICON)] {
         let icon = LoadImageW(
@@ -193,43 +343,74 @@ unsafe fn init(dlg: HWND, d: &Dlg) {
             SendMessageW(dlg, WM_SETICON, kind as usize, icon as LPARAM);
         }
     }
-    SetDlgItemTextW(dlg, ID_HINT, wide(t(Key::SettingsHint)).as_ptr());
+}
+
+/// Tabs, pages (child dialogs) and their initial layout; the first tab is shown.
+unsafe fn create_pages(dlg: HWND) {
+    let tab = GetDlgItem(dlg, ID_TAB);
+    for (i, key) in [Key::TabGeneral, Key::TabApps, Key::TabAdvanced].into_iter().enumerate() {
+        let text = wide(t(key));
+        let mut item: TCITEMW = std::mem::zeroed();
+        item.mask = TCIF_TEXT;
+        item.pszText = text.as_ptr() as *mut u16;
+        SendMessageW(tab, TCM_INSERTITEMW, i, &item as *const TCITEMW as LPARAM);
+    }
+    for k in 0..PAGES as i32 {
+        let page = i18n::create_dialog(IDD_PAGE0 + k as u16, dlg, Some(page_proc), 0);
+        SetWindowLongPtrW(page, GWLP_ID, (ID_PAGE0 + k) as isize);
+    }
+    layout_pages(dlg);
+    show_page(dlg, 0);
+}
+
+unsafe fn init(dlg: HWND, d: &Dlg) {
+    set_icons(dlg);
+    create_pages(dlg);
+    SetDlgItemTextW(pg(dlg, ID_HINT), ID_HINT, wide(t(Key::SettingsHint)).as_ptr());
     let fs = d.settings.fullscreen_only();
-    CheckRadioButton(dlg, ID_MODE_ALL, ID_MODE_FS, if fs { ID_MODE_FS } else { ID_MODE_ALL });
+    CheckRadioButton(pg(dlg, ID_MODE_ALL), ID_MODE_ALL, ID_MODE_FS, if fs { ID_MODE_FS } else { ID_MODE_ALL });
     for (i, (p, n)) in d.excl.iter().enumerate() {
-        list_add(dlg, ID_EXCL_LIST, &display_label(p, n), i);
+        list_add(pg(dlg, ID_EXCL_LIST), ID_EXCL_LIST, &display_label(p, n), i);
     }
     for (i, (p, n)) in d.learned.iter().enumerate() {
-        list_add(dlg, ID_LEARNED_LIST, &display_label(p, n), i);
+        list_add(pg(dlg, ID_LEARNED_LIST), ID_LEARNED_LIST, &display_label(p, n), i);
     }
-    CheckDlgButton(dlg, ID_LEARNING, check(d.settings.learning));
-    CheckDlgButton(dlg, ID_ARRANGE, check(d.settings.arrange_at_start));
+    CheckDlgButton(pg(dlg, ID_LEARNING), ID_LEARNING, check(d.settings.learning));
+    CheckDlgButton(pg(dlg, ID_ARRANGE), ID_ARRANGE, check(d.settings.arrange_at_start));
+    CheckDlgButton(pg(dlg, ID_LOG), ID_LOG, check(d.settings.log));
     // Autostart is read from the system, not from settings.json.
-    CheckDlgButton(dlg, ID_AUTOSTART, check(sysopts::autostart_enabled()));
+    CheckDlgButton(pg(dlg, ID_AUTOSTART), ID_AUTOSTART, check(sysopts::autostart_enabled()));
     // Language: automatic, then every language under its own name.
     let names = std::iter::once(t(Key::LangAuto)).chain(LANGS.iter().map(|l| l.native_name()));
     for n in names {
-        SendDlgItemMessageW(dlg, ID_LANGUAGE, CB_ADDSTRING, 0, wide(n).as_ptr() as LPARAM);
+        SendDlgItemMessageW(pg(dlg, ID_LANGUAGE), ID_LANGUAGE, CB_ADDSTRING, 0, wide(n).as_ptr() as LPARAM);
     }
-    SendDlgItemMessageW(dlg, ID_LANGUAGE, CB_SETCURSEL, d.settings.language.index(), 0);
+    SendDlgItemMessageW(pg(dlg, ID_LANGUAGE), ID_LANGUAGE, CB_SETCURSEL, d.settings.language.index(), 0);
     update_buttons(dlg);
 }
 
+/// Checked state of a button of any page.
+unsafe fn checked(dlg: HWND, id: i32) -> bool {
+    IsDlgButtonChecked(pg(dlg, id), id) == BST_CHECKED
+}
+
+/// Reads every page, also those the user never opened (their controls exist all the time).
 unsafe fn collect(dlg: HWND, d: &mut Dlg) {
     let mut s = d.settings.clone();
-    s.set_fullscreen_only(IsDlgButtonChecked(dlg, ID_MODE_FS) == BST_CHECKED);
+    s.set_fullscreen_only(checked(dlg, ID_MODE_FS));
     s.excluded.clear();
     s.names.clear();
-    for i in list_data(dlg, ID_EXCL_LIST) {
+    for i in list_data(pg(dlg, ID_EXCL_LIST), ID_EXCL_LIST) {
         if let Some((p, n)) = d.excl.get(i) {
             s.exclude(p);
             s.set_name(p, n);
         }
     }
-    s.learning = IsDlgButtonChecked(dlg, ID_LEARNING) == BST_CHECKED;
-    s.arrange_at_start = IsDlgButtonChecked(dlg, ID_ARRANGE) == BST_CHECKED;
-    s.autostart = IsDlgButtonChecked(dlg, ID_AUTOSTART) == BST_CHECKED;
-    let sel = SendDlgItemMessageW(dlg, ID_LANGUAGE, CB_GETCURSEL, 0, 0);
+    s.learning = checked(dlg, ID_LEARNING);
+    s.arrange_at_start = checked(dlg, ID_ARRANGE);
+    s.autostart = checked(dlg, ID_AUTOSTART);
+    s.log = checked(dlg, ID_LOG);
+    let sel = SendDlgItemMessageW(pg(dlg, ID_LANGUAGE), ID_LANGUAGE, CB_GETCURSEL, 0, 0);
     s.language = if sel < 0 { d.settings.language } else { Pref::from_index(sel as usize) };
     d.out = Some(Outcome {
         settings: s,
@@ -246,7 +427,17 @@ unsafe extern "system" fn proc(dlg: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> i
             if let Some(d) = state(dlg) {
                 init(dlg, d);
             }
-            1
+            fit_to_work_area(dlg);
+            // The focus starts on the tab control (arrow keys and Ctrl+Tab change the tab).
+            SetFocus(GetDlgItem(dlg, ID_TAB));
+            0
+        }
+        WM_NOTIFY => {
+            let h = &*(lp as *const NMHDR);
+            if h.idFrom == ID_TAB as usize && h.code == TCN_SELCHANGE {
+                show_page(dlg, SendMessageW(h.hwndFrom, TCM_GETCURSEL, 0, 0).max(0) as usize);
+            }
+            0
         }
         WM_COMMAND => {
             let id = (wp & 0xffff) as i32;
@@ -261,20 +452,20 @@ unsafe extern "system" fn proc(dlg: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> i
                 }
                 ID_EXCL_ADD => {
                     if let Some((p, n)) = pick(dlg, d) {
-                        let have = list_data(dlg, ID_EXCL_LIST);
+                        let have = list_data(pg(dlg, ID_EXCL_LIST), ID_EXCL_LIST);
                         if !have.iter().any(|&i| d.excl.get(i).is_some_and(|e| e.0 == p)) {
                             d.excl.push((p.clone(), n.clone()));
-                            list_add(dlg, ID_EXCL_LIST, &display_label(&p, &n), d.excl.len() - 1);
+                            list_add(pg(dlg, ID_EXCL_LIST), ID_EXCL_LIST, &display_label(&p, &n), d.excl.len() - 1);
                         }
                         update_buttons(dlg);
                     }
                 }
                 ID_EXCL_DEL => {
-                    list_remove_selected(dlg, ID_EXCL_LIST);
+                    list_remove_selected(pg(dlg, ID_EXCL_LIST), ID_EXCL_LIST);
                     update_buttons(dlg);
                 }
                 ID_LEARNED_DEL => {
-                    if let Some(i) = list_remove_selected(dlg, ID_LEARNED_LIST) {
+                    if let Some(i) = list_remove_selected(pg(dlg, ID_LEARNED_LIST), ID_LEARNED_LIST) {
                         if let Some((p, _)) = d.learned.get(i) {
                             d.forgotten.push(p.clone());
                         }
@@ -324,7 +515,7 @@ unsafe fn pick(parent: HWND, d: &Dlg) -> Option<(String, String)> {
         .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_lowercase()))
         .unwrap_or_default();
     let excl: Vec<String> =
-        list_data(parent, ID_EXCL_LIST).into_iter().filter_map(|i| d.excl.get(i).map(|e| e.0.clone())).collect();
+        list_data(pg(parent, ID_EXCL_LIST), ID_EXCL_LIST).into_iter().filter_map(|i| d.excl.get(i).map(|e| e.0.clone())).collect();
     pick_from(parent, picker_entries((d.running)(), &excl, &own), t(Key::PickExcludeTitle), t(Key::PickExcludeButton))
 }
 
@@ -674,6 +865,31 @@ unsafe extern "system" fn layout_proc(dlg: HWND, msg: u32, wp: WPARAM, lp: LPARA
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tabs_wrap_around() {
+        assert_eq!(next_tab(0, 1, 3), 1);
+        assert_eq!(next_tab(2, 1, 3), 0);
+        assert_eq!(next_tab(0, -1, 3), 2);
+        assert_eq!(next_tab(1, -1, 3), 0);
+        assert_eq!(next_tab(0, 1, 0), 0);
+    }
+
+    #[test]
+    fn dialog_is_moved_into_the_work_area() {
+        let work = [0, 0, 1366, 728];
+        // Fits and is inside: untouched.
+        assert_eq!(fit_in_work([100, 100, 600, 500], work), (100, 100, 0));
+        // Sticks out at the bottom and on the right: moved up and left.
+        assert_eq!(fit_in_work([1000, 500, 1500, 800], work), (866, 428, 0));
+        // Sticks out at the top and on the left.
+        assert_eq!(fit_in_work([-50, -20, 450, 380], work), (0, 0, 0));
+        // Taller than the work area: top edge at the top, the rest is cut.
+        assert_eq!(fit_in_work([300, 10, 800, 900], work), (300, 0, 162));
+        // Work area not at the origin (second monitor).
+        assert_eq!(fit_in_work([2000, 0, 2400, 300], [1920, 0, 3840, 1040]), (2000, 0, 0));
+        assert_eq!(fit_in_work([1800, 900, 2200, 1200], [1920, 0, 3840, 1040]), (1920, 740, 0));
+    }
 
     #[test]
     fn picker_dedupes_filters_and_sorts() {

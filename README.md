@@ -36,7 +36,7 @@ Settings live in `%APPDATA%\AutoSpaces\settings.json`; learned exceptions and st
 | Windows 11 21H2, 22H2, 23H2 | Included, not yet tested on a real system |
 | Windows 10 1809–22H2 | Included, not yet tested on a real system |
 
-Windows offers no public API for moving another app's window between virtual desktops, so AutoSpaces uses the internal interface of the Windows shell. That interface differs between Windows versions and can change with an update. To stay safe, AutoSpaces checks the interface with read-only calls against the registry at startup and only then uses it. If the check fails, AutoSpaces moves nothing, tells you that this Windows version is not supported, and offers *Diagnostics for a report…* in the tray menu.
+Windows offers no public API for moving another app's window between virtual desktops, so AutoSpaces uses the internal interface of the Windows shell. That interface differs between Windows versions and can change with an update. To stay safe, AutoSpaces checks the interface with read-only calls against the registry at startup and only then uses it. If the check fails, AutoSpaces moves nothing, tells you that this Windows version is not supported, and offers *Report a problem…* in the tray menu.
 
 ## Installation
 
@@ -78,4 +78,4 @@ AutoSpaces is free software under the [GNU General Public License v3.0 or later]
 
 ## Reporting a problem
 
-Please open an issue at [github.com/premekvibe/AutoSpaces/issues](https://github.com/premekvibe/AutoSpaces/issues).
+Please open an issue at [github.com/premekvibe/AutoSpaces/issues](https://github.com/premekvibe/AutoSpaces/issues). The tray icon menu → *Report a problem…* creates a diagnostic file (`report.txt`, without window titles or your name) that you can drag into the report.

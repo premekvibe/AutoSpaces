@@ -192,7 +192,7 @@ pub fn show_support(owner: HWND) -> bool {
     true
 }
 
-unsafe fn set_text(dlg: HWND, id: i32, text: &str) {
+pub(crate) unsafe fn set_text(dlg: HWND, id: i32, text: &str) {
     SetDlgItemTextW(dlg, id, wide(text).as_ptr());
 }
 
@@ -279,17 +279,17 @@ unsafe fn init(dlg: HWND, ctx: &Ctx) {
     }
 }
 
-unsafe fn item_rect(dlg: HWND, id: i32) -> RECT {
+pub(crate) unsafe fn item_rect(dlg: HWND, id: i32) -> RECT {
     let mut r: RECT = std::mem::zeroed();
     GetWindowRect(GetDlgItem(dlg, id), &mut r);
     r
 }
 
-unsafe fn hide(dlg: HWND, id: i32) {
+pub(crate) unsafe fn hide(dlg: HWND, id: i32) {
     ShowWindow(GetDlgItem(dlg, id), SW_HIDE);
 }
 
-unsafe fn move_up(dlg: HWND, id: i32, dy: i32) {
+pub(crate) unsafe fn move_up(dlg: HWND, id: i32, dy: i32) {
     let r = item_rect(dlg, id);
     let mut pt = POINT { x: r.left, y: r.top };
     ScreenToClient(dlg, &mut pt);
@@ -297,7 +297,7 @@ unsafe fn move_up(dlg: HWND, id: i32, dy: i32) {
 }
 
 /// Makes the dialog `shrink` pixels shorter, keeping it centred.
-unsafe fn shrink_dialog(dlg: HWND, shrink: i32) {
+pub(crate) unsafe fn shrink_dialog(dlg: HWND, shrink: i32) {
     if shrink <= 0 {
         return;
     }
