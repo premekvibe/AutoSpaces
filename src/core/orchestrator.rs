@@ -592,7 +592,7 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
         if !s.enabled {
             return Vec::new();
         }
-        let wins = self.ws.app_windows();
+        let wins = self.real_windows();
         let mut all = s.arrange_at_start && self.spaces.is_empty();
         if all {
             // Occupied desktops, among the windows that may be moved at all (debug filter).
@@ -636,6 +636,16 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
             found.push((if t == 0 { u64::MAX } else { t }, w, fullscreen));
         }
         found.sort_by_key(|f| f.0); // stable: equal start times keep the z-order
+        if all {
+            // The first (oldest) window stays on desktop #1, treated like a window left in place
+            // (until restored and maximized again). Excluded apps stay anyway: they do not count.
+            if let Some(i) = found.iter().position(|f| !self.settings.is_excluded(&self.ws.process(f.1).0)) {
+                let (_, w, _) = found.remove(i);
+                let label = self.window_label(w);
+                self.rejected.insert(w);
+                self.note(format!("startup: {label} stays on desktop #1 (the first maximized window)"));
+            }
+        }
         found
     }
 
@@ -944,7 +954,7 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
     /// (cloaked / foreign shell windows report none) do not count.
     fn occupancy(&self, exclude: Option<HWND>) -> HashSet<Guid> {
         let mut occ = HashSet::new();
-        for w in self.ws.app_windows() {
+        for w in self.real_windows() {
             if Some(w) == exclude {
                 continue;
             }
@@ -1141,10 +1151,20 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
         Some(list)
     }
 
+    /// App windows without the shell / system ones (CoreWindow of the input host, etc.): they
+    /// never count as an app window on a desktop (occupancy, startup arrangement).
+    fn real_windows(&self) -> Vec<HWND> {
+        let mut v = self.ws.app_windows();
+        v.retain(|&w| {
+            let (p, _) = self.ws.process(w);
+            !is_system_window(&p, &self.ws.class(w))
+        });
+        v
+    }
+
     /// Number of real app windows on `d`, optionally ignoring one.
     fn count_on(&self, d: Guid, exclude: Option<HWND>) -> usize {
-        self.ws
-            .app_windows()
+        self.real_windows()
             .into_iter()
             .filter(|&w| Some(w) != exclude && self.backend.window_desktop(w) == Some(d))
             .count()

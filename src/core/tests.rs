@@ -1890,15 +1890,15 @@ fn arrange_gives_each_maximized_window_its_own_desktop_in_z_order_without_switch
     open_as(&w, 5, State::Minimized, "e.exe");
     w.fg.set(4);
     let (mut o, _) = started_with(&w, Settings::default());
-    assert_eq!(list(&w), vec![1, 2, 3, 4]);
-    assert_eq!((w.desk_of(1), w.desk_of(2), w.desk_of(3)), (g(2), g(3), g(4)));
+    assert_eq!(list(&w), vec![1, 2, 3]);
+    assert_eq!((w.desk_of(1), w.desk_of(2), w.desk_of(3)), (g(1), g(2), g(3)), "the first one stays on 1");
     assert_eq!((w.desk_of(4), w.desk_of(5)), (g(1), g(1)));
     assert_eq!(w.current.get(), g(1), "foreground window was not moved: the view stays");
     assert!(w.activated.borrow().is_empty());
-    assert_eq!(o.snapshot().len(), 3);
+    assert_eq!(o.snapshot().len(), 2);
     assert!(o.snapshot().iter().any(|s| s.hwnd == h(2) && s.fullscreen));
     assert_eq!(o.baseline(), 1);
-    assert!(logged(&mut o, "arranged 3"));
+    assert!(logged(&mut o, "arranged 2"));
 }
 
 #[test]
@@ -1909,8 +1909,9 @@ fn arrange_follows_the_foreground_window_to_its_desktop_once() {
     open_as(&w, 3, State::Maximized, "c.exe");
     w.fg.set(2);
     let (_o, _) = started_with(&w, Settings::default());
+    assert_eq!(w.desk_of(1), g(1), "the first (oldest) window stays on desktop 1");
     assert_eq!(w.current.get(), w.desk_of(2));
-    assert_eq!(w.desk_of(2), g(3));
+    assert_eq!(w.desk_of(2), g(2));
     assert_eq!(*w.activated.borrow(), vec![2]);
 }
 
@@ -1930,11 +1931,11 @@ fn arrange_does_nothing_when_windows_are_on_several_desktops() {
 #[test]
 fn arrange_with_empty_desktops_uses_them_first_then_creates_new_ones() {
     let w = World::new(3); // desktops 2 and 3 are empty
-    for id in 1..=3 {
+    for id in 1..=4 {
         open_as(&w, id, State::Maximized, &format!("app{id}.exe"));
     }
     let (_o, _) = started_with(&w, Settings::default());
-    assert_eq!((w.desk_of(1), w.desk_of(2), w.desk_of(3)), (g(2), g(3), g(4)));
+    assert_eq!((w.desk_of(1), w.desk_of(2), w.desk_of(3), w.desk_of(4)), (g(1), g(2), g(3), g(4)));
     assert_eq!(list(&w), vec![1, 2, 3, 4]);
 }
 
@@ -1946,8 +1947,8 @@ fn arrange_order_is_by_process_start_then_z_order() {
         w.starts.borrow_mut().insert(id, t);
     }
     let (_o, _) = started_with(&w, Settings::default());
-    // old (2, then 4: same time, z-order), mid, new, unknown start time last.
-    let order: Vec<usize> = (2..=6).map(|d| (1..=5).find(|id| w.desk_of(*id) == g(d)).unwrap()).collect();
+    // old (2) stays on desktop 1; then old (4: same time, z-order), mid, new, unknown start time last.
+    let order: Vec<usize> = (1..=5).map(|d| (1..=5).find(|id| w.desk_of(*id) == g(d)).unwrap()).collect();
     assert_eq!(order, vec![2, 4, 5, 1, 3]);
 }
 
@@ -1964,15 +1965,15 @@ fn arrange_user_scenario_profile_on_three_desktops_two_empty() {
     }
     w.fg.set(1);
     let (mut o, _) = started_with(&w, profile(3, &[(2, "olk.exe"), (3, "tv.exe")]));
-    assert_eq!(w.current.get(), g(5), "the user lands with Edge");
+    assert_eq!(w.current.get(), g(4), "the user lands with Edge");
     assert_eq!(w.desk_of(3), g(2), "Outlook on desktop 2 (by the profile, in the same step)");
     assert_eq!(*w.launched.borrow(), vec!["tv.exe".to_string()], "TradingView is launched for desktop 3");
     w.open(7, State::Normal);
     proc_of(&w, 7, "tv.exe");
     ev(&w, &mut o, 7, Event::Show);
     assert_eq!(w.desk_of(7), g(3), "TradingView on desktop 3");
-    assert_eq!((w.desk_of(2), w.desk_of(1)), (g(4), g(5)), "Explorer (older process) 4, Edge 5");
-    assert_eq!(list(&w), vec![1, 2, 3, 4, 5], "no empty desktop between them");
+    assert_eq!((w.desk_of(2), w.desk_of(1)), (g(1), g(4)), "Explorer (older process) stays on 1, Edge 4");
+    assert_eq!(list(&w), vec![1, 2, 3, 4], "no empty desktop between them");
 }
 
 #[test]
@@ -2012,8 +2013,8 @@ fn arrange_fullscreen_only_mode_takes_only_fullscreen_windows() {
     let mut s = Settings::default();
     s.set_fullscreen_only(true);
     let (o, _) = started_with(&w, s);
-    assert_eq!((w.desk_of(1), w.desk_of(2)), (g(1), g(2)));
-    assert!(o.is_rejected(h(1)) && o.is_managed(h(2)));
+    assert_eq!((w.desk_of(1), w.desk_of(2)), (g(1), g(1)), "the only fullscreen window is the first: it stays");
+    assert!(o.is_rejected(h(1)) && o.is_rejected(h(2)));
 }
 
 #[test]
@@ -2027,9 +2028,9 @@ fn arrange_respects_excluded_apps_and_other_candidate_rules() {
     let mut s = Settings::default();
     s.exclude("skip.exe");
     let (o, _) = started_with(&w, s);
-    assert_eq!(list(&w), vec![1, 2, 3]);
-    assert_eq!((w.desk_of(1), w.desk_of(2), w.desk_of(3), w.desk_of(4)), (g(1), g(2), g(1), g(3)));
-    assert!(o.is_rejected(h(1)) && o.is_managed(h(2)));
+    assert_eq!(list(&w), vec![1, 2]);
+    assert_eq!((w.desk_of(1), w.desk_of(2), w.desk_of(3), w.desk_of(4)), (g(1), g(1), g(1), g(2)));
+    assert!(o.is_rejected(h(1)) && o.is_rejected(h(2)) && o.is_managed(h(4)), "excluded apps do not take the place of the first");
 }
 
 #[test]
@@ -2051,12 +2052,13 @@ fn arrange_leaves_profile_apps_to_the_profile_no_double_move_no_extra_desktop() 
     let w = World::new(1);
     open_as(&w, 1, State::Maximized, "mail.exe");
     open_as(&w, 2, State::Maximized, "other.exe");
+    open_as(&w, 3, State::Maximized, "third.exe");
     let (o, _) = started_with(&w, profile(2, &[(2, "mail.exe")]));
-    assert_eq!(w.desk_of(2), g(3), "other.exe goes behind desktop 2");
+    assert_eq!(w.desk_of(2), g(1), "the first non-profile window stays on desktop 1");
+    assert_eq!(w.desk_of(3), g(3), "third.exe goes behind desktop 2");
     assert_eq!(list(&w), vec![1, 2, 3]);
     assert_eq!(w.desk_of(1), g(2), "the profile gives mail.exe desktop 2");
-    assert_eq!(w.desk_of(2), g(3));
-    assert!(o.is_managed(h(2)) && !o.is_managed(h(1)));
+    assert!(o.is_managed(h(3)) && !o.is_managed(h(1)) && !o.is_managed(h(2)));
 }
 
 #[test]
@@ -2064,16 +2066,17 @@ fn arranged_window_returns_to_desktop_1_when_restored_and_its_desktop_is_removed
     let w = World::new(1);
     open_as(&w, 1, State::Maximized, "a.exe");
     open_as(&w, 2, State::Maximized, "b.exe");
-    w.fg.set(2);
+    open_as(&w, 3, State::Maximized, "c.exe");
+    w.fg.set(3);
     let (mut o, _) = started_with(&w, Settings::default());
     assert_eq!((list(&w), w.current.get()), (vec![1, 2, 3], g(3)));
-    w.set_state(2, State::Normal);
-    ev(&w, &mut o, 2, Loc);
-    assert_eq!((w.desk_of(2), w.current.get()), (g(1), g(1)));
+    w.set_state(3, State::Normal);
+    ev(&w, &mut o, 3, Loc);
+    assert_eq!((w.desk_of(3), w.current.get()), (g(1), g(1)));
     assert_eq!(list(&w), vec![1, 2]);
     // --restore / quit: the other window goes back to desktop 1 as well.
     o.give_back_all();
-    assert_eq!((w.desk_of(1), list(&w)), (g(1), vec![1]));
+    assert_eq!((w.desk_of(2), list(&w)), (g(1), vec![1]));
     assert!(o.snapshot().is_empty());
 }
 
@@ -2081,10 +2084,11 @@ fn arranged_window_returns_to_desktop_1_when_restored_and_its_desktop_is_removed
 fn arrange_closing_an_arranged_window_removes_its_desktop() {
     let w = World::new(1);
     open_as(&w, 1, State::Maximized, "a.exe");
+    open_as(&w, 2, State::Maximized, "b.exe");
     let (mut o, _) = started_with(&w, Settings::default());
     assert_eq!(list(&w), vec![1, 2]);
-    w.set_state(1, State::Destroyed);
-    ev(&w, &mut o, 1, Event::Destroy);
+    w.set_state(2, State::Destroyed);
+    ev(&w, &mut o, 2, Event::Destroy);
     assert_eq!(list(&w), vec![1]);
     assert!(o.snapshot().is_empty());
 }
@@ -2099,6 +2103,60 @@ fn arrange_setting_json_default_true_missing_key_true_and_roundtrip() {
     assert!(json.contains("\"arrangeAtStart\": false"));
     assert!(!Settings::from_json(&json).unwrap().arrange_at_start);
     assert!(Settings::from_json("{\"arrangeAtStart\": 1}").unwrap().arrange_at_start, "wrong type keeps the default");
+}
+
+#[test]
+fn arrange_keeps_the_oldest_window_on_desktop_1_and_it_moves_normally_after_restore_and_maximize() {
+    let w = World::new(1);
+    open_as(&w, 1, State::Maximized, "new.exe");
+    open_as(&w, 2, State::Maximized, "old.exe");
+    w.starts.borrow_mut().insert(1, 200);
+    w.starts.borrow_mut().insert(2, 100);
+    let (mut o, _) = started_with(&w, Settings::default());
+    assert_eq!((w.desk_of(2), w.desk_of(1), list(&w)), (g(1), g(2), vec![1, 2]));
+    assert!(o.is_rejected(h(2)) && !o.is_managed(h(2)));
+    assert!(logged(&mut o, "stays on desktop #1"));
+    w.set_state(2, State::Normal);
+    ev(&w, &mut o, 2, Loc);
+    w.set_state(2, State::Maximized);
+    ev(&w, &mut o, 2, Loc);
+    assert!(o.is_managed(h(2)), "after restore and a new maximize it is moved as usual");
+    assert_ne!(w.desk_of(2), g(1));
+}
+
+#[test]
+fn arrange_keeps_the_first_window_on_desktop_1_whatever_else_is_there() {
+    for other in [State::Normal, State::Maximized] {
+        let w = World::new(1);
+        open_as(&w, 1, State::Maximized, "a.exe");
+        open_as(&w, 2, State::Maximized, "b.exe");
+        open_as(&w, 3, other, "skip.exe");
+        let mut s = Settings::default();
+        s.exclude("skip.exe");
+        let (_o, _) = started_with(&w, s);
+        assert_eq!((w.desk_of(1), w.desk_of(2), w.desk_of(3)), (g(1), g(2), g(1)), "{other:?}");
+    }
+}
+
+#[test]
+fn arrange_only_profile_apps_maximized_leaves_desktop_1_empty() {
+    let w = World::new(1);
+    open_as(&w, 1, State::Maximized, "mail.exe");
+    let (_o, _) = started_with(&w, profile(2, &[(2, "mail.exe")]));
+    assert_eq!((w.desk_of(1), list(&w)), (g(2), vec![1, 2]));
+}
+
+#[test]
+fn arrange_kept_window_in_front_keeps_the_view_on_desktop_1() {
+    let w = World::new(1);
+    open_as(&w, 1, State::Maximized, "a.exe");
+    open_as(&w, 2, State::Maximized, "b.exe");
+    w.starts.borrow_mut().insert(1, 100);
+    w.starts.borrow_mut().insert(2, 200);
+    w.fg.set(1);
+    let (_o, _) = started_with(&w, Settings::default());
+    assert_eq!((w.desk_of(1), w.desk_of(2), w.current.get()), (g(1), g(2), g(1)));
+    assert!(w.activated.borrow().is_empty());
 }
 
 // ---------------------------------------------------------------- startup sequence: arrangement + profile (plan 12.11 / 12.7)
@@ -2190,11 +2248,11 @@ fn outlook_starts(w: &World, o: &mut Orch) {
 fn assert_user_layout(w: &World, o: &mut Orch, outlook: usize) {
     settle(w, o);
     let l = w.desktops.borrow().clone();
-    assert_eq!(l.len(), 5, "1 + two profile desktops + two arranged windows: {:?}", list(w));
+    assert_eq!(l.len(), 4, "1 + two profile desktops + Edge: {:?}", list(w));
     assert_eq!(w.desk_of(outlook), l[1], "Outlook on desktop 2");
     assert_eq!(w.desk_of(21), l[2], "TradingView on desktop 3");
-    assert_eq!(w.desk_of(2), l[3], "File Explorer on desktop 4");
-    assert_eq!(w.desk_of(1), l[4], "Edge on desktop 5");
+    assert_eq!(w.desk_of(2), l[0], "File Explorer (oldest process) stays on desktop 1");
+    assert_eq!(w.desk_of(1), l[3], "Edge on desktop 4");
     // A later unrelated event does not change anything (no empty profile desktop to remove).
     delay_noise(w, o);
     assert_eq!(*w.desktops.borrow(), l);
@@ -2214,6 +2272,30 @@ fn startup_user_scenario_outlook_running_edge_in_front() {
     assert_eq!(w.current.get(), edge, "the user ends with the window they had in front");
     assert!(w.switches.borrow().iter().all(|d| *d == edge.d1), "never switched anywhere else: {:?}", w.switches.borrow());
     assert_eq!(w.fg.get(), 1);
+}
+
+#[test]
+fn startup_system_window_on_desktop_1_is_not_a_visible_app_window() {
+    // From the user's log: textinputhost.exe (CoreWindow) is visible on desktop 1, yet File
+    // Explorer (oldest) must stay there and Edge goes to its own desktop.
+    let w = user_world(true, 1);
+    open_as(&w, 9, State::Normal, "textinputhost.exe");
+    let (mut o, _) = boot(&w, user_profile());
+    tradingview_starts(&w, &mut o);
+    assert_user_layout(&w, &mut o, 3);
+    assert!(!logged(&mut o, "textinputhost.exe Cls stays (not moved)"));
+}
+
+#[test]
+fn startup_system_window_on_another_desktop_does_not_block_the_arrangement() {
+    let w = World::new(2);
+    open_as(&w, 1, State::Maximized, "a.exe");
+    open_as(&w, 2, State::Maximized, "b.exe");
+    put(&w, 3, 2);
+    proc_of(&w, 3, "textinputhost.exe");
+    let (o, _) = started_with(&w, Settings::default());
+    assert_eq!((w.desk_of(1), w.desk_of(2)), (g(1), g(2)));
+    assert!(o.is_managed(h(2)));
 }
 
 #[test]
@@ -2264,7 +2346,7 @@ fn startup_nothing_moves_or_compacts_before_the_sequence_and_late_maximized_wind
     o.on_event(first.hwnd, Event::Recheck);
     let l = w.desktops.borrow().clone();
     assert_eq!(w.desk_of(3), l[1]);
-    assert_eq!((w.desk_of(2), w.desk_of(1), w.desk_of(8)), (l[3], l[4], l[5]), "the late window last (youngest process)");
+    assert_eq!((w.desk_of(2), w.desk_of(1), w.desk_of(8)), (l[0], l[3], l[4]), "Explorer (oldest) stays, the late window last (youngest process)");
     assert!(o.is_managed(h(8)));
 }
 
@@ -2282,8 +2364,8 @@ fn startup_profile_app_that_never_starts_keeps_its_desktop_and_nothing_else_move
     assert!(!o.layout_running());
     assert!(logged(&mut o, "gave up waiting for a window of tradingview.exe"));
     let l = w.desktops.borrow().clone();
-    assert_eq!(l.len(), 5, "desktop 3 stays the profile's (part of B), helpers behind it");
-    assert_eq!((w.desk_of(3), w.desk_of(2), w.desk_of(1)), (l[1], l[3], l[4]));
+    assert_eq!(l.len(), 4, "desktop 3 stays the profile's (part of B), helpers behind it");
+    assert_eq!((w.desk_of(3), w.desk_of(2), w.desk_of(1)), (l[1], l[0], l[3]));
     assert_eq!(w.current.get(), edge);
     // The end of the run compacts once; the profile desktop is kept even when empty.
     delay_noise(&w, &mut o);
@@ -2340,8 +2422,8 @@ fn startup_debug_filter_moves_only_the_named_processes() {
     o.adopt(Vec::new(), None);
     let s = o.startup_schedule(false).unwrap();
     o.on_event(s.hwnd, Event::Recheck);
-    assert_eq!((w.desk_of(1), w.desk_of(2), w.desk_of(3)), (g(1), g(3), g(2)));
-    assert_eq!(list(&w), vec![1, 2, 3], "the user's desktop 2 is never taken or removed");
+    assert_eq!((w.desk_of(1), w.desk_of(2), w.desk_of(3)), (g(1), g(1), g(2)));
+    assert_eq!(list(&w), vec![1, 2], "the user's desktop 2 is never taken or removed");
     // Later maximizing a user's window does nothing either.
     w.set_state(1, State::Normal);
     ev(&w, &mut o, 1, Loc);
