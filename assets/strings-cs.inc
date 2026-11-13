@@ -33,7 +33,7 @@
 #define T_CS_PICK_LABEL "Aplikace s otevřeným oknem:"
 #define T_CS_PICK_BTN "Vyloučit"
 #define T_CS_ABOUT_CAPTION "O aplikaci AutoSpaces"
-#define T_CS_ABOUT_SUMMARY "AutoSpaces přesune maximalizované okno nebo okno v celoobrazovkovém režimu na vlastní plochu Windows a po jeho zavření nebo zmenšení se na původní plochu zase vrátí."
+#define T_CS_ABOUT_SUMMARY "Když na ploše maximalizujete další okno, AutoSpaces mu dá vlastní plochu Windows a po jeho zavření nebo zmenšení vás vrátí na původní plochu."
 #define T_CS_ABOUT_AUTHOR "Autor: Přemysl Vavroušek"
 #define T_CS_ABOUT_GRP "Podpořit autora"
 #define T_CS_PAY_REVOLUT "Revolut"

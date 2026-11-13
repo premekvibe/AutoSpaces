@@ -33,7 +33,7 @@
 #define T_EN_PICK_LABEL "Apps with an open window:"
 #define T_EN_PICK_BTN "Exclude"
 #define T_EN_ABOUT_CAPTION "About AutoSpaces"
-#define T_EN_ABOUT_SUMMARY "AutoSpaces moves a maximized or full-screen window to its own virtual desktop and switches back to the original desktop when that window is closed or restored."
+#define T_EN_ABOUT_SUMMARY "When you maximize another window on a desktop, AutoSpaces gives it its own virtual desktop and takes you back when that window is closed or restored."
 #define T_EN_ABOUT_AUTHOR "Author: Přemysl Vavroušek"
 #define T_EN_ABOUT_GRP "Support the author"
 #define T_EN_PAY_REVOLUT "Revolut"

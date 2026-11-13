@@ -105,6 +105,10 @@ pub struct Orchestrator<B: DesktopBackend, W: WindowSystem> {
     by_window: HashMap<HWND, Guid>,
     /// Maximized windows we decided not to manage (plan 6.1); NOT a dictionary of all windows.
     rejected: HashSet<HWND>,
+    /// Tests of the entry mechanics (one window at a time) switch the "only when another maximized
+    /// window shares the desktop" rule off; the rule tests switch it on.
+    #[cfg(test)]
+    pub(crate) always_own_desktop: bool,
     /// Per-window transition locks: (hwnd, locked until, ms).
     locks: Vec<(HWND, u64)>,
     dragging: Option<HWND>,
@@ -157,6 +161,8 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
             spaces: HashMap::new(),
             by_window: HashMap::new(),
             rejected: HashSet::new(),
+            #[cfg(test)]
+            always_own_desktop: true,
             locks: Vec::new(),
             dragging: None,
             tombstones: Vec::new(),
@@ -636,17 +642,25 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
             found.push((if t == 0 { u64::MAX } else { t }, w, fullscreen));
         }
         found.sort_by_key(|f| f.0); // stable: equal start times keep the z-order
-        if all {
-            // The first (oldest) window stays on desktop #1, treated like a window left in place
-            // (until restored and maximized again). Excluded apps stay anyway: they do not count.
-            if let Some(i) = found.iter().position(|f| !self.settings.is_excluded(&self.ws.process(f.1).0)) {
-                let (_, w, _) = found.remove(i);
-                let label = self.window_label(w);
-                self.rejected.insert(w);
-                self.note(format!("startup: {label} stays on desktop #1 (the first maximized window)"));
-            }
-        }
         found
+    }
+
+    fn always_own(&self) -> bool {
+        #[cfg(test)]
+        return self.always_own_desktop;
+        #[cfg(not(test))]
+        false
+    }
+
+    /// Another visible (not minimized, not cloaked on the viewed desktop) maximized or full-screen
+    /// app window of any app (excluded ones and learned exceptions included) is on `origin`.
+    fn shares_desktop(&self, hwnd: HWND, origin: Guid, cur: Guid) -> bool {
+        self.real_windows().into_iter().any(|w| {
+            w != hwnd
+                && matches!(self.ws.state(w), State::Maximized | State::Fullscreen)
+                && self.backend.window_desktop(w) == Some(origin)
+                && !(origin == cur && self.ws.is_cloaked(w))
+        })
     }
 
     /// Gives each window a desktop of its own by the ordinary enter path, in bulk: no animation,
@@ -655,6 +669,27 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
     fn arrange(&mut self, found: Vec<(u64, HWND, bool)>) {
         if found.is_empty() {
             return;
+        }
+        let mut found = found;
+        // The first (oldest) window stays when no maximized window would remain with it: nothing
+        // outside the group (or excluded from moving) shares its desktop. The others then see it.
+        if let Some(origin) = self.backend.window_desktop(found[0].1).filter(|g| !g.is_zero()) {
+            let cur = self.backend.current().unwrap_or(origin);
+            let group: Vec<HWND> = found.iter().map(|f| f.1).collect();
+            let stays_anyway = |o: &Self, w: HWND| !group.contains(&w) || o.settings.is_excluded(&o.ws.process(w).0);
+            let shared = self.real_windows().into_iter().any(|w| {
+                w != found[0].1
+                    && stays_anyway(self, w)
+                    && matches!(self.ws.state(w), State::Maximized | State::Fullscreen)
+                    && self.backend.window_desktop(w) == Some(origin)
+                    && !(origin == cur && self.ws.is_cloaked(w))
+            });
+            if !shared {
+                let (_, w, _) = found.remove(0);
+                let label = self.window_label(w);
+                self.rejected.insert(w);
+                self.note(format!("startup: {label} stays on its desktop (the first maximized window)"));
+            }
         }
         self.bulk = true;
         let mut moved = 0;
@@ -739,13 +774,14 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
             self.rejected.insert(hwnd);
             return None;
         }
-        // Alone on a desktop that is not #1: it already has a desktop to itself.
-        if let Some(list) = self.sync_list() {
-            if list.first() != Some(&origin) && !self.occupancy(Some(hwnd)).contains(&origin) {
-                self.note(format!("skip {:#x}: alone on its desktop", hwnd as usize));
-                self.rejected.insert(hwnd);
-                return None;
-            }
+        // A window gets a desktop of its own only when another maximized / full-screen window
+        // is on its desktop; alone it stays (until restored and maximized again). The startup
+        // arrangement decides this for the whole group beforehand (`arrange`).
+        self.sync_list();
+        if !self.bulk && !self.always_own() && !self.shares_desktop(hwnd, origin, cur) {
+            self.note(format!("skip {:#x} {process}: no other maximized window on its desktop; it stays", hwnd as usize));
+            self.rejected.insert(hwnd);
+            return None;
         }
         let viewing = cur == origin && !self.bulk;
         let (d, created) = match self.find_empty(origin) {

@@ -1011,6 +1011,7 @@ fn compaction_never_counts_the_moved_window_twice_or_not_at_all() {
     put(&w, 9, 1);
     put(&w, 1, 2);
     let mut o = started(&w);
+    o.always_own_desktop = false;
     w.current.set(g(2));
     w.wins.borrow_mut().get_mut(&1).unwrap().state = State::Maximized;
     ev(&w, &mut o, 1, Loc);
@@ -1260,6 +1261,7 @@ fn window_alone_on_its_desktop_is_not_moved_but_alone_on_desktop_one_is() {
     let w = World::new(3);
     put(&w, 1, 2);
     let mut o = started(&w);
+    o.always_own_desktop = false;
     w.set_state(1, State::Maximized);
     w.current.set(g(2));
     ev(&w, &mut o, 1, Loc);
@@ -1267,18 +1269,20 @@ fn window_alone_on_its_desktop_is_not_moved_but_alone_on_desktop_one_is() {
     assert_eq!((list(&w), w.creates.get()), (vec![1, 2, 3], 0));
     // Not a learned-list strike either.
     let (w, mut o, log) = setup(3);
+    o.always_own_desktop = false;
     w.wins.borrow_mut().remove(&902);
     put(&w, 1, 2);
     w.set_state(1, State::Maximized);
     ev(&w, &mut o, 1, Loc);
     assert!(log.borrow().is_empty() && !o.is_managed(h(1)));
-    // Alone on #1: entered.
+    // Alone on #1: stays as well (the rule is the same on every desktop).
     let w = World::new(3);
     put(&w, 1, 1);
     let mut o = started(&w);
+    o.always_own_desktop = false;
     w.set_state(1, State::Maximized);
     ev(&w, &mut o, 1, Loc);
-    assert!(o.is_managed(h(1)));
+    assert!(!o.is_managed(h(1)) && o.is_rejected(h(1)));
 }
 
 #[test]
@@ -2013,8 +2017,9 @@ fn arrange_fullscreen_only_mode_takes_only_fullscreen_windows() {
     let mut s = Settings::default();
     s.set_fullscreen_only(true);
     let (o, _) = started_with(&w, s);
-    assert_eq!((w.desk_of(1), w.desk_of(2)), (g(1), g(1)), "the only fullscreen window is the first: it stays");
-    assert!(o.is_rejected(h(1)) && o.is_rejected(h(2)));
+    // A maximized window occupies the desktop as well, so the fullscreen one gets its own.
+    assert_eq!((w.desk_of(1), w.desk_of(2)), (g(1), g(2)));
+    assert!(o.is_rejected(h(1)) && o.is_managed(h(2)));
 }
 
 #[test]
@@ -2028,9 +2033,9 @@ fn arrange_respects_excluded_apps_and_other_candidate_rules() {
     let mut s = Settings::default();
     s.exclude("skip.exe");
     let (o, _) = started_with(&w, s);
-    assert_eq!(list(&w), vec![1, 2]);
-    assert_eq!((w.desk_of(1), w.desk_of(2), w.desk_of(3), w.desk_of(4)), (g(1), g(1), g(1), g(2)));
-    assert!(o.is_rejected(h(1)) && o.is_rejected(h(2)) && o.is_managed(h(4)), "excluded apps do not take the place of the first");
+    assert_eq!(list(&w), vec![1, 2, 3]);
+    assert_eq!((w.desk_of(1), w.desk_of(2), w.desk_of(3), w.desk_of(4)), (g(1), g(2), g(1), g(3)));
+    assert!(o.is_rejected(h(1)) && o.is_managed(h(2)), "the excluded app occupies desktop 1: the others move");
 }
 
 #[test]
@@ -2113,20 +2118,25 @@ fn arrange_keeps_the_oldest_window_on_desktop_1_and_it_moves_normally_after_rest
     w.starts.borrow_mut().insert(1, 200);
     w.starts.borrow_mut().insert(2, 100);
     let (mut o, _) = started_with(&w, Settings::default());
+    o.always_own_desktop = false;
     assert_eq!((w.desk_of(2), w.desk_of(1), list(&w)), (g(1), g(2), vec![1, 2]));
     assert!(o.is_rejected(h(2)) && !o.is_managed(h(2)));
-    assert!(logged(&mut o, "stays on desktop #1"));
+    assert!(logged(&mut o, "stays on its desktop"));
+    // Restored and maximized again: still alone on its desktop, so it stays (no desktop of its own).
     w.set_state(2, State::Normal);
     ev(&w, &mut o, 2, Loc);
     w.set_state(2, State::Maximized);
     ev(&w, &mut o, 2, Loc);
-    assert!(o.is_managed(h(2)), "after restore and a new maximize it is moved as usual");
-    assert_ne!(w.desk_of(2), g(1));
+    assert!(!o.is_managed(h(2)) && w.desk_of(2) == g(1) && list(&w) == vec![1, 2]);
+    // A second window maximized on the same desktop is the one that moves.
+    open_as(&w, 3, State::Maximized, "third.exe");
+    ev(&w, &mut o, 3, Event::Show);
+    assert!(o.is_managed(h(3)) && w.desk_of(3) != g(1) && w.desk_of(2) == g(1));
 }
 
 #[test]
-fn arrange_keeps_the_first_window_on_desktop_1_whatever_else_is_there() {
-    for other in [State::Normal, State::Maximized] {
+fn arrange_keeps_the_first_window_unless_another_maximized_window_stays_on_the_desktop() {
+    for (other, want) in [(State::Normal, (g(1), g(2), g(1))), (State::Maximized, (g(2), g(3), g(1)))] {
         let w = World::new(1);
         open_as(&w, 1, State::Maximized, "a.exe");
         open_as(&w, 2, State::Maximized, "b.exe");
@@ -2134,8 +2144,73 @@ fn arrange_keeps_the_first_window_on_desktop_1_whatever_else_is_there() {
         let mut s = Settings::default();
         s.exclude("skip.exe");
         let (_o, _) = started_with(&w, s);
-        assert_eq!((w.desk_of(1), w.desk_of(2), w.desk_of(3)), (g(1), g(2), g(1)), "{other:?}");
+        // Another maximized window (even of an excluded app) shares desktop 1: all move.
+        assert_eq!((w.desk_of(1), w.desk_of(2), w.desk_of(3)), want, "{other:?}");
     }
+}
+
+// ---------------------------------------------------------------- general rule: own desktop only when another maximized window shares it
+
+fn rule_started(w: &Rc<World>, s: Settings) -> Orch {
+    let mut o = Orchestrator::new(FB(w.clone()), FW(w.clone()), s);
+    o.always_own_desktop = false;
+    o.adopt(Vec::new(), None);
+    o
+}
+
+#[test]
+fn rule_single_maximized_window_stays_on_any_desktop_and_the_second_one_moves() {
+    for d in [1u32, 2] {
+        let w = World::new(2);
+        put(&w, 1, d);
+        proc_of(&w, 1, "a.exe");
+        put(&w, 2, d);
+        proc_of(&w, 2, "b.exe");
+        w.current.set(g(d));
+        let mut o = rule_started(&w, Settings::default());
+        w.set_state(1, State::Maximized);
+        ev(&w, &mut o, 1, Loc);
+        assert!(!o.is_managed(h(1)) && w.desk_of(1) == g(d) && list(&w) == vec![1, 2], "desktop {d}");
+        // The second maximized window on the same desktop is the one that gets its own desktop.
+        w.set_state(2, State::Maximized);
+        ev(&w, &mut o, 2, Loc);
+        assert!(o.is_managed(h(2)) && !o.is_managed(h(1)) && w.desk_of(1) == g(d), "desktop {d}");
+        // Restoring it returns it, nothing moves again (no loop).
+        w.set_state(2, State::Normal);
+        ev(&w, &mut o, 2, Loc);
+        assert_eq!((w.desk_of(2), o.snapshot().len()), (g(d), 0));
+        ev(&w, &mut o, 2, Loc);
+        assert_eq!(w.desk_of(2), g(d));
+    }
+}
+
+#[test]
+fn rule_excluded_app_and_fullscreen_window_occupy_the_desktop_minimized_one_does_not() {
+    let mut s = Settings::default();
+    s.exclude("skip.exe");
+    for (other, moves) in [(State::Maximized, true), (State::Fullscreen, true), (State::Minimized, false), (State::Normal, false)] {
+        let w = World::new(1);
+        open_as(&w, 9, other, "skip.exe");
+        open_as(&w, 1, State::Normal, "a.exe");
+        let mut o = rule_started(&w, s.clone());
+        w.set_state(1, State::Maximized);
+        ev(&w, &mut o, 1, Loc);
+        assert_eq!(o.is_managed(h(1)), moves, "{other:?}");
+    }
+}
+
+#[test]
+fn rule_kept_window_after_restore_and_maximize_again_stays_while_alone() {
+    // The user's case: the window left at startup is restored and maximized again.
+    let w = World::new(1);
+    open_as(&w, 1, State::Maximized, "explorer.exe");
+    let mut o = rule_started(&w, Settings::default());
+    assert!(o.is_rejected(h(1)) || !o.is_managed(h(1)));
+    w.set_state(1, State::Normal);
+    ev(&w, &mut o, 1, Loc);
+    w.set_state(1, State::Maximized);
+    ev(&w, &mut o, 1, Loc);
+    assert!(!o.is_managed(h(1)) && w.desk_of(1) == g(1) && list(&w) == vec![1]);
 }
 
 #[test]
@@ -2422,8 +2497,8 @@ fn startup_debug_filter_moves_only_the_named_processes() {
     o.adopt(Vec::new(), None);
     let s = o.startup_schedule(false).unwrap();
     o.on_event(s.hwnd, Event::Recheck);
-    assert_eq!((w.desk_of(1), w.desk_of(2), w.desk_of(3)), (g(1), g(1), g(2)));
-    assert_eq!(list(&w), vec![1, 2], "the user's desktop 2 is never taken or removed");
+    assert_eq!((w.desk_of(1), w.desk_of(2), w.desk_of(3)), (g(1), g(3), g(2)), "the user's maximized window shares desktop 1");
+    assert_eq!(list(&w), vec![1, 2, 3], "the user's desktop 2 is never taken or removed");
     // Later maximizing a user's window does nothing either.
     w.set_state(1, State::Normal);
     ev(&w, &mut o, 1, Loc);
