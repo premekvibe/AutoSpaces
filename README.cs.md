@@ -71,3 +71,11 @@ Užitečné přepínače: `--selftest --select-only` (kontrola rozhraní ploch j
 Přemysl Vavroušek · [www.premysl-vavrousek.cz](https://www.premysl-vavrousek.cz)
 
 Pokud vám AutoSpaces pomáhá, v dialogu *O aplikaci…* najdete možnosti, jak podpořit jeho vývoj.
+
+## Licence
+
+AutoSpaces je svobodný software pod licencí [GNU General Public License verze 3.0 nebo novější](LICENSE). Na název, ikonu a platební údaje autora se licence nevztahuje; viz [NOTICE.md](NOTICE.md).
+
+## Nahlášení problému
+
+Založte prosím hlášení na [github.com/premekvibe/AutoSpaces/issues](https://github.com/premekvibe/AutoSpaces/issues).

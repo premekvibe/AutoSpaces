@@ -71,3 +71,11 @@ Useful switches: `--selftest --select-only` (read-only check of the desktop inte
 Přemysl Vavroušek · [www.premysl-vavrousek.cz](https://www.premysl-vavrousek.cz)
 
 If AutoSpaces is useful to you, the *About…* dialog lists ways to support its development.
+
+## Licence
+
+AutoSpaces is free software under the [GNU General Public License v3.0 or later](LICENSE). The name, the icon and the author's payment details are not covered by it; see [NOTICE.md](NOTICE.md).
+
+## Reporting a problem
+
+Please open an issue at [github.com/premekvibe/AutoSpaces/issues](https://github.com/premekvibe/AutoSpaces/issues).
