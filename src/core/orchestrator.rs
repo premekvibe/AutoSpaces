@@ -948,8 +948,8 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
         self.layout.is_some()
     }
 
-    /// Applies the profile now: completes the desktops, moves the windows of running
-    /// applications, launches the others and awaits their windows by events (plus a short timer
+    /// Applies the profile now: completes the desktops, moves and maximizes the windows of
+    /// running applications, launches the others and awaits their windows by events (plus a short timer
     /// that only runs meanwhile). Returns the timer request for the host. Never switches the view.
     pub fn start_layout(&mut self) -> Option<Schedule> {
         if self.reinit || self.baseline == 0 {
@@ -998,10 +998,13 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
         for i in 0..run.rules.len() {
             let process = run.rules[i].process.clone();
             match self.layout_find(&run, &wins, &process) {
-                // A running app: its window is only moved (the user arranged it already).
+                // A running app is not started again: its window (the first unclaimed one, in
+                // window enumeration order) is moved and maximized like a launched one, also when
+                // minimized or on another desktop. If it is the user's foreground window, it still
+                // moves and the view stays (consistent: the profile never switches the view).
                 Some(w) => {
-                    if self.place(&mut run, i, w, false) == Placed::NotYet {
-                        run.pending.push((i, deadline, false));
+                    if self.place(&mut run, i, w, true) == Placed::NotYet {
+                        run.pending.push((i, deadline, true));
                     }
                 }
                 None => {
@@ -1026,9 +1029,9 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
     }
 
     /// Moves `hwnd` to the desktop of rule `i` (no view switch); a window the profile launched is
-    /// also maximized, without activation. The window is registered as placed: the ordinary logic
+    /// also maximized (`maximize`; running apps too), without activation. The window is registered as placed: the ordinary logic
     /// never moves it to a helper desktop (plan 12.7).
-    fn place(&mut self, run: &mut LayoutRun, i: usize, hwnd: HWND, launched: bool) -> Placed {
+    fn place(&mut self, run: &mut LayoutRun, i: usize, hwnd: HWND, maximize: bool) -> Placed {
         let (desk, proc) = (run.rules[i].desktop, run.rules[i].process.clone());
         let Some(target) = self.layout_target(desk) else {
             self.note(format!("layout: {proc}: desktop {desk} does not exist"));
@@ -1061,14 +1064,14 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
             }
         }
         self.note(format!("layout: {proc} {:#x} -> desktop {desk}", hwnd as usize));
-        run.claimed.push(Claim { hwnd, maximize: launched, tries: 0 });
+        run.claimed.push(Claim { hwnd, maximize, tries: 0 });
         self.profile_windows.insert(hwnd);
         self.rejected.insert(hwnd);
         // Focus back to the user first: the maximize then stays inside the app (no view switch).
         self.layout_guard(run);
         // An app asking for the foreground under our lock gets a flashing taskbar button instead.
         self.ws.stop_flash(hwnd);
-        if launched {
+        if maximize {
             self.layout_maximize(run, run.claimed.len() - 1);
         }
         Placed::Yes

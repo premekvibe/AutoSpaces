@@ -1402,7 +1402,7 @@ fn layout_moves_running_app_and_launches_missing_one() {
     proc_of(&w, 2, "trade.exe");
     ev(&w, &mut o, 2, Event::Show);
     assert_eq!(w.desk_of(2), g(3));
-    assert_eq!(*w.maximized.borrow(), vec![2], "the launched app is maximized, the running one is not");
+    assert_eq!(*w.maximized.borrow(), vec![1, 2], "the running and the launched app are both maximized");
     assert_eq!(w.state(2), State::Maximized);
     assert!(o.layout_running(), "the launched app is followed for a while");
     settle(&w, &mut o);
@@ -1410,6 +1410,38 @@ fn layout_moves_running_app_and_launches_missing_one() {
     assert_eq!(w.current.get(), g(1));
     assert_eq!(list(&w), vec![1, 2, 3]);
     assert!(!o.is_managed(h(2)), "registered as placed: no helper desktop");
+}
+
+#[test]
+fn layout_running_app_is_not_started_again_but_moved_and_maximized() {
+    let w = World::new(2);
+    put(&w, 1, 1);
+    proc_of(&w, 1, "a.exe");
+    let mut o = started(&w);
+    o.apply_settings(profile(3, &[(2, "a.exe")]));
+    assert!(o.start_layout().is_none(), "nothing to wait for");
+    assert!(w.launched.borrow().is_empty(), "not started again");
+    assert_eq!(w.desk_of(1), g(2));
+    assert_eq!(*w.maximized.borrow(), vec![1]);
+    assert_eq!(w.state(1), State::Maximized);
+    assert_eq!(w.current.get(), g(1), "no view switch");
+}
+
+#[test]
+fn layout_minimized_running_app_on_another_desktop_is_moved_and_maximized() {
+    let w = World::new(2);
+    put(&w, 1, 2); // on desktop 2, minimized, the user is on desktop 1
+    proc_of(&w, 1, "a.exe");
+    w.set_state(1, State::Minimized);
+    let mut o = started(&w);
+    o.apply_settings(profile(3, &[(3, "a.exe")]));
+    assert!(o.start_layout().is_none());
+    assert!(w.launched.borrow().is_empty());
+    assert_eq!(w.desk_of(1), g(3));
+    assert_eq!(*w.maximized.borrow(), vec![1]);
+    assert_eq!(w.state(1), State::Maximized);
+    assert_eq!(w.current.get(), g(1));
+    assert!(w.activated.borrow().is_empty(), "no focus taken");
 }
 
 #[test]
