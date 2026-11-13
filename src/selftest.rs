@@ -19,8 +19,9 @@ struct Out {
 }
 
 impl Out {
-    fn open() -> Out {
-        let file = std::env::var_os("LOCALAPPDATA").and_then(|base| {
+    /// `to_file` = also write `selftest.txt` (the read-only mode only prints to the console).
+    fn open(to_file: bool) -> Out {
+        let file = std::env::var_os("LOCALAPPDATA").filter(|_| to_file).and_then(|base| {
             let dir = std::path::Path::new(&base).join("AutoSpaces");
             std::fs::create_dir_all(&dir).ok()?;
             File::create(dir.join("selftest.txt")).ok()
@@ -195,9 +196,11 @@ fn scenario(r: &mut Runner, b: &InternalBackend, hwnd: HWND, origin: Guid, befor
     });
 }
 
-pub fn run() -> i32 {
-    let mut out = Out::open();
-    out.say("AutoSpaces self-test");
+/// `select_only`: only the variant selection with its read-only self-test (no desktop is created,
+/// nothing is moved or switched, no file is written); otherwise the full scenario below.
+pub fn run(select_only: bool) -> i32 {
+    let mut out = Out::open(!select_only);
+    out.say(if select_only { "AutoSpaces self-test (read-only: variant selection)" } else { "AutoSpaces self-test" });
     let t0 = Instant::now();
     let mut diag = Vec::new();
     let sel = InternalBackend::select(&mut diag);
@@ -212,7 +215,12 @@ pub fn run() -> i32 {
             return 1;
         }
     };
-    out.say(&format!("PASS {sel_ms:>8} ms  select: {}", b.name()));
+    let tag = if b.verified() { "" } else { " (unverified variant)" };
+    out.say(&format!("PASS {sel_ms:>8} ms  select: {}{tag}", b.name()));
+    if select_only {
+        out.say("RESULT: PASS");
+        return 0;
+    }
 
     let (origin, before) = match (b.current(), b.desktops()) {
         (Ok(c), Ok(l)) => (c, l.len()),

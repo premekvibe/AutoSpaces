@@ -7,11 +7,16 @@
 use super::backend::{check, DesktopBackend, Error, Result};
 use super::guid::Guid;
 use super::registry;
+use super::select::{self, Candidate, Guard, Probe, Skip};
 use super::variants::{self, Variant};
 use std::ffi::c_void;
 use std::fmt;
 use std::ptr::{null_mut, NonNull};
 use windows_sys::Win32::Foundation::HWND;
+use windows_sys::Win32::System::Memory::{
+    VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_IMAGE, PAGE_EXECUTE, PAGE_EXECUTE_READ,
+    PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_NOACCESS,
+};
 use windows_sys::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, CLSCTX_LOCAL_SERVER,
     COINIT_APARTMENTTHREADED,
@@ -166,11 +171,187 @@ pub struct InternalBackend {
 pub struct Unsupported {
     pub build: u32,
     pub details: String,
+    /// Explorer's COM services were not reachable (restarting / not up yet): worth retrying.
+    pub transient: bool,
 }
 
 impl fmt::Display for Unsupported {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "unsupported Windows build {}: {}", self.build, self.details)
+    }
+}
+
+/// IIDs from public sources that no variant uses (one source only / never released). Only asked
+/// for with QueryService when nothing passed, so a report says which interface Explorer offers.
+const EXTRA_PROBE_IIDS: [&str; 3] = [
+    "4970BA3D-FD4E-4647-BEA3-D89076EF4B9C", // pyvda: 22631 (other sources: 53F5CA0B)
+    "094AFE11-44F2-4BA0-976F-29A97E263EE0", // pyvda: Insider 20231+
+    "0F3A72B0-4566-487E-9A33-4ED302F6D6CE", // IVirtualDesktopManagerInternal2, Windows 10 2004+
+];
+
+// ---------------------------------------------------------------- self-test plumbing
+//
+// During the self-test the layout is not trusted yet. A wrong slot may write more (or less) than
+// the expected type, or leave garbage where an interface pointer should be. So the read-only calls
+// write into oversized zeroed buffers (anything written past the expected size = wrong layout) and
+// a returned pointer is used only when it points to committed readable memory whose first entry
+// (the vtable) leads to executable code of a loaded image, as every COM proxy does. An implausible
+// pointer is leaked rather than released.
+
+fn readable(addr: usize, len: usize) -> Option<MEMORY_BASIC_INFORMATION> {
+    if addr < 0x10000 {
+        return None;
+    }
+    let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    let got = unsafe { VirtualQuery(addr as *const c_void, &mut m, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) };
+    let end = (m.BaseAddress as usize).saturating_add(m.RegionSize);
+    let ok = got != 0
+        && m.State == MEM_COMMIT
+        && m.Protect != 0
+        && m.Protect & (PAGE_GUARD | PAGE_NOACCESS) == 0
+        && addr.checked_add(len).is_some_and(|e| e <= end);
+    ok.then_some(m)
+}
+
+fn plausible_object(p: Raw) -> bool {
+    const EXEC: u32 = PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    let a = p as usize;
+    if a % 8 != 0 || readable(a, 8).is_none() {
+        return false;
+    }
+    let vtbl = unsafe { *(a as *const usize) };
+    if vtbl % 8 != 0 || readable(vtbl, 3 * 8).is_none() {
+        return false;
+    }
+    let qi = unsafe { *(vtbl as *const usize) };
+    readable(qi, 1).is_some_and(|m| m.Type == MEM_IMAGE && m.Protect & EXEC != 0)
+}
+
+/// `[out] IUnknown**` call for the self-test (see above).
+fn guarded_out(f: impl FnOnce(*mut Raw) -> Hr) -> std::result::Result<ComPtr, String> {
+    let mut buf = [0usize; 4];
+    let hr = f(buf.as_mut_ptr() as *mut Raw);
+    let p = buf[0] as Raw;
+    if buf[1..].iter().any(|&x| x != 0) {
+        return Err("wrote past the interface pointer".into());
+    }
+    if hr < 0 {
+        // A failing call may still have left an object; release it only when it is plausible.
+        if !p.is_null() && plausible_object(p) {
+            drop(ComPtr(unsafe { NonNull::new_unchecked(p) }));
+        }
+        return Err(format!("0x{:08X}", hr as u32));
+    }
+    if !plausible_object(p) {
+        return Err(format!("implausible object pointer {:#x}", p as usize));
+    }
+    Ok(ComPtr(unsafe { NonNull::new_unchecked(p) }))
+}
+
+/// The self-test's view of a freshly opened (not yet trusted) variant.
+struct Untrusted<'a>(&'a InternalBackend);
+
+impl Untrusted<'_> {
+    fn id_of(&self, d: &ComPtr) -> std::result::Result<Guid, String> {
+        // The object must really implement this variant's IVirtualDesktop.
+        let d = d.query(&self.0.v.iid_desktop).map_err(|e| format!("QueryInterface(IVirtualDesktop) {e}"))?;
+        let mut buf = [0u8; 48];
+        let hr = unsafe { d.slot::<FnGuidOut>(self.0.v.desktop_get_id)(d.raw(), buf.as_mut_ptr() as *mut Guid) };
+        if hr < 0 {
+            return Err(format!("GetId 0x{:08X}", hr as u32));
+        }
+        if buf[16..].iter().any(|&x| x != 0) {
+            return Err("GetId wrote more than a GUID".into());
+        }
+        Guid::from_bytes(&buf[..16]).ok_or_else(|| "GetId".to_string())
+    }
+
+    fn out_call(&self, slot: usize) -> std::result::Result<ComPtr, String> {
+        let (m, mon) = (&self.0.mgr, self.0.v.monitor_param);
+        guarded_out(|p| unsafe {
+            if mon {
+                m.slot::<FnMonOut>(slot)(m.raw(), null_mut(), p)
+            } else {
+                m.slot::<FnOut>(slot)(m.raw(), p)
+            }
+        })
+    }
+}
+
+impl Probe for Untrusted<'_> {
+    fn count(&mut self) -> std::result::Result<i32, String> {
+        let (b, mut buf) = (self.0, [0u32; 8]);
+        let m = &b.mgr;
+        let out = buf.as_mut_ptr() as *mut i32;
+        let hr = unsafe {
+            if b.v.monitor_param {
+                m.slot::<FnMonCount>(b.v.slots.get_count)(m.raw(), null_mut(), out)
+            } else {
+                m.slot::<FnCount>(b.v.slots.get_count)(m.raw(), out)
+            }
+        };
+        if hr < 0 {
+            return Err(format!("0x{:08X}", hr as u32));
+        }
+        if buf[1..].iter().any(|&x| x != 0) {
+            return Err("wrote more than an int".into());
+        }
+        Ok(buf[0] as i32)
+    }
+
+    fn current(&mut self) -> std::result::Result<Guid, String> {
+        let d = self.out_call(self.0.v.slots.get_current)?;
+        self.id_of(&d)
+    }
+
+    fn desktops(&mut self) -> std::result::Result<Vec<Guid>, String> {
+        let arr = self.out_call(self.0.v.slots.get_desktops)?;
+        let arr = arr.query(&guid(IID_OBJECT_ARRAY)).map_err(|e| format!("QueryInterface(IObjectArray) {e}"))?;
+        let mut n = 0u32;
+        check(unsafe { arr.slot::<FnArrCount>(SLOT_ARRAY_COUNT)(arr.raw(), &mut n) }).map_err(|e| e.to_string())?;
+        if n > 1000 {
+            return Err(format!("{n} desktops"));
+        }
+        let iid = self.0.v.iid_desktop;
+        (0..n)
+            .map(|i| {
+                let d = out_ptr(|p| unsafe { arr.slot::<FnArrGetAt>(SLOT_ARRAY_GET_AT)(arr.raw(), i, &iid, p) })
+                    .map_err(|e| format!("GetAt({i}) {e}"))?;
+                self.id_of(&d)
+            })
+            .collect()
+    }
+
+    fn find(&mut self, id: Guid) -> std::result::Result<Guid, String> {
+        let m = &self.0.mgr;
+        let d = guarded_out(|p| unsafe { m.slot::<FnFind>(self.0.v.slots.find)(m.raw(), &id, p) })?;
+        self.id_of(&d)
+    }
+}
+
+/// [`Candidate`] backed by Explorer: opens a variant with QueryService, self-tests it read-only.
+struct System<'a> {
+    shell: &'a ComPtr,
+    reg_ids: Option<Vec<Guid>>,
+    reg_cur: Option<Guid>,
+    opened: Option<InternalBackend>,
+}
+
+impl Candidate for System<'_> {
+    fn open(&mut self, v: &Variant) -> std::result::Result<(), Skip> {
+        self.opened = None;
+        let mgr = query_service(self.shell, &guid(SID_VDM_INTERNAL), &v.iid_manager).map_err(|e| Skip::Iid(e.hr()))?;
+        let vc = v.iid_view_collection;
+        let views = query_service(self.shell, &vc, &vc).map_err(|e| Skip::Views(e.hr()))?;
+        let public = create_instance(CLSID_VDM_PUBLIC, CLSCTX_ALL, IID_VDM_PUBLIC).map_err(|e| Skip::Views(e.hr()))?;
+        let name = format!("internal:{}", v.name);
+        self.opened = Some(InternalBackend { name, v: v.clone(), mgr, views, public });
+        Ok(())
+    }
+
+    fn test(&mut self, _v: &Variant) -> std::result::Result<String, String> {
+        let b = self.opened.as_ref().ok_or("not opened")?;
+        select::self_test(&mut Untrusted(b), self.reg_ids.as_deref(), self.reg_cur)
     }
 }
 
@@ -185,18 +366,6 @@ impl InternalBackend {
                 m.slot::<FnOut>(slot)(m.raw(), p)
             }
         })
-    }
-
-    fn count(&self) -> Result<i32> {
-        let (m, mut n) = (&self.mgr, 0i32);
-        check(unsafe {
-            if self.v.monitor_param {
-                m.slot::<FnMonCount>(self.v.slots.get_count)(m.raw(), null_mut(), &mut n)
-            } else {
-                m.slot::<FnCount>(self.v.slots.get_count)(m.raw(), &mut n)
-            }
-        })?;
-        Ok(n)
     }
 
     fn desktop_id(&self, d: &ComPtr) -> Result<Guid> {
@@ -221,34 +390,23 @@ impl InternalBackend {
         check(unsafe { m.slot::<FnIn2>(slot)(m.raw(), a.raw(), b.raw()) })
     }
 
-    /// Read-only verification against the registry (plan 5.1 step 4).
-    fn self_test(&self, reg_ids: Option<&[Guid]>, reg_cur: Option<Guid>) -> std::result::Result<String, String> {
-        let n = self.count().map_err(|e| format!("GetCount failed ({e})"))?;
-        let expected = reg_ids.map_or(1, |l| l.len());
-        if n < 1 || n as usize != expected {
-            return Err(format!("GetCount={n}, registry has {expected}"));
-        }
-        let d = self.call_out(self.v.slots.get_current).map_err(|e| format!("GetCurrentDesktop failed ({e})"))?;
-        // The returned object must really be an IVirtualDesktop of this variant.
-        let d = d.query(&self.v.iid_desktop).map_err(|e| format!("current desktop QI failed ({e})"))?;
-        let cur = self.desktop_id(&d).map_err(|e| format!("GetId failed ({e})"))?;
-        match reg_cur {
-            Some(rc) if rc != cur => Err(format!("current {cur} != registry {rc}")),
-            None if reg_ids.is_some_and(|l| !l.contains(&cur)) => Err(format!("current {cur} not in registry list")),
-            _ => Ok(format!("count {n}, current {cur}")),
-        }
+    /// The variant in use was checked on a real system (`"verified": true` in variants.json).
+    pub fn verified(&self) -> bool {
+        self.v.verified
     }
 
-    /// Picks the first variant whose build range matches, whose IID explorer accepts
-    /// and which passes the read-only self-test. `diag` collects human-readable diagnostics.
+    /// Picks the first variant whose build range matches, whose IID Explorer accepts and which
+    /// passes the read-only self-test, in the order described in `select.rs`. `diag` collects
+    /// human-readable diagnostics.
     pub fn select(diag: &mut Vec<String>) -> std::result::Result<InternalBackend, Unsupported> {
         let build = os_build();
-        let (mut list, src) = variants::load();
-        diag.push(format!("build {build}, {src}, {} variant(s)", list.len()));
-        let fail = |details: String| Unsupported { build, details };
+        let ubr = registry::ubr().map_or(String::new(), |u| format!(".{u}"));
+        let (list, src) = variants::load();
+        diag.push(format!("build {build}{ubr}, {src}, {} variant(s)", list.len()));
+        let fail = |details: String, transient: bool| Unsupported { build, details, transient };
 
         let shell = create_instance(CLSID_IMMERSIVE_SHELL, CLSCTX_LOCAL_SERVER, IID_SERVICE_PROVIDER)
-            .map_err(|e| fail(format!("ImmersiveShell: {e}")))?;
+            .map_err(|e| fail(format!("ImmersiveShell: {e}"), true))?;
         let reg_ids = registry::desktop_ids();
         let reg_cur = registry::current_desktop();
         diag.push(format!(
@@ -257,49 +415,58 @@ impl InternalBackend {
             reg_cur.map_or("?".into(), |g| g.to_string())
         ));
 
-        // Most specific (newest) range first.
-        list.sort_by_key(|v| std::cmp::Reverse(v.min_build));
-        let sid = guid(SID_VDM_INTERNAL);
-        let mut results = Vec::new();
-        for v in list {
-            let range = format!("{}..{}", v.min_build, v.max_build.map_or(String::new(), |m| m.to_string()));
-            if !v.matches_build(build) {
-                diag.push(format!("  {}: build range {range} does not match", v.name));
-                results.push(format!("{}=range", v.name));
-                continue;
-            }
-            let mgr = match query_service(&shell, &sid, &v.iid_manager) {
-                Ok(m) => m,
-                Err(e) => {
-                    diag.push(format!("  {}: QueryService({}) -> 0x{:08X}", v.name, v.iid_manager, e.hr() as u32));
-                    results.push(format!("{}=0x{:08X}", v.name, e.hr() as u32));
-                    continue;
-                }
-            };
-            let iid_vc = v.iid_view_collection;
-            let views = match query_service(&shell, &iid_vc, &iid_vc) {
-                Ok(c) => c,
-                Err(e) => {
-                    diag.push(format!("  {}: view collection -> 0x{:08X}", v.name, e.hr() as u32));
-                    results.push(format!("{}=views 0x{:08X}", v.name, e.hr() as u32));
-                    continue;
-                }
-            };
-            let public = create_instance(CLSID_VDM_PUBLIC, CLSCTX_ALL, IID_VDM_PUBLIC)
-                .map_err(|e| fail(format!("IVirtualDesktopManager: {e}")))?;
-            let b = InternalBackend { name: format!("internal:{}", v.name), v, mgr, views, public };
-            match b.self_test(reg_ids.as_deref(), reg_cur) {
-                Ok(s) => {
-                    diag.push(format!("  {}: QueryService OK, self-test PASS ({s})", b.v.name));
-                    return Ok(b);
-                }
-                Err(s) => {
-                    diag.push(format!("  {}: QueryService OK, self-test FAIL ({s})", b.v.name));
-                    results.push(format!("{}=selftest", b.v.name));
-                }
+        let mut guard = match std::env::var_os("LOCALAPPDATA") {
+            Some(base) => Guard::open(std::path::Path::new(&base).join("AutoSpaces").join("selftest-guard.txt")),
+            None => Guard::default(),
+        };
+        let mut sys = System { shell: &shell, reg_ids, reg_cur, opened: None };
+        let (chosen, outcome) = select::choose(&list, build, &mut guard, &mut sys);
+        for (name, r) in &outcome {
+            let v = list.iter().find(|v| &v.name == name);
+            let range = v.map_or(String::new(), |v| {
+                format!("{}..{}", v.min_build, v.max_build.map_or(String::new(), |m| m.to_string()))
+            });
+            let tag = if v.is_some_and(|v| v.verified) { "" } else { " [unverified]" };
+            let iid = v.map_or(String::new(), |v| v.iid_manager.to_string());
+            match r {
+                Ok(s) => diag.push(format!("  {name}{tag}: QueryService({iid}) OK, self-test PASS ({s})")),
+                Err(Skip::Range) => diag.push(format!("  {name}{tag}: build range {range} does not match")),
+                Err(e) => diag.push(format!("  {name}{tag}: {iid}: {e}")),
             }
         }
-        Err(fail(if results.is_empty() { "no variants".into() } else { results.join(", ") }))
+        if chosen.is_some() {
+            if let Some(b) = sys.opened.take() {
+                if !b.v.verified {
+                    diag.push(format!("variant {} is UNVERIFIED (taken from public sources, passed the self-test)", b.v.name));
+                }
+                return Ok(b);
+            }
+        }
+        drop(sys);
+        // Which interfaces Explorer offers at all (QueryService only, no method calls): the
+        // information needed to add a variant for this build.
+        let sid = guid(SID_VDM_INTERNAL);
+        let mut iids: Vec<Guid> = Vec::new();
+        for g in list.iter().map(|v| v.iid_manager).chain(EXTRA_PROBE_IIDS.iter().map(|s| guid(s))) {
+            if !iids.contains(&g) {
+                iids.push(g);
+            }
+        }
+        let accepted: Vec<String> =
+            iids.iter().filter(|g| query_service(&shell, &sid, g).is_ok()).map(|g| g.to_string()).collect();
+        diag.push(format!(
+            "IVirtualDesktopManagerInternal IIDs accepted by Explorer: {}",
+            if accepted.is_empty() { "none of the known ones".into() } else { accepted.join(", ") }
+        ));
+        let summary: Vec<String> = outcome
+            .iter()
+            .filter(|(_, r)| *r != Err(Skip::Range))
+            .map(|(n, r)| format!("{n}: {}", r.as_ref().map_or_else(|e| e.to_string(), |s| s.clone())))
+            .collect();
+        Err(fail(
+            if summary.is_empty() { "no variant for this build".into() } else { summary.join("; ") },
+            false,
+        ))
     }
 }
 

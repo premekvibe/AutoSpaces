@@ -65,12 +65,57 @@ pub struct Variant {
     pub slots: Slots,
     pub desktop_get_id: usize,
     pub view_for_hwnd: usize,
+    /// Checked on a real system (`"verified": true`). Unverified variants (slots taken from public
+    /// sources only) need a closed build range and are used only after the read-only self-test.
+    pub verified: bool,
 }
 
 impl Variant {
     pub fn matches_build(&self, build: u32) -> bool {
         build >= self.min_build && self.max_build.is_none_or(|m| build <= m)
     }
+
+    fn overlaps(&self, o: &Variant) -> bool {
+        let (a_max, b_max) = (self.max_build.unwrap_or(u32::MAX), o.max_build.unwrap_or(u32::MAX));
+        self.min_build <= b_max && o.min_build <= a_max
+    }
+}
+
+/// Order of the methods common to every known layout (plan 5.1): GetCount < MoveViewToDesktop <
+/// CanViewMoveDesktops < GetCurrentDesktop < GetDesktops < SwitchDesktop < CreateDesktop <
+/// RemoveDesktop < FindDesktop. The self-test checks GetCount, GetCurrentDesktop, GetDesktops and
+/// FindDesktop, so the untestable (changing) methods are bracketed by tested ones. A typo in a
+/// user-supplied file that breaks this order is rejected before anything is called.
+fn check_slot_order(s: &Slots) -> Result<(), String> {
+    let order = [
+        ("GetCount", s.get_count),
+        ("MoveViewToDesktop", s.move_view),
+        ("CanViewMoveDesktops", s.can_view_move),
+        ("GetCurrentDesktop", s.get_current),
+        ("GetDesktops", s.get_desktops),
+        ("SwitchDesktop", s.switch),
+        ("CreateDesktop", s.create),
+        ("RemoveDesktop", s.remove),
+        ("FindDesktop", s.find),
+    ];
+    if let Some(w) = order.windows(2).find(|w| w[0].1 >= w[1].1) {
+        return Err(format!("slot '{}' must be below '{}'", w[0].0, w[1].0));
+    }
+    for (name, slot) in &s.optional {
+        let ok = match name.as_str() {
+            "SwitchDesktopAndMoveForegroundView" => *slot > s.switch && *slot < s.create,
+            _ => *slot > s.find,
+        };
+        if !ok {
+            return Err(format!("slot '{name}' is out of place"));
+        }
+    }
+    let mut all: Vec<usize> = order.iter().map(|o| o.1).chain(s.optional.iter().map(|o| o.1)).collect();
+    all.sort_unstable();
+    if all.windows(2).any(|w| w[0] == w[1]) {
+        return Err("two methods share a slot".into());
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------- schema
@@ -132,9 +177,19 @@ fn parse_variant(o: &Json) -> Result<Variant, String> {
         Some(Json::Bool(b)) => *b,
         Some(_) => return Err(ctx("'monitorParam' must be a bool".into())),
     };
-    Ok(Variant {
+    let verified = match o.get("verified") {
+        None => false, // unknown provenance = unverified
+        Some(Json::Bool(b)) => *b,
+        Some(_) => return Err(ctx("'verified' must be a bool".into())),
+    };
+    let max_build = build_field(o, "maxBuild").map_err(ctx)?;
+    if !verified && max_build.is_none() {
+        return Err(ctx("an unverified variant needs 'maxBuild'".into()));
+    }
+    let v = Variant {
         min_build: build_field(o, "minBuild").map_err(ctx)?.unwrap_or(0),
-        max_build: build_field(o, "maxBuild").map_err(ctx)?,
+        max_build,
+        verified,
         iid_manager: guid_field(o, "iidManagerInternal", None).map_err(ctx)?,
         iid_desktop: guid_field(o, "iidDesktop", None).map_err(ctx)?,
         iid_view_collection: guid_field(o, "iidViewCollection", Some(DEFAULT_IID_VIEW_COLLECTION)).map_err(ctx)?,
@@ -153,8 +208,13 @@ fn parse_variant(o: &Json) -> Result<Variant, String> {
         },
         desktop_get_id: required_slot(desktop_slots, "GetId").map_err(ctx)?,
         view_for_hwnd,
-        name,
-    })
+        name: name.clone(),
+    };
+    if v.max_build.is_some_and(|m| m < v.min_build) {
+        return Err(ctx("'maxBuild' is below 'minBuild'".into()));
+    }
+    check_slot_order(&v.slots).map_err(ctx)?;
+    Ok(v)
 }
 
 pub fn parse_variants(text: &str) -> Result<Vec<Variant>, String> {
@@ -162,7 +222,15 @@ pub fn parse_variants(text: &str) -> Result<Vec<Variant>, String> {
     let Some(Json::Arr(list)) = root.get("variants") else {
         return Err("missing 'variants' array".into());
     };
-    list.iter().map(parse_variant).collect()
+    let list: Vec<Variant> = list.iter().map(parse_variant).collect::<Result<_, _>>()?;
+    // One IID may stand for different layouts (B2F925B9 in 21H2 and early 22H2, 53F5CA0B in 23H2
+    // and 24H2): only the build range tells them apart, so such ranges must not overlap.
+    for (i, a) in list.iter().enumerate() {
+        if let Some(b) = list[i + 1..].iter().find(|b| b.iid_manager == a.iid_manager && a.overlaps(b)) {
+            return Err(format!("variants '{}' and '{}' share an IID and overlapping builds", a.name, b.name));
+        }
+    }
+    Ok(list)
 }
 
 /// Embedded list, or `variants.json` next to the exe when present and valid.
@@ -186,7 +254,10 @@ mod tests {
     #[test]
     fn embedded_file_parses() {
         let v = parse_variants(EMBEDDED).unwrap();
-        assert_eq!(v.len(), 1);
+        let names: Vec<&str> = v.iter().map(|v| v.name.as_str()).collect();
+        assert_eq!(names, ["win11-24h2", "win11-23h2-3085", "win11-22h2-2215", "win11-22h2", "win11-21h2", "win10"]);
+        // Only the variant checked on a real system is marked verified.
+        assert!(v.iter().all(|x| x.verified == (x.name == "win11-24h2")));
         let w = &v[0];
         assert_eq!(w.name, "win11-24h2");
         assert_eq!(w.min_build, 26100);
@@ -233,6 +304,64 @@ mod tests {
         assert!(parse_variants(&MIN.replace("53F5CA0B-", "53F5CA0B")).is_err());
         assert!(parse_variants(r#"{"variants":{}}"#).is_err());
         assert!(parse_variants(r#"{"variants":[]} x"#).is_err());
+        assert!(parse_variants(&MIN.replace("\"monitorParam\":true", "\"verified\":1")).is_err());
     }
 
+    #[test]
+    fn older_variants_from_sources() {
+        let v = parse_variants(EMBEDDED).unwrap();
+        let by = |n: &str| v.iter().find(|x| x.name == n).unwrap().clone();
+        let w10 = by("win10");
+        assert_eq!((w10.min_build, w10.max_build), (17763, Some(19045)));
+        assert_eq!(w10.iid_manager.to_string(), "F31574D6-B682-4CDC-BD56-1827860ABEC6");
+        assert_eq!(w10.iid_desktop.to_string(), "FF72FFDD-BE7E-43FC-9C03-AD81681E88E4");
+        assert!(!w10.monitor_param && w10.slots.optional.is_empty());
+        assert_eq!((w10.slots.switch, w10.slots.create, w10.slots.remove, w10.slots.find), (9, 10, 11, 12));
+        // 21H2 and early 22H2 share the IID; 22H2 has GetAllCurrentDesktops at 7, so everything shifts.
+        let (a, b) = (by("win11-21h2"), by("win11-22h2"));
+        assert_eq!(a.iid_manager, b.iid_manager);
+        assert!(a.monitor_param && b.monitor_param);
+        assert_eq!((a.slots.get_desktops, a.slots.switch, a.slots.create, a.slots.find), (7, 9, 10, 13));
+        assert_eq!((b.slots.get_desktops, b.slots.switch, b.slots.create, b.slots.find), (8, 10, 11, 14));
+        assert!(!a.overlaps(&b));
+        // 23H2 (UBR 3085+) shares the IID with 24H2 but lacks SwitchDesktopAndMoveForegroundView.
+        let (c, d) = (by("win11-23h2-3085"), by("win11-24h2"));
+        assert_eq!(c.iid_manager, d.iid_manager);
+        assert_eq!((c.slots.create, c.slots.remove, c.slots.find), (10, 12, 13));
+        assert!(!c.overlaps(&d) && c.matches_build(22631) && !c.matches_build(26100));
+        // No animation slots where only one source lists them.
+        for n in ["win10", "win11-21h2", "win11-22h2", "win11-22h2-2215", "win11-23h2-3085"] {
+            assert_eq!(by(n).slots.opt("SwitchDesktopWithAnimation"), None, "{n}");
+            assert!(!by(n).matches_build(26340), "{n}");
+        }
+    }
+
+    #[test]
+    fn unverified_needs_closed_range_and_sane_slots() {
+        // Unverified without maxBuild: rejected; verified may stay open-ended.
+        let open = MIN.replace("\"maxBuild\":5,", "");
+        assert!(parse_variants(&open).is_err());
+        assert!(parse_variants(&open.replace("\"monitorParam\"", "\"verified\":true,\"monitorParam\"")).is_ok());
+        assert!(parse_variants(&MIN.replace("\"maxBuild\":5", "\"maxBuild\":0")).is_err());
+        // Slot order and uniqueness.
+        assert!(parse_variants(&MIN.replace("\"CreateDesktop\":10", "\"CreateDesktop\":8")).is_err());
+        assert!(parse_variants(&MIN.replace("\"FindDesktop\":13", "\"FindDesktop\":11")).is_err());
+        assert!(parse_variants(&MIN.replace("\"GetCount\":3", "\"GetCount\":30")).is_err());
+        let opt = |s: &str| MIN.replace("\"FindDesktop\":13", &format!("\"FindDesktop\":13,{s}"));
+        assert!(parse_variants(&opt("\"SetDesktopName\":15")).is_ok());
+        assert!(parse_variants(&opt("\"SetDesktopName\":13")).is_err());
+        assert!(parse_variants(&opt("\"SetDesktopName\":11")).is_err());
+        assert!(parse_variants(&opt("\"SwitchDesktopAndMoveForegroundView\":8")).is_err());
+        assert!(parse_variants(&opt("\"SwitchDesktopWithAnimation\":20,\"WaitForAnimationToComplete\":20")).is_err());
+    }
+
+    #[test]
+    fn same_iid_needs_disjoint_builds() {
+        let one = &MIN[r#"{"variants":["#.len()..MIN.len() - 2];
+        let two = |second: &str| format!(r#"{{"variants":[{one},{second}]}}"#);
+        let other = one.replace("\"name\":\"x\"", "\"name\":\"y\"");
+        assert!(parse_variants(&two(&other)).is_err());
+        assert!(parse_variants(&two(&other.replace("\"minBuild\":1,\"maxBuild\":5", "\"minBuild\":6,\"maxBuild\":9"))).is_ok());
+        assert!(parse_variants(&two(&other.replace("53F5CA0B-", "A3175F2D-"))).is_ok());
+    }
 }

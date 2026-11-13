@@ -308,6 +308,38 @@ pub struct Settings {
     pub layout: Layout,
     /// User interface language: automatic (Windows UI language) or forced (plan 12.10).
     pub language: Pref,
+    /// Desktop backend (key `"backend"`, no UI, plan 5.2/5.3): `auto` = internal interface when a
+    /// variant passes; anything else = the "not supported" mode (nothing is moved), for trying it.
+    pub backend: BackendPref,
+}
+
+/// Value of the hidden `"backend"` key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackendPref {
+    Auto,
+    /// Asked for the public-API fallback (plan 5.2), which is not built: behaves like `None`.
+    Fallback,
+    /// No desktop backend: the app runs in the "not supported" mode.
+    None,
+}
+
+impl BackendPref {
+    /// Unknown values keep the default (`auto`): a typo must not switch the app off.
+    pub fn from_code(s: &str) -> BackendPref {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "fallback" => BackendPref::Fallback,
+            "none" => BackendPref::None,
+            _ => BackendPref::Auto,
+        }
+    }
+
+    pub fn code(self) -> &'static str {
+        match self {
+            BackendPref::Auto => "auto",
+            BackendPref::Fallback => "fallback",
+            BackendPref::None => "none",
+        }
+    }
 }
 
 impl Default for Settings {
@@ -329,6 +361,7 @@ impl Default for Settings {
             autostart: false,
             layout: Layout::default(),
             language: Pref::Auto,
+            backend: BackendPref::Auto,
         }
     }
 }
@@ -408,6 +441,9 @@ impl Settings {
         if let Some(code) = j.get("language").and_then(Json::as_str) {
             s.language = Pref::from_code(code);
         }
+        if let Some(code) = j.get("backend").and_then(Json::as_str) {
+            s.backend = BackendPref::from_code(code);
+        }
         if let Some(l @ Json::Obj(_)) = j.get("layout") {
             s.layout = Layout::from_json(l);
         }
@@ -445,7 +481,7 @@ impl Settings {
   \"learning\": {},
   \"arrangeAtStart\": {},
   \"switchAnimation\": {},
-  \"language\": {},{}
+  \"language\": {},{}{}
   \"layout\": {}
 }}
 ",
@@ -459,6 +495,11 @@ impl Settings {
             quote(self.language.code()),
             // Written only when on: a hand-made key that survives saving from the dialog.
             if self.log { "\n  \"log\": true," } else { "" },
+            // Same for the hidden backend switch.
+            match self.backend {
+                BackendPref::Auto => String::new(),
+                b => format!("\n  \"backend\": {},", quote(b.code())),
+            },
             self.layout.to_json()
         )
     }
@@ -524,6 +565,30 @@ mod tests {
             let mut s = Settings::default();
             s.language = p;
             assert_eq!(Settings::from_json(&s.to_json()).unwrap().language, p);
+        }
+    }
+
+    #[test]
+    fn hidden_backend_key() {
+        assert_eq!(Settings::from_json("{}").unwrap().backend, BackendPref::Auto);
+        for (text, want) in [
+            (r#"{"backend":"auto"}"#, BackendPref::Auto),
+            (r#"{"backend":"fallback"}"#, BackendPref::Fallback),
+            (r#"{"backend":" None "}"#, BackendPref::None),
+            (r#"{"backend":"internal"}"#, BackendPref::Auto),
+            (r#"{"backend":"nonsense"}"#, BackendPref::Auto),
+            (r#"{"backend":false}"#, BackendPref::Auto),
+        ] {
+            assert_eq!(Settings::from_json(text).unwrap().backend, want, "{text}");
+        }
+        // Written only when not "auto", and kept when the dialog saves the file.
+        assert!(!Settings::default().to_json().contains("backend"));
+        for b in [BackendPref::Fallback, BackendPref::None] {
+            let mut s = Settings::default();
+            s.backend = b;
+            let text = s.to_json();
+            assert!(text.contains(&format!("\"backend\": \"{}\"", b.code())));
+            assert_eq!(Settings::from_json(&text).unwrap(), s);
         }
     }
 

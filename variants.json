@@ -2,7 +2,9 @@
   "variants": [
     {
       "name": "win11-24h2",
+      "verified": true,
       "minBuild": 26100,
+      "source": "verified live on 26340; MScholtes/VirtualDesktop VirtualDesktop11-24H2.cs (v1.21), Ciantic/VirtualDesktopAccessor (winvd 0.0.48+), mrob95/pyvda (OVER_26100)",
       "iidManagerInternal": "53F5CA0B-158F-4124-900C-057158060B27",
       "iidDesktop": "3F07F4BE-B107-441A-AF0F-39D82529072C",
       "iidViewCollection": "1841C6D7-4F9D-42C0-AF41-8747538F10E5",
@@ -24,6 +26,120 @@
       },
       "desktopSlots": { "GetId": 4 },
       "viewSlots": { "GetViewForHwnd": 6 }
+    },
+    {
+      "name": "win11-23h2-3085",
+      "verified": false,
+      "minBuild": 22621,
+      "maxBuild": 22631,
+      "source": "22621/22631 from UBR 3085 (same IID as 24H2, but without SwitchDesktopAndMoveForegroundView); MScholtes/VirtualDesktop VirtualDesktop11.cs v1.17 (commit 4dd34ce), Ciantic/VirtualDesktopAccessor commit 0276add (winvd 0.0.46); pyvda agrees on the method order but names IID 4970BA3D-FD4E-4647-BEA3-D89076EF4B9C",
+      "iidManagerInternal": "53F5CA0B-158F-4124-900C-057158060B27",
+      "iidDesktop": "3F07F4BE-B107-441A-AF0F-39D82529072C",
+      "monitorParam": false,
+      "slots": {
+        "GetCount": 3,
+        "MoveViewToDesktop": 4,
+        "CanViewMoveDesktops": 5,
+        "GetCurrentDesktop": 6,
+        "GetDesktops": 7,
+        "SwitchDesktop": 9,
+        "CreateDesktop": 10,
+        "RemoveDesktop": 12,
+        "FindDesktop": 13,
+        "SetDesktopName": 15
+      },
+      "desktopSlots": { "GetId": 4 }
+    },
+    {
+      "name": "win11-22h2-2215",
+      "verified": false,
+      "minBuild": 22621,
+      "maxBuild": 22631,
+      "source": "22621/22631 UBR 2215..3084; MScholtes/VirtualDesktop VirtualDesktop11-23H2.cs v1.16 (commit 546b673), Ciantic/VirtualDesktopAccessor commit c918946 (winvd 0.0.40), mrob95/pyvda (OVER_22621)",
+      "iidManagerInternal": "A3175F2D-239C-4BD2-8AA0-EEBA8B0B138E",
+      "iidDesktop": "3F07F4BE-B107-441A-AF0F-39D82529072C",
+      "monitorParam": false,
+      "slots": {
+        "GetCount": 3,
+        "MoveViewToDesktop": 4,
+        "CanViewMoveDesktops": 5,
+        "GetCurrentDesktop": 6,
+        "GetDesktops": 7,
+        "SwitchDesktop": 9,
+        "CreateDesktop": 10,
+        "RemoveDesktop": 12,
+        "FindDesktop": 13,
+        "SetDesktopName": 15
+      },
+      "desktopSlots": { "GetId": 4 }
+    },
+    {
+      "name": "win11-22h2",
+      "verified": false,
+      "minBuild": 22621,
+      "maxBuild": 22621,
+      "source": "22621 before UBR 2215 (same IID as 21H2, extra GetAllCurrentDesktops at slot 7); MScholtes/VirtualDesktop VirtualDesktop11.cs v1.16 (commit 546b673), mrob95/pyvda (OVER_22449)",
+      "iidManagerInternal": "B2F925B9-5A0F-4D2E-9F4D-2B1507593C10",
+      "iidDesktop": "536D3495-B208-4CC9-AE26-DE8111275BF8",
+      "monitorParam": true,
+      "slots": {
+        "GetCount": 3,
+        "MoveViewToDesktop": 4,
+        "CanViewMoveDesktops": 5,
+        "GetCurrentDesktop": 6,
+        "GetDesktops": 8,
+        "SwitchDesktop": 10,
+        "CreateDesktop": 11,
+        "RemoveDesktop": 13,
+        "FindDesktop": 14,
+        "SetDesktopName": 16
+      },
+      "desktopSlots": { "GetId": 4 }
+    },
+    {
+      "name": "win11-21h2",
+      "verified": false,
+      "minBuild": 22000,
+      "maxBuild": 22000,
+      "source": "MScholtes/VirtualDesktop VirtualDesktop11-21H2.cs v1.16 (commit 546b673), mrob95/pyvda (OVER_21313)",
+      "iidManagerInternal": "B2F925B9-5A0F-4D2E-9F4D-2B1507593C10",
+      "iidDesktop": "536D3495-B208-4CC9-AE26-DE8111275BF8",
+      "monitorParam": true,
+      "slots": {
+        "GetCount": 3,
+        "MoveViewToDesktop": 4,
+        "CanViewMoveDesktops": 5,
+        "GetCurrentDesktop": 6,
+        "GetDesktops": 7,
+        "SwitchDesktop": 9,
+        "CreateDesktop": 10,
+        "RemoveDesktop": 12,
+        "FindDesktop": 13,
+        "SetDesktopName": 15
+      },
+      "desktopSlots": { "GetId": 4 }
+    },
+    {
+      "name": "win10",
+      "verified": false,
+      "minBuild": 17763,
+      "maxBuild": 19045,
+      "source": "Windows 10 1809-22H2; MScholtes/VirtualDesktop VirtualDesktop.cs v1.21, mrob95/pyvda (build 9000+ branch)",
+      "iidManagerInternal": "F31574D6-B682-4CDC-BD56-1827860ABEC6",
+      "iidDesktop": "FF72FFDD-BE7E-43FC-9C03-AD81681E88E4",
+      "monitorParam": false,
+      "slots": {
+        "GetCount": 3,
+        "MoveViewToDesktop": 4,
+        "CanViewMoveDesktops": 5,
+        "GetCurrentDesktop": 6,
+        "GetDesktops": 7,
+        "SwitchDesktop": 9,
+        "CreateDesktop": 10,
+        "RemoveDesktop": 11,
+        "FindDesktop": 12
+      },
+      "desktopSlots": { "GetId": 4 }
     }
   ]
 }

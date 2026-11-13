@@ -177,7 +177,7 @@ Klíčový fakt: veřejné API Windows **neumí vytvořit plochu ani přesunout 
 1. Vytvořit `ImmersiveShell` (CLSID `C2F03A33-21F5-47FA-B4BB-156362A2F239`) → `IServiceProvider` (`6D5140C1-7436-11CE-8034-00AA006009FA`).
 2. Pro každou variantu z `variants.json` zavolat `QueryService(SID C5E0CDCA-7B6E-41B2-9FC4-D93975CC467B, IID varianty)`. **Vybrat podle odezvy, ne podle čísla buildu** (funguje i na Insider buildech sdílejících rozhraní).
 3. **Rozsah buildů jako druhá podmínka** (revize 2): každá varianta má `minBuild`/`maxBuild` (z `RtlGetVersion`, příp. verze `twinui.pcshell.dll`). Když IID projde u více variant (stejné IID, jiný vtable), rozhodne build. Neznámý build + známé IID → zkusit nejnovější variantu s tím IID, ale jen přes sebetest.
-4. **Sebetest před použitím**: `GetCount()` musí odpovídat počtu ploch v registru a `GetCurrentDesktop().GetId()` aktuální ploše z registru. Při nesouladu variantu zamítnout. Pozor: rozhraní žije v `explorer.exe`, voláme ho přes COM proxy – volání špatného slotu Explorer neshodí, ale **může shodit náš proces**. Proto sebetest pouštět jen čtecími metodami a výsledek „varianta X na buildu Y ověřena“ uložit do `state.json`; pád během sebetestu = při dalším startu tuto variantu přeskočit.
+4. **Sebetest před použitím**: `GetCount()` musí odpovídat počtu ploch v registru a `GetCurrentDesktop().GetId()` aktuální ploše z registru. Při nesouladu variantu zamítnout. Pozor: rozhraní žije v `explorer.exe`, voláme ho přes COM proxy – volání špatného slotu **může shodit náš proces i Průzkumníka** (při jedné dřívější zkoušce se to stalo), protože špatný slot je jiná metoda s jinými parametry. Proto sebetest pouštět jen čtecími metodami; pád během sebetestu = při dalším startu tuto variantu přeskočit (skutečné provedení: soubor `selftest-guard.txt`, ne `state.json` – viz „Pořadí ochran“ níže).
 5. Volání metod přes **indexy slotů ve vtable** (surové ukazatele na funkce) → nová verze Windows = úprava `variants.json`, **bez rekompilace**.
 6. Volitelné sloty (pokud je varianta má): `SwitchDesktopWithAnimation`, `WaitForAnimationToComplete`, `SwitchDesktopAndMoveForegroundView`, `SetDesktopName`. Chybějící slot = funkce se tiše nepoužije.
 
@@ -199,16 +199,33 @@ Klíčový fakt: veřejné API Windows **neumí vytvořit plochu ani přesunout 
 ```
 (Sloty počítány včetně 3 metod `IUnknown`. Pro 24H2 odpovídají pořadí ověřenému v testech; ostatní varianty doplnit a ověřit – viz tabulka.)
 
-| Varianta | IVirtualDesktopManagerInternal | IVirtualDesktop | Poznámka | Stav |
-|---|---|---|---|---|
-| Windows 10 (1809–22H2) | `F31574D6-B682-4CDC-BD56-1827860ABEC6` | `FF72FFDD-BE7E-43FC-9C03-AD81681E88E4` | bez `MoveDesktop`, bez názvů ploch | [PŘEVZATO] |
-| Windows 11 21H2 (22000) | `B2F925B9-5A0F-4D2E-9F4D-2B1507593C10` | `536D3495-B208-4CC9-AE26-DE8111275BF8` | metody s parametrem `HWND/HMONITOR` | [PŘEVZATO] |
-| Windows 11 22H2 rané buildy | `B2F925B9-…` (stejné IID!) | `536D3495-…` | **jiný vtable při stejném IID** → nutný sebetest | [PŘEVZATO] |
-| Windows 11 22H2/23H2 (22621.2215+) | `A3175F2D-239C-4BD2-8AA0-EEBA8B0B138E` | `3F07F4BE-B107-441A-AF0F-39D82529072C` | | [PŘEVZATO] |
-| Windows 11 24H2+ (26100+) | `53F5CA0B-158F-4124-900C-057158060B27` | `3F07F4BE-B107-441A-AF0F-39D82529072C` | | **[OVĚŘENO]** |
-| společné | `IApplicationViewCollection` `1841C6D7-4F9D-42C0-AF41-8747538F10E5`, `IApplicationView` `372E1D3B-38D3-42E4-A15B-8AB2B178F513` | | stabilní napříč verzemi | [OVĚŘENO na 24H2] |
+**Skutečný stav (fáze 8, 2026-11-13):** `variants.json` má 6 variant. Převzaty jsou jen IID a čísla slotů (z definic rozhraní, žádný kód), každá varianta je doložena aspoň dvěma nezávislými zdroji. V JSON má `source` (zdroje a rozsah buildů) a `verified`. Chybějící `verified` = neověřená. Neověřená varianta musí mít uzavřený rozsah (`maxBuild`).
 
-Zdroje k převzetí/kontrole layoutů: `MScholtes/VirtualDesktop`, `Ciantic/VirtualDesktopAccessor`, `Slion/VirtualDesktop`. **Před převzetím kódu ověřit licence.**
+| Varianta (`name`) | Windows / buildy | IVirtualDesktopManagerInternal | IVirtualDesktop | Sloty Count/Cur/Desktops/Switch/Create/Remove/Find | Zdroje | Stav |
+|---|---|---|---|---|---|---|
+| `win11-24h2` | 11 24H2+ (26100–) | `53F5CA0B-…` | `3F07F4BE-…` | 3/6/7/9/11/13/14 (+ `SwitchDesktopAndMoveForegroundView` 10) | MScholtes 11-24H2.cs, Ciantic winvd 0.0.48+, pyvda OVER_26100 | **[OVĚŘENO]** 26340 |
+| `win11-23h2-3085` | 11 22H2/23H2 od UBR 3085 (22621–22631) | `53F5CA0B-…` (**stejné IID jako 24H2**, chybí slot 10) | `3F07F4BE-…` | 3/6/7/9/10/12/13 | MScholtes v1.17 (`4dd34ce`), Ciantic `0276add` (winvd 0.0.46); pyvda má stejné pořadí, ale IID `4970BA3D-…` | neověřeno |
+| `win11-22h2-2215` | 11 22H2/23H2 UBR 2215–3084 (22621–22631) | `A3175F2D-…` | `3F07F4BE-…` | 3/6/7/9/10/12/13 | MScholtes v1.16 `VirtualDesktop11-23H2.cs` (`546b673`), Ciantic `c918946` (winvd 0.0.40), pyvda OVER_22621 | neověřeno |
+| `win11-22h2` | 11 22H2 před UBR 2215 (22621) | `B2F925B9-…` | `536D3495-…` | HMONITOR; 3/6/8/10/11/13/14 (navíc `GetAllCurrentDesktops` 7) | MScholtes v1.16 `VirtualDesktop11.cs`, pyvda OVER_22449 | neověřeno |
+| `win11-21h2` | 11 21H2 (22000) | `B2F925B9-…` (**stejné IID jako raná 22H2**) | `536D3495-…` | HMONITOR; 3/6/7/9/10/12/13 | MScholtes v1.16 `VirtualDesktop11-21H2.cs`, pyvda OVER_21313 | neověřeno |
+| `win10` | 10 1809–22H2 (17763–19045) | `F31574D6-…` | `FF72FFDD-…` | 3/6/7/9/10/11/12 | MScholtes `VirtualDesktop.cs` v1.21, pyvda (větev 9000) | neověřeno |
+| společné | | `IApplicationViewCollection` `1841C6D7-…` (`GetViewForHwnd` 6) | | `IVirtualDesktop::GetId` 4 všude | všechny zdroje | [OVĚŘENO na 24H2] |
+
+- **Nepřidáno:** `4970BA3D-FD4E-4647-BEA3-D89076EF4B9C` (jen pyvda, ostatní dva zdroje mají pro 22631.3085+ `53F5CA0B`; jen se zkouší QueryService pro diagnostiku), Insider 20231 (`094AFE11-…`, jen pyvda, nevydaný build), `IVirtualDesktopManagerInternal2` Win10 2004 (názvy ploch – aplikace je nepoužívá), Windows Server 2016/2022 a Win10 1607/1709/1803 (mimo rozsah zadání). `SwitchDesktopWithAnimation`/`WaitForAnimationToComplete` mají jen 24H2: u 22621/22631 je uvádí jen MScholtes (pyvda má jiný konec rozhraní), takže tam animace chybí a přepíná se bez ní.
+- **Stejné IID, různý vtable:** `B2F925B9` (21H2 vs. raná 22H2) a `53F5CA0B` (23H2 od 3085 vs. 24H2). Rozliší je jen rozsah buildů – parser proto odmítne dvě varianty se stejným IID a překrývajícím se rozsahem. Rozlišení podle UBR není potřeba: v rámci 22621/22631 má každé rozložení jiné IID.
+- **Zjištěno navíc:** Ciantic přidal `SwitchDesktopAndMoveForegroundView` až v 26100.2605, ale MScholtes ho má už ve verzi pro 24H2 Insider (6/2024) a pyvda pro celé 26100+; ověřená varianta proto zůstává od 26100.
+
+**Pořadí ochran (`src/desktops/select.rs`), od nejbezpečnější:**
+1. Při načtení `variants.json`: sloty jsou jedinečné a v pořadí společném všem známým rozložením (GetCount < Move < CanMove < GetCurrent < GetDesktops < Switch < Create < Remove < Find; `SwitchDesktopAndMoveForegroundView` mezi Switch a Create, ostatní volitelné za Find); neověřená varianta má `maxBuild`; stejné IID = disjunktní rozsahy. Chybný soubor vedle exe se ignoruje (použije se vložený).
+2. Rozsah buildů – varianta mimo rozsah se vůbec neotevře.
+3. Paměť pádu: před sebetestem **neověřené** varianty se zapíše `%LOCALAPPDATA%\AutoSpaces\selftest-guard.txt` (`pending <varianta> <build>`), po dokončení se smaže. Najde-li se při dalším startu, varianta se na tomto buildu už nezkouší (`crashed …`). Ověřené varianty soubor nezapisují.
+4. `QueryService` s IID varianty (+ kolekce pohledů) – špatné IID vrátí E_NOINTERFACE, nic se nevolá.
+5. Jen čtecí volání, každé až po shodě předchozího s registrem: `GetCount` → `GetCurrentDesktop` + QI na IID plochy varianty + `GetId` → `GetDesktops` (počet, pořadí a GUID shodné s `VirtualDesktopIDs`) → `FindDesktop(aktuální)` vrátí tutéž plochu. U variant s HMONITOR se předává NULL jako u ostatních volání. `FindDesktop` je nejvyšší povinný slot, takže měnící metody (Switch/Create/Remove) leží mezi ověřenými sloty.
+6. Během sebetestu se výsledky zapisují do zvětšených vynulovaných bufferů (zápis za očekávanou velikost = špatné rozložení) a vrácený ukazatel se použije, jen pokud míří do potvrzené čitelné paměti a jeho vtable vede do spustitelného kódu načteného modulu (`VirtualQuery`); jinak se ani neuvolní.
+- Žádná jiná metoda varianty se nevolá, dokud tohle neprojde. Neověřená varianta je v logu, v `--selftest` i v „O aplikaci“ označena jako neověřená.
+- **Zbývající riziko:** volání špatného slotu probíhá přes COM proxy podle skutečné signatury. Kontroly 1–4 brání tomu, aby se k čtecímu volání vůbec došlo s cizím rozložením; zůstává případ, kdy zdroje shodně uvádějí špatné pořadí pro konkrétní build. Pak může čtecí slot ve skutečnosti být jiná metoda: s parametrem rozhraní obvykle spadne už náš proces při marshalování (krok 3 to příště přeskočí), ale nelze vyloučit volání měnící metody v explorer.exe (např. přepnutí plochy). Proto neověřené varianty zůstávají označené, dokud je někdo nevyzkouší na skutečném systému (`--selftest --select-only` je jen pro čtení).
+- `autospaces.exe --selftest --select-only`: jen výběr varianty se sebetestem, výpis do konzole, žádný soubor, žádná plocha se nevytváří (plné `--selftest` dál vytváří plochu a přesouvá charmap). Na 26340: `win11-24h2` PASS za 13 ms, ostatní mimo rozsah.
+- Velikost release exe 766 464 → 793 088 B (+26 KB: tabulka variant, sebetest, diagnostika). Paměť za běhu beze změny (výběr proběhne jednou při startu / po restartu Exploreru; v režimu bez podpory zůstane jen seznam diagnostických řádků).
 
 ### 5.2 Úroveň 2 – `FallbackBackend` (jen veřejné prostředky)
 | Operace | Realizace | Stav |
@@ -224,10 +241,25 @@ Zdroje k převzetí/kontrole layoutů: `MScholtes/VirtualDesktop`, `Ciantic/Virt
 
 Omezení fallbacku: viditelné přepínání (víc animací), některé aplikace hide/show nepřežijí (seznam nekompatibilních → okno nepřesouvat, jen nechat být), `SendInput` nefunguje, když je v popředí okno s vyšší integritou nebo zabezpečená plocha UAC.
 
-### 5.3 Úroveň 3 – bez podpory
-Pokud selže úroveň 1 i 2 (např. Windows bez virtuálních ploch, Windows Server bez shellu): notifikace „Nepodporovaná verze“, aplikace zůstane v trayi neaktivní, loguje diagnostiku (build, výsledky QueryService) pro doplnění `variants.json`.
+**Rozhodnutí (fáze 8, 2026-11-13): úroveň 2 se nestaví.** Vyhodnocení po funkcích:
+| Funkce | Veřejnými prostředky | Spolehlivě? |
+|---|---|---|
+| EnterSpace | skrýt okno → Win+Ctrl+D (vytvoří a přepne) → zobrazit | **ne**: hide/show u WinForms okna selhalo (okno zůstalo skryté = uživatel přijde o okno, test 11); UWP/`ApplicationFrameHost` okna cizí `ShowWindow` neskryje; maximalizaci často spouští sám uživatel přes Win+↑ nebo dvojklik, takže vložené Win+Ctrl+D se míchá s fyzicky drženými klávesami; UIPI blokuje `SendInput` i `ShowWindow`, je-li v popředí okno správce; skrytí mění pořadí na hlavním panelu a stav některých aplikací |
+| ExitSpace | Win+Ctrl+F4 na pomocné ploše | **ne**: okna jdou na *sousední* plochu vlevo, ne na původní; vrácení = další hide/show se stejnými riziky; nejdřív by se na plochu muselo přepnout (2 animace) |
+| kompakce | přepnout na prázdnou plochu + Win+Ctrl+F4 | ne: každé smazání = viditelné přepnutí, souboj s uživatelovým vstupem |
+| profil rozložení, startovní rozmístění | N× přesun přes hide/show s přepínáním | ne: totéž ×N, přepínání pohledu, které profil právě nesmí dělat |
+| čtení stavu (počet, aktuální plocha, plocha okna) | registr + `GetWindowDesktopId` | ano – ale samo nic nepřesune |
 
-Volba úrovně: automaticky při startu a po restartu Exploreru; v nastavení lze vynutit `auto | internal | fallback`.
+Protože ani základní EnterSpace/ExitSpace nejde udělat bez rizika ztráty okna nebo přesunu na špatnou plochu, polofunkční režim by škodil víc než pomohl. Místo něj je čistá úroveň 3.
+
+### 5.3 Úroveň 3 – bez podpory
+Pokud žádná varianta neprojde (neznámý build, Windows Server bez virtuálních ploch, chyba v rozhraní): aplikace běží v trayi, **nic nepřesouvá** a říká to:
+- tooltip ikony „AutoSpaces – nepodporovaná verze Windows, nic se nepřesouvá“, jednou za běh oznámení (balón) s číslem sestavení;
+- v nabídce ikony položka „Diagnostika pro nahlášení…“ otevře `%LOCALAPPDATA%\AutoSpaces\unsupported.txt`: verze aplikace, build.UBR, příčina, výsledek každé varianty (rozsah / HRESULT QueryService / důvod neúspěchu sebetestu) a seznam IID, které Explorer přijme (jen `QueryService` na IID všech variant + `4970BA3D`, `094AFE11`, `0F3A72B0` – žádné volání metod);
+- „O aplikaci“: „Sestavení Windows N není podporováno, aplikace nic nepřesouvá.“ (cs/en).
+Při startu se backend zkouší 20× po 1 s (Explorer může ještě startovat), teprve pak se ukáže tento režim; po restartu Exploreru se zkusí znovu.
+
+**Volba úrovně:** skrytý klíč `"backend"` v `settings.json` (bez UI, zapisuje se jen když není `auto`): `auto` (výchozí, i pro neznámé hodnoty) = interní rozhraní; `none` = režim bez podpory i na podporovaném systému (pro vyzkoušení); `fallback` = totéž jako `none` (úroveň 2 není postavená, log to uvede). Při vynuceném vypnutí se neopakuje, tooltip zní „přesouvání vypnuto v settings.json“ a `unsupported.txt` se nepíše.
 
 ---
 
@@ -349,7 +381,7 @@ Start: 2 plochy, uživatel na ploše 1.
 | `excludedProcesses` | `[]` | např. `["vlc.exe"]` |
 | `switchBackWhenOthersRemain` | true | krok 7 scénáře |
 | `nameDesktopsAfterApp` | true | jen pokud varianta umí `SetDesktopName` (Win11) |
-| `backend` | `auto` | `auto/internal/fallback` |
+| `backend` | `auto` | skrytý: `auto/none/fallback` (`fallback` = `none`, viz 5.2/5.3) |
 | `switchAnimation` | false | true = `SwitchDesktopWithAnimation` (+~440 ms), jen kde ho varianta má |
 | `fullscreenSettleMs` | 60 | ustálení jen pro geometrickou detekci fullscreenu |
 | `learning` | true | samoučící seznam (6.7) |
@@ -480,13 +512,13 @@ Notepad, Edge, Chrome (F11), Firefox, Průzkumník, VS Code (Electron), Kalkula�
 4. Chování na **více monitorech** (R3) – vypnout pro sekundární monitory?
 5. Pojmenovávat plochy podle aplikace (jen Win11)?
 6. ~~C#/.NET, nebo Rust?~~ **Rozhodnuto v revizi 2: Rust** (kap. 3).
-7. Podporovat fallback ve v1, nebo jen úroveň 1 + diagnostiku?
+7. ~~Podporovat fallback ve v1, nebo jen úroveň 1 + diagnostiku?~~ **Rozhodnuto ve fázi 8: jen úroveň 1 + režim „nepodporováno“ s diagnostikou** (5.2).
 8. Okamžité, nebo animované přepnutí jako výchozí? Revize 2 volí okamžité (rychlost); animované je blíž macOS, ale o ~440 ms pomalejší.
 9. Má aplikace při prvním zablokování procesu zobrazit oznámení („Aplikaci X nelze přesouvat, přidána do výjimek“), nebo učit potichu?
 
 ## 11. Checklist pro revidující model
-- [ ] Zkontrolovat sloty vtable a IID všech variant v kap. 5.1 proti aktuálním zdrojům.
-- [ ] Posoudit, zda sebetest (5.1 bod 3) dostatečně chrání před R2 – navrhnout lepší (např. ověření délky vtable, kontrola modulu, ze kterého pochází vtable).
+- [x] Zkontrolovat sloty vtable a IID všech variant v kap. 5.1 proti aktuálním zdrojům. (fáze 8)
+- [x] Posoudit, zda sebetest (5.1 bod 3) dostatečně chrání před R2 – navrhnout lepší (např. ověření délky vtable, kontrola modulu, ze kterého pochází vtable). (fáze 8: pořadí ochran v 5.1)
 - [ ] Ověřit správnost sady WinEvent událostí a strategie bez debounce (6.1), zejména pro UWP a Electron.
 - [ ] Posoudit stavový stroj (6.3) na race conditions: událost během vlastního přesunu/přepínání, rychlé max/restore, zavření během přepínání.
 - [ ] Zvážit, zda nepoužít `IVirtualDesktopNotification` místo polling/registry.
@@ -557,7 +589,7 @@ Nativní dialog z nabídky ikony: ikona, název, verze (`CARGO_PKG_VERSION`), au
 | 5b | profil rozložení ploch po startu (12.7) | hotovo (vyzkoušeno živě při 96 DPI) |
 | 6 | dialog O aplikaci (12.4), VERSIONINFO | hotovo (vyzkoušeno živě při 96 DPI; vysoké DPI neověřeno; odkaz na web a otevření peněženky živě neotevřeny) |
 | 7 | instalátor (12.3) | hotovo (živě vyzkoušena tichá instalace, aktualizace a odinstalace při běžící aplikaci, autostart, průvodce česky i anglicky; režim pro všechny uživatele a smazání dat při odinstalaci živě ne; exe i instalátor nepodepsané) |
-| 8 | záložní režim pro neznámé verze Windows (5.2) | čeká |
+| 8 | varianty rozhraní pro Win10 1809–22H2 a Win11 21H2–23H2 (5.1), zpřísněný sebetest, režim „nepodporováno“ (5.3), skrytý klíč `backend`; záložní úroveň 2 vyhodnocena a nestavěna (5.2) | hotovo (5 nových variant **neověřeno** na skutečném systému – jen ze zdrojů; živě jen `--selftest --select-only` na 26340 → `win11-24h2`; režim „nepodporováno“ živě nevyzkoušen) |
 | 9 | testy na dalších verzích Windows, podpis, vydání | čeká |
 
 ### 12.6 Podklady pro O aplikaci (zjištěno v projektu kolikplatim)

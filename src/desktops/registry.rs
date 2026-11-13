@@ -63,6 +63,25 @@ pub fn current_desktop() -> Option<Guid> {
     read_value("CurrentVirtualDesktop").and_then(|b| Guid::from_bytes(&b))
 }
 
+/// Update build revision (the "3085" in 22631.3085), for diagnostics only.
+pub fn ubr() -> Option<u32> {
+    use windows_sys::Win32::System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD};
+    let (k, v) = (wide(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion"), wide("UBR"));
+    let (mut val, mut len) = (0u32, 4u32);
+    let r = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            k.as_ptr(),
+            v.as_ptr(),
+            RRF_RT_REG_DWORD,
+            std::ptr::null_mut(),
+            (&mut val as *mut u32).cast(),
+            &mut len,
+        )
+    };
+    (r == 0).then_some(val)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

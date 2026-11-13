@@ -140,6 +140,23 @@ macro_rules! strings {
 strings! {
     // Tray icon and its menu
     TrayTip => ["AutoSpaces", "AutoSpaces"],
+    TrayTipUnsupported => [
+        "AutoSpaces – nepodporovaná verze Windows, nic se nepřesouvá",
+        "AutoSpaces – unsupported Windows version, nothing is moved"
+    ],
+    TrayTipForcedOff => [
+        "AutoSpaces – přesouvání vypnuto v settings.json",
+        "AutoSpaces – moving is switched off in settings.json"
+    ],
+    MenuDiagnostics => ["Diagnostika pro nahlášení…", "Diagnostics for a report…"],
+    NoticeUnsupported => [
+        "Tato verze Windows (sestavení {0}) není podporována, AutoSpaces proto nic nepřesouvá. Podrobnosti pro nahlášení najdete v nabídce ikony: Diagnostika.",
+        "This version of Windows (build {0}) is not supported, so AutoSpaces moves nothing. Details for a report are in the tray menu: Diagnostics."
+    ],
+    NoticeForcedOff => [
+        "Rozhraní ploch je vypnuto klíčem \"backend\": \"{0}\" v settings.json, AutoSpaces nic nepřesouvá.",
+        "The desktop interface is switched off by \"backend\": \"{0}\" in settings.json, AutoSpaces moves nothing."
+    ],
     MenuEnabled => ["Zapnuto", "Enabled"],
     MenuLearned => ["Naučené výjimky", "Learned exceptions"],
     MenuNone => ["(žádné)", "(none)"],
@@ -173,6 +190,15 @@ strings! {
     // About dialog and support reminder
     AboutVersion => ["Verze {0}", "Version {0}"],
     AboutVariant => ["Varianta Windows: {0}", "Windows variant: {0}"],
+    AboutVariantUnverified => ["Varianta Windows: {0} (neověřená)", "Windows variant: {0} (unverified)"],
+    AboutUnsupported => [
+        "Sestavení Windows {0} není podporováno, aplikace nic nepřesouvá.",
+        "Windows build {0} is not supported; the app moves nothing."
+    ],
+    AboutForcedOff => [
+        "Rozhraní ploch vypnuto v settings.json, nic se nepřesouvá.",
+        "Desktop interface off in settings.json; nothing is moved."
+    ],
     AboutVariantNone => [
         "Varianta Windows: nebyla rozpoznána, aplikace je neaktivní",
         "Windows variant: not recognized, the app is inactive"

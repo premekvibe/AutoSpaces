@@ -120,16 +120,37 @@ pub fn version_label() -> String {
     tf(Key::AboutVersion, &[env!("CARGO_PKG_VERSION")])
 }
 
-/// `backend` is the name reported by the desktop backend (e.g. "internal:win11-24h2"), if any.
-pub fn variant_label(backend: Option<&str>) -> String {
-    match backend {
-        Some(b) => tf(Key::AboutVariant, &[b.strip_prefix("internal:").unwrap_or(b)]),
-        None => t(Key::AboutVariantNone).to_string(),
+/// What the app runs on, for the variant line of the dialog.
+pub enum Backend<'a> {
+    /// Name reported by the desktop backend (e.g. "internal:win11-24h2").
+    Variant { name: &'a str, verified: bool },
+    /// No variant passed on this build (plan 5.3).
+    Unsupported { build: u32 },
+    /// Switched off by the hidden `"backend"` key in settings.json.
+    ForcedOff,
+    /// Not decided yet (Explorer not ready, retries running).
+    Pending,
+}
+
+pub fn variant_label(backend: &Backend) -> String {
+    variant_label_in(i18n::current(), backend)
+}
+
+fn variant_label_in(lang: i18n::Lang, backend: &Backend) -> String {
+    let f = |k, args: &[&str]| i18n::fill(i18n::tr(lang, k), args);
+    match *backend {
+        Backend::Variant { name, verified } => {
+            let n = name.strip_prefix("internal:").unwrap_or(name);
+            f(if verified { Key::AboutVariant } else { Key::AboutVariantUnverified }, &[n])
+        }
+        Backend::Unsupported { build } => f(Key::AboutUnsupported, &[&build.to_string()]),
+        Backend::ForcedOff => f(Key::AboutForcedOff, &[]),
+        Backend::Pending => f(Key::AboutVariantNone, &[]),
     }
 }
 
 /// Opens the modal dialog (no-op, except bringing it forward, when already open).
-pub fn show(backend: Option<&str>) {
+pub fn show(backend: &Backend) {
     let prev = OPEN.load(Relaxed);
     if prev != 0 {
         unsafe { SetForegroundWindow(prev as HWND) };
@@ -516,10 +537,30 @@ mod tests {
 
     #[test]
     fn variant_label_strips_backend_prefix() {
-        assert!(variant_label(Some("internal:win11-24h2")).ends_with("win11-24h2"));
-        assert!(!variant_label(Some("internal:win11-24h2")).contains("internal:"));
-        assert!(variant_label(Some("other")).ends_with("other"));
-        assert_ne!(variant_label(None), variant_label(Some("other")));
+        let v = |name, verified| variant_label(&Backend::Variant { name, verified });
+        assert!(v("internal:win11-24h2", true).ends_with("win11-24h2"));
+        assert!(!v("internal:win11-24h2", true).contains("internal:"));
+        assert!(v("other", true).ends_with("other"));
+        assert_ne!(variant_label(&Backend::Pending), v("other", true));
+    }
+
+    #[test]
+    fn variant_label_marks_unverified_and_unsupported() {
+        use crate::i18n::Lang;
+        for (lang, mark) in [(Lang::Cs, "(neověřená)"), (Lang::En, "(unverified)")] {
+            let l = |b: &Backend| variant_label_in(lang, b);
+            let un = l(&Backend::Variant { name: "internal:win10", verified: false });
+            assert!(un.contains("win10") && un.ends_with(mark), "{un}");
+            assert!(!l(&Backend::Variant { name: "internal:win11-24h2", verified: true }).contains(mark));
+            assert!(l(&Backend::Unsupported { build: 20348 }).contains("20348"));
+            let off = l(&Backend::ForcedOff);
+            assert!(off.contains("settings.json"));
+            // Must fit the one-line label of the dialog (280 dialog units).
+            let long = l(&Backend::Variant { name: "internal:win11-22h2-2215", verified: false });
+            for s in [un, off, long, l(&Backend::Unsupported { build: 99999 })] {
+                assert!(s.chars().count() <= 70, "{s}");
+            }
+        }
     }
 
     #[test]

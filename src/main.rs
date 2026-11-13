@@ -85,9 +85,32 @@ unsafe fn init_reg_notify() {
 const REINIT_TRIES: u32 = 20;
 static REINIT_LEFT: AtomicU32 = AtomicU32::new(0);
 
+/// Why there is no desktop backend.
+enum NoBackend {
+    /// Switched off by the hidden `"backend"` key (plan 5.2: the fallback is not built).
+    Forced(core::settings::BackendPref),
+    /// No variant passed (plan 5.3); `transient` = Explorer not reachable, worth retrying.
+    Unsupported { build: u32, transient: bool },
+}
+
+/// Diagnostics of the last failed selection, for `unsupported.txt`.
+static mut LAST_DIAG: Vec<String> = Vec::new();
+/// The "not supported" notification is shown once per run.
+static NOTICE_SHOWN: AtomicBool = AtomicBool::new(false);
+
 /// Selects the desktop backend; on failure the app stays inactive and only logs (plan 5.3).
-fn init_backend() -> Option<desktops::InternalBackend> {
+fn init_backend() -> Result<desktops::InternalBackend, NoBackend> {
+    use core::settings::BackendPref;
     use desktops::DesktopBackend;
+    let pref = settings_path().map_or(BackendPref::Auto, |p| Settings::load(&p).backend);
+    if pref != BackendPref::Auto {
+        let why = match pref {
+            BackendPref::Fallback => "the public-API fallback (plan 5.2) is not built",
+            _ => "no backend requested",
+        };
+        log_line(&format!("backend: switched off by settings.json \"backend\": \"{}\" ({why})", pref.code()));
+        return Err(NoBackend::Forced(pref));
+    }
     let mut diag = Vec::new();
     let res = desktops::InternalBackend::select(&mut diag);
     for d in &diag {
@@ -95,13 +118,64 @@ fn init_backend() -> Option<desktops::InternalBackend> {
     }
     match res {
         Ok(b) => {
-            log_line(&format!("backend: {}", b.name()));
-            Some(b)
+            let tag = if b.verified() { "" } else { " (UNVERIFIED variant, self-test passed)" };
+            log_line(&format!("backend: {}{tag}", b.name()));
+            Ok(b)
         }
         Err(u) => {
             log_line(&format!("backend: {u}"));
-            None
+            diag.push(format!("result: {u}"));
+            unsafe { *std::ptr::addr_of_mut!(LAST_DIAG) = diag };
+            Err(NoBackend::Unsupported { build: u.build, transient: u.transient })
         }
+    }
+}
+
+fn diagnostics_path() -> Option<std::path::PathBuf> {
+    app_dir().map(|d| d.join("unsupported.txt"))
+}
+
+/// The app runs without a backend: nothing is moved. The icon says so, a notification explains it
+/// once per run, and `unsupported.txt` holds what is needed to add a variant (plan 5.3).
+fn enter_no_backend(main: HWND, why: &NoBackend) {
+    let (mode, text) = match why {
+        NoBackend::Forced(p) => (tray::MODE_FORCED_OFF, i18n::tf(i18n::Key::NoticeForcedOff, &[p.code()])),
+        NoBackend::Unsupported { build, .. } => {
+            (tray::MODE_UNSUPPORTED, i18n::tf(i18n::Key::NoticeUnsupported, &[&build.to_string()]))
+        }
+    };
+    if let NoBackend::Unsupported { build, transient } = why {
+        let diag = unsafe { (*std::ptr::addr_of!(LAST_DIAG)).clone() };
+        let cause = if *transient {
+            "Explorer's virtual desktop service could not be reached (it may not run on this system)"
+        } else {
+            "no known variant of the virtual desktop interface passed the read-only self-test"
+        };
+        let report = format!(
+            "AutoSpaces {} - this Windows build is not supported (build {build}); nothing is moved.\n\
+             Cause: {cause}.\n\
+             Please send this file to the author (see About) so that the build can be added.\n\n{}\n",
+            env!("CARGO_PKG_VERSION"),
+            diag.join("\n")
+        );
+        if let Some(p) = diagnostics_path() {
+            let _ = std::fs::write(p, report);
+        }
+    }
+    tray::set_mode(main, mode);
+    if !NOTICE_SHOWN.swap(true, Relaxed) {
+        tray::notify(main, &text);
+    }
+}
+
+fn open_diagnostics() {
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    if let Some(p) = diagnostics_path().filter(|p| p.exists()) {
+        let path = tray::wide(&p.to_string_lossy());
+        unsafe {
+            ShellExecuteW(std::ptr::null_mut(), tray::wide("open").as_ptr(), path.as_ptr(), std::ptr::null(), std::ptr::null(), SW_SHOWNORMAL)
+        };
     }
 }
 
@@ -302,9 +376,16 @@ fn open_settings(hwnd: HWND) {
 
 /// Opens the About dialog (modal; shows the backend variant the app runs on, if any).
 fn open_about() {
+    use about_dlg::Backend;
     use desktops::DesktopBackend;
-    let backend = orch().map(|o| o.backend().name().to_string());
-    about_dlg::show(backend.as_deref());
+    let name = orch().map(|o| (o.backend().name().to_string(), o.backend().verified()));
+    let info = match (&name, tray::mode()) {
+        (Some((n, v)), tray::MODE_NORMAL) => Backend::Variant { name: n, verified: *v },
+        (_, tray::MODE_FORCED_OFF) => Backend::ForcedOff,
+        (_, tray::MODE_UNSUPPORTED) => Backend::Unsupported { build: desktops::internal::os_build() },
+        _ => Backend::Pending,
+    };
+    about_dlg::show(&info);
 }
 
 /// "Use current layout" button of the layout dialog.
@@ -362,11 +443,11 @@ fn restore_cli() -> i32 {
     let mut out = Vec::new();
     let _apartment = desktops::Apartment::init();
     let code = match init_backend() {
-        None => {
+        Err(_) => {
             out.push("no desktop backend; nothing done".to_string());
             1
         }
-        Some(b) => {
+        Ok(b) => {
             let mut o = new_orchestrator(b);
             let count = |o: &Orch| o.backend().desktops().map_or(0, |l| l.len());
             out.push(format!("desktops before: {}", count(&o)));
@@ -444,7 +525,10 @@ fn on_timer(main: HWND, id: usize) {
 /// while Explorer's COM services are not up yet.
 fn reinit_backend(main: HWND) {
     match init_backend() {
-        Some(b) => unsafe {
+        Ok(b) => unsafe {
+            if tray::mode() != tray::MODE_NORMAL {
+                tray::set_mode(main, tray::MODE_NORMAL);
+            }
             match orch() {
                 Some(o) => {
                     o.set_backend(b);
@@ -465,11 +549,14 @@ fn reinit_backend(main: HWND) {
                 after_orchestrator(main, o, None);
             }
         },
-        None => {
+        Err(why) => {
             let left = REINIT_LEFT.load(Relaxed);
-            if left > 0 {
+            if left > 0 && !matches!(why, NoBackend::Forced(_)) {
                 REINIT_LEFT.store(left - 1, Relaxed);
                 unsafe { SetTimer(main, TIMER_REINIT, 1000, None) };
+            } else if orch().is_none() {
+                // Retries are over (or the backend is switched off): the app stays without one.
+                enter_no_backend(main, &why);
             }
         }
     }
@@ -576,6 +663,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                     tray::CMD_ABOUT => {
                         open_about();
                     }
+                    tray::CMD_DIAGNOSTICS => open_diagnostics(),
                     tray::CMD_FORGET_ALL => {
                         if let Some(o) = orch() {
                             o.forget_learned(None);
@@ -627,7 +715,7 @@ fn main() {
     LOGGING.store(logging_wanted(settings_path().is_some_and(|p| Settings::load(&p).log)), Relaxed);
     if std::env::args().nth(1).as_deref() == Some("--selftest") {
         let apartment = desktops::Apartment::init();
-        let code = selftest::run();
+        let code = selftest::run(std::env::args().nth(2).as_deref() == Some("--select-only"));
         drop(apartment);
         std::process::exit(code);
     }
@@ -687,8 +775,10 @@ fn main() {
         }
 
         let _apartment = desktops::Apartment::init();
+        i18n::set_pref(settings_path().map_or(i18n::Pref::Auto, |p| Settings::load(&p).language));
+        let mut no_backend = None;
         match init_backend() {
-            Some(b) => {
+            Ok(b) => {
                 let mut o = new_orchestrator(b);
                 let st = load_state();
                 o.adopt(st.spaces, st.baseline);
@@ -698,14 +788,20 @@ fn main() {
                     begin_startup(hwnd, o);
                 }
             }
-            None => {
+            // Switched off on purpose: no retries, say so at once (after the icon exists).
+            Err(why @ NoBackend::Forced(_)) => no_backend = Some(why),
+            Err(_) => {
+                // Explorer may still be starting: retry; the "not supported" mode follows only
+                // when every retry failed.
                 REINIT_LEFT.store(REINIT_TRIES, Relaxed);
                 SetTimer(hwnd, TIMER_REINIT, 1000, None);
             }
         }
 
-        i18n::set_pref(settings_path().map_or(i18n::Pref::Auto, |p| Settings::load(&p).language));
         tray::add(hwnd);
+        if let Some(why) = no_backend {
+            enter_no_backend(hwnd, &why);
+        }
         support_init(hwnd);
         #[cfg(debug_assertions)]
         if std::env::var_os("AUTOSPACES_SHOW_SUPPORT").is_some() {
