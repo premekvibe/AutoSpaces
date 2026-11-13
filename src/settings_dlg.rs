@@ -3,6 +3,7 @@
 
 use crate::core::settings::{display_label, file_name_lower, renumber_rules, Layout, LayoutRule, MAX_LAYOUT_DESKTOPS, SYSTEM_HOSTS};
 use crate::core::Settings;
+use crate::i18n::{self, t, tf, Key, Pref, LANGS};
 use crate::sysopts;
 use crate::tray::wide;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
@@ -16,7 +17,7 @@ use windows_sys::Win32::UI::Shell::ShellExecuteW;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus};
 use windows_sys::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    DialogBoxParamW, EndDialog, GetDlgItem, GetDlgItemInt, SetDlgItemInt, SetDlgItemTextW, SetWindowTextW,
+    CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL, EndDialog, GetDlgItem, GetDlgItemInt, SetDlgItemInt, SetDlgItemTextW, SetWindowTextW,
     LB_RESETCONTENT, LBN_SELCHANGE, LB_SETHORIZONTALEXTENT, GetWindowLongPtrW, GetWindowTextW, LoadImageW, SendDlgItemMessageW,
     SendMessageW, SetForegroundWindow, SetWindowLongPtrW, GWLP_USERDATA,
     ICON_BIG, ICON_SMALL, IMAGE_ICON, LR_SHARED, SM_CXICON, SM_CXSMICON, SM_CYICON, SM_CYSMICON, IDCANCEL, IDOK, LBN_DBLCLK, LB_ADDSTRING, LB_DELETESTRING, LB_ERR,
@@ -37,12 +38,15 @@ const ID_LEARNING: i32 = 132;
 const ID_AUTOSTART: i32 = 140;
 const ID_OPEN_WINSETTINGS: i32 = 141;
 const ID_OPEN_LAYOUT: i32 = 143;
+const ID_LANGUAGE: i32 = 144;
+const ID_HINT: i32 = 142;
 const IDD_LAYOUT: u16 = 103;
 const ID_LAY_ENABLED: i32 = 160;
 const ID_LAY_COUNT: i32 = 161;
 const ID_LAY_UP: i32 = 169;
 const ID_LAY_DOWN: i32 = 170;
 const ID_LAY_COUNT_LABEL: i32 = 171;
+const ID_LAY_INFO: i32 = 173;
 const EN_KILLFOCUS: u32 = 0x0200;
 const ID_LAY_LIST: i32 = 163;
 const ID_LAY_ADD_RUN: i32 = 164;
@@ -65,7 +69,7 @@ pub struct Outcome {
     pub settings: Settings,
     /// Learned processes to forget.
     pub forgotten: Vec<String>,
-    /// The user asked to apply the layout profile right now ("Použít teď").
+    /// The user asked to apply the layout profile right now ("Apply now" button).
     pub apply_now: bool,
 }
 
@@ -117,13 +121,7 @@ pub fn show(
         capture,
     };
     unsafe {
-        DialogBoxParamW(
-            GetModuleHandleW(std::ptr::null()),
-            std::ptr::without_provenance::<u16>(IDD_SETTINGS as usize),
-            std::ptr::null_mut(),
-            Some(proc),
-            &mut dlg as *mut Dlg as LPARAM,
-        );
+        i18n::dialog_box(IDD_SETTINGS, std::ptr::null_mut(), Some(proc), &mut dlg as *mut Dlg as LPARAM);
     }
     OPEN.store(0, Relaxed);
     dlg.out
@@ -192,6 +190,7 @@ unsafe fn init(dlg: HWND, d: &Dlg) {
             SendMessageW(dlg, WM_SETICON, kind as usize, icon as LPARAM);
         }
     }
+    SetDlgItemTextW(dlg, ID_HINT, wide(t(Key::SettingsHint)).as_ptr());
     let fs = d.settings.fullscreen_only();
     CheckRadioButton(dlg, ID_MODE_ALL, ID_MODE_FS, if fs { ID_MODE_FS } else { ID_MODE_ALL });
     for (i, (p, n)) in d.excl.iter().enumerate() {
@@ -203,6 +202,12 @@ unsafe fn init(dlg: HWND, d: &Dlg) {
     CheckDlgButton(dlg, ID_LEARNING, check(d.settings.learning));
     // Autostart is read from the system, not from settings.json.
     CheckDlgButton(dlg, ID_AUTOSTART, check(sysopts::autostart_enabled()));
+    // Language: automatic, then every language under its own name.
+    let names = std::iter::once(t(Key::LangAuto)).chain(LANGS.iter().map(|l| l.native_name()));
+    for n in names {
+        SendDlgItemMessageW(dlg, ID_LANGUAGE, CB_ADDSTRING, 0, wide(n).as_ptr() as LPARAM);
+    }
+    SendDlgItemMessageW(dlg, ID_LANGUAGE, CB_SETCURSEL, d.settings.language.index(), 0);
     update_buttons(dlg);
 }
 
@@ -219,6 +224,8 @@ unsafe fn collect(dlg: HWND, d: &mut Dlg) {
     }
     s.learning = IsDlgButtonChecked(dlg, ID_LEARNING) == BST_CHECKED;
     s.autostart = IsDlgButtonChecked(dlg, ID_AUTOSTART) == BST_CHECKED;
+    let sel = SendDlgItemMessageW(dlg, ID_LANGUAGE, CB_GETCURSEL, 0, 0);
+    s.language = if sel < 0 { d.settings.language } else { Pref::from_index(sel as usize) };
     d.out = Some(Outcome {
         settings: s,
         forgotten: std::mem::take(&mut d.forgotten),
@@ -281,7 +288,7 @@ unsafe extern "system" fn proc(dlg: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> i
                 }
                 ID_OPEN_LAYOUT => {
                     if layout_dialog(dlg, d) {
-                        // "Použít teď": confirm the whole settings dialog and apply the profile.
+                        // "Apply now": confirm the whole settings dialog and apply the profile.
                         collect(dlg, d);
                         if let Some(o) = d.out.as_mut() {
                             o.apply_now = true;
@@ -313,19 +320,13 @@ unsafe fn pick(parent: HWND, d: &Dlg) -> Option<(String, String)> {
         .unwrap_or_default();
     let excl: Vec<String> =
         list_data(parent, ID_EXCL_LIST).into_iter().filter_map(|i| d.excl.get(i).map(|e| e.0.clone())).collect();
-    pick_from(parent, picker_entries((d.running)(), &excl, &own), "Vyloučit aplikaci", "Vyloučit")
+    pick_from(parent, picker_entries((d.running)(), &excl, &own), t(Key::PickExcludeTitle), t(Key::PickExcludeButton))
 }
 
 /// Shows the picker dialog with its own caption and confirm button; the chosen entry or None.
 unsafe fn pick_from(parent: HWND, entries: Vec<(String, String)>, title: &str, button: &str) -> Option<(String, String)> {
     let mut st = Pick { entries, chosen: None, title: title.into(), button: button.into() };
-    DialogBoxParamW(
-        GetModuleHandleW(std::ptr::null()),
-        std::ptr::without_provenance::<u16>(IDD_PICK as usize),
-        parent,
-        Some(pick_proc),
-        &mut st as *mut Pick as LPARAM,
-    );
+    i18n::dialog_box(IDD_PICK, parent, Some(pick_proc), &mut st as *mut Pick as LPARAM);
     st.chosen
 }
 
@@ -409,16 +410,10 @@ struct LayDlg {
     drag_src: Option<usize>,
 }
 
-/// The layout dialog; true when the user chose "Použít teď" (the profile is stored in `d`).
+/// The layout dialog; true when the user chose "Apply now" (the profile is stored in `d`).
 unsafe fn layout_dialog(parent: HWND, d: &mut Dlg) -> bool {
     let mut st = LayDlg { layout: d.settings.layout.clone(), capture: d.capture, apply: false, drag_msg: 0, drag_src: None };
-    let r = DialogBoxParamW(
-        GetModuleHandleW(std::ptr::null()),
-        std::ptr::without_provenance::<u16>(IDD_LAYOUT as usize),
-        parent,
-        Some(layout_proc),
-        &mut st as *mut LayDlg as LPARAM,
-    );
+    let r = i18n::dialog_box(IDD_LAYOUT, parent, Some(layout_proc), &mut st as *mut LayDlg as LPARAM);
     if r != IDOK as isize {
         return false;
     }
@@ -440,7 +435,7 @@ fn read_num(dlg: HWND, id: i32, default: u32) -> u32 {
 /// The desktop count may exceed the minimum (empty desktops on top) but never fall below it.
 unsafe fn lay_fix_count(dlg: HWND, l: &Layout) {
     let min = l.min_count();
-    SetDlgItemTextW(dlg, ID_LAY_COUNT_LABEL, wide(&format!("Počet ploch po startu (nejméně {min}):")).as_ptr());
+    SetDlgItemTextW(dlg, ID_LAY_COUNT_LABEL, wide(&tf(Key::LayoutCountLabel, &[&min.to_string()])).as_ptr());
     if read_num(dlg, ID_LAY_COUNT, 1) < min {
         SetDlgItemInt(dlg, ID_LAY_COUNT, min, 0);
     }
@@ -453,7 +448,7 @@ unsafe fn lay_refill(dlg: HWND, l: &mut Layout, sel: Option<usize>) {
     SendDlgItemMessageW(dlg, ID_LAY_LIST, LB_RESETCONTENT, 0, 0);
     let mut longest = 0;
     for (i, r) in l.rules.iter().enumerate() {
-        let text = format!("Plocha {} – {}", r.desktop, r.label());
+        let text = tf(Key::LayoutRow, &[&r.desktop.to_string(), &r.label()]);
         longest = longest.max(text.chars().count());
         list_add(dlg, ID_LAY_LIST, &text, i);
     }
@@ -476,7 +471,7 @@ unsafe fn lay_buttons(dlg: HWND, l: &Layout) {
     EnableWindow(GetDlgItem(dlg, ID_LAY_DOWN), (has && i + 1 < l.rules.len()) as i32);
 }
 
-/// Moves a row (drag or Nahoru / Dolů): the desktops follow the new order at once.
+/// Moves a row (drag or the up / down buttons): the desktops follow the new order at once.
 unsafe fn lay_move(dlg: HWND, l: &mut Layout, from: usize, to: usize) {
     if from >= l.rules.len() || to >= l.rules.len() || from == to {
         return;
@@ -489,8 +484,8 @@ unsafe fn lay_move(dlg: HWND, l: &mut Layout, from: usize, to: usize) {
 /// New applications go to the end of the list: the next desktop.
 unsafe fn lay_add(dlg: HWND, l: &mut Layout, name: &str, launch: &str, process: &str) {
     if l.rules.len() + 1 >= MAX_LAYOUT_DESKTOPS as usize {
-        let text = format!("V rozložení může být nejvýše {} aplikací.", MAX_LAYOUT_DESKTOPS - 1);
-        MessageBoxW(dlg, wide(&text).as_ptr(), wide("AutoSpaces").as_ptr(), MB_OK | MB_ICONINFORMATION);
+        let text = tf(Key::LayoutFull, &[&(MAX_LAYOUT_DESKTOPS - 1).to_string()]);
+        MessageBoxW(dlg, wide(&text).as_ptr(), wide(t(Key::AppName)).as_ptr(), MB_OK | MB_ICONINFORMATION);
         return;
     }
     if let Some(r) = LayoutRule::new(l.rules.len() as u32 + 2, name, launch, "", process) {
@@ -507,8 +502,9 @@ unsafe fn choose_exe(parent: HWND) -> Option<String> {
         GetOpenFileNameW, OFN_FILEMUSTEXIST, OFN_HIDEREADONLY, OFN_NOCHANGEDIR, OFN_PATHMUSTEXIST, OPENFILENAMEW,
     };
     let mut file = [0u16; 1040];
-    let filter: Vec<u16> = "Programy (*.exe)\0*.exe\0Všechny soubory (*.*)\0*.*\0\0".encode_utf16().collect();
-    let title = wide("Vybrat aplikaci");
+    let filter: Vec<u16> =
+        format!("{}\0*.exe\0{}\0*.*\0\0", t(Key::FileFilterPrograms), t(Key::FileFilterAll)).encode_utf16().collect();
+    let title = wide(t(Key::FileChooseApp));
     let mut ofn: OPENFILENAMEW = std::mem::zeroed();
     ofn.lStructSize = std::mem::size_of::<OPENFILENAMEW>() as u32;
     ofn.hwndOwner = parent;
@@ -584,6 +580,7 @@ unsafe extern "system" fn layout_proc(dlg: HWND, msg: u32, wp: WPARAM, lp: LPARA
         WM_INITDIALOG => {
             SetWindowLongPtrW(dlg, GWLP_USERDATA, lp);
             if let Some(st) = (lp as *mut LayDlg).as_mut() {
+                SetDlgItemTextW(dlg, ID_LAY_INFO, wide(t(Key::LayoutInfo)).as_ptr());
                 CheckDlgButton(dlg, ID_LAY_ENABLED, check(st.layout.enabled));
                 SetDlgItemInt(dlg, ID_LAY_COUNT, st.layout.count() as u32, 0);
                 MakeDragList(GetDlgItem(dlg, ID_LAY_LIST));
@@ -625,7 +622,7 @@ unsafe extern "system" fn layout_proc(dlg: HWND, msg: u32, wp: WPARAM, lp: LPARA
                         .unwrap_or_default();
                     let raw: Vec<(String, String)> = full.iter().map(|(p, n, _)| (p.clone(), n.clone())).collect();
                     let entries = picker_entries(raw, &[], &own);
-                    if let Some((p, n)) = pick_from(dlg, entries, "Přidat do rozložení", "Přidat") {
+                    if let Some((p, n)) = pick_from(dlg, entries, t(Key::PickLayoutTitle), t(Key::PickLayoutButton)) {
                         let path = full.iter().find(|f| f.0 == p).map(|f| f.2.clone()).unwrap_or_default();
                         lay_add(dlg, &mut st.layout, &n, &path, &p);
                     }

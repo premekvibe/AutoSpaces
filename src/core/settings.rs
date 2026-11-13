@@ -1,5 +1,6 @@
 //! Settings (plan 6.6, 12.2): defaults plus `settings.json` in `%APPDATA%\AutoSpaces`.
 
+use crate::i18n::Pref;
 use crate::json::{parse_json, quote, Json};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -300,6 +301,8 @@ pub struct Settings {
     pub autostart: bool,
     /// Desktop layout profile applied after start (plan 12.7).
     pub layout: Layout,
+    /// User interface language: automatic (Windows UI language) or forced (plan 12.10).
+    pub language: Pref,
 }
 
 impl Default for Settings {
@@ -318,6 +321,7 @@ impl Default for Settings {
             names: BTreeMap::new(),
             autostart: false,
             layout: Layout::default(),
+            language: Pref::Auto,
         }
     }
 }
@@ -392,6 +396,9 @@ impl Settings {
         flag("autostart", &mut s.autostart);
         flag("learning", &mut s.learning);
         flag("switchAnimation", &mut s.switch_animation);
+        if let Some(code) = j.get("language").and_then(Json::as_str) {
+            s.language = Pref::from_code(code);
+        }
         if let Some(l @ Json::Obj(_)) = j.get("layout") {
             s.layout = Layout::from_json(l);
         }
@@ -428,6 +435,7 @@ impl Settings {
   \"autostart\": {},
   \"learning\": {},
   \"switchAnimation\": {},
+  \"language\": {},
   \"layout\": {}
 }}
 ",
@@ -437,6 +445,7 @@ impl Settings {
             self.autostart,
             self.learning,
             self.switch_animation,
+            quote(self.language.code()),
             self.layout.to_json()
         )
     }
@@ -478,6 +487,31 @@ mod tests {
         assert!(s.excluded.is_empty());
         assert!(Settings::from_json("not json").is_err());
         assert!(Settings::from_json("[1]").is_err());
+    }
+
+    #[test]
+    fn language_is_optional_and_tolerant() {
+        use crate::i18n::{Lang, Pref};
+        // Files written by older versions have no "language": automatic.
+        let old = r#"{"mode":"all","excluded":[],"autostart":false,"learning":true,"switchAnimation":false}"#;
+        assert_eq!(Settings::from_json(old).unwrap().language, Pref::Auto);
+        assert_eq!(Settings::from_json("{}").unwrap().language, Pref::Auto);
+        for (text, want) in [
+            (r#"{"language":"cs"}"#, Pref::Fixed(Lang::Cs)),
+            (r#"{"language":"en"}"#, Pref::Fixed(Lang::En)),
+            (r#"{"language":"EN"}"#, Pref::Fixed(Lang::En)),
+            (r#"{"language":"auto"}"#, Pref::Auto),
+            (r#"{"language":"de"}"#, Pref::Auto),
+            (r#"{"language":5}"#, Pref::Auto),
+            (r#"{"language":null}"#, Pref::Auto),
+        ] {
+            assert_eq!(Settings::from_json(text).unwrap().language, want, "{text}");
+        }
+        for p in [Pref::Auto, Pref::Fixed(Lang::Cs), Pref::Fixed(Lang::En)] {
+            let mut s = Settings::default();
+            s.language = p;
+            assert_eq!(Settings::from_json(&s.to_json()).unwrap().language, p);
+        }
     }
 
     #[test]

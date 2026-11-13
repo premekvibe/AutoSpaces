@@ -22,10 +22,18 @@
 #define SS_CENTERIMAGE 0x200
 #define SS_REALSIZECONTROL 0x40
 #define SS_OWNERDRAW 0xD
+#define CBS_DROPDOWNLIST 3
 
 // AS_VER_COMMA / AS_VER_STR come from build.rs (version in Cargo.toml is the single source).
 #include "version.h"
 
+// Token pasting picks the text set of the language being compiled: T(NAME) -> T_CS_NAME / T_EN_NAME.
+#define AS_CAT2(a, b) a##b
+#define AS_CAT(a, b) AS_CAT2(a, b)
+#define T(name) AS_CAT(AS_TEXTS, name)
+
+// Language-neutral resources.
+LANGUAGE 0x00, 0x00
 1 ICON "autospaces.ico"
 // Donate QR code (RLE8 bitmap made by tools/make-qr-bmp.py), loaded only while the About dialog is open.
 20 BITMAP "donate-qr.bmp"
@@ -34,105 +42,23 @@
 // Per-monitor v2 DPI awareness for the whole process (plan 12.2).
 1 24 "autospaces.manifest"
 
-// Dialog and control IDs must match src/settings_dlg.rs.
-101 DIALOGEX 0, 0, 304, 308
-STYLE DS_SHELLFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
-CAPTION "AutoSpaces – Nastavení"
-FONT 9, "MS Shell Dlg", 400, 0, 1
-BEGIN
-    GROUPBOX        "Co spouští přesun na samostatnou plochu", -1, 6, 4, 292, 44
-    AUTORADIOBUTTON "Všechna maximalizovaná okna i celoobrazovkový režim", 110, 14, 17, 278, 10, WS_GROUP | WS_TABSTOP
-    AUTORADIOBUTTON "Jen celoobrazovkový režim (např. F11 v prohlížeči)", 111, 14, 31, 278, 10
+// Dialogs, once per language (LANGUAGE primary, sublanguage); src/i18n.rs picks the variant explicitly,
+// the ids are the same in both. Czech = 0x05/0x01 (0x0405), English (US) = 0x09/0x01 (0x0409).
+LANGUAGE 0x05, 0x01
+#define AS_TEXTS T_CS_
+#include "strings-cs.inc"
+#include "dialogs.inc"
+#undef AS_TEXTS
 
-    GROUPBOX        "Vyloučené aplikace (okna zůstávají, kde jsou)", -1, 6, 52, 292, 72
-    LISTBOX         120, 14, 64, 204, 54, LBS_NOTIFY | LBS_SORT | LBS_NOINTEGRALHEIGHT | WS_BORDER | WS_VSCROLL | WS_TABSTOP
-    PUSHBUTTON      "Přidat z běžících…", 121, 224, 64, 68, 14
-    PUSHBUTTON      "Odebrat", 122, 224, 82, 68, 14
+LANGUAGE 0x09, 0x01
+#define AS_TEXTS T_EN_
+#include "strings-en.inc"
+#include "dialogs.inc"
+#undef AS_TEXTS
 
-    GROUPBOX        "Naučené výjimky (aplikace, které se nepodařilo přesunout)", -1, 6, 128, 292, 72
-    LISTBOX         130, 14, 140, 204, 40, LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | WS_BORDER | WS_VSCROLL | WS_TABSTOP
-    PUSHBUTTON      "Odebrat", 131, 224, 140, 68, 14
-    AUTOCHECKBOX    "Učit se z neúspěšných přesunů", 132, 14, 184, 204, 10, WS_TABSTOP
+LANGUAGE 0x00, 0x00
 
-    GROUPBOX        "Systém", -1, 6, 204, 292, 78
-    AUTOCHECKBOX    "Spouštět AutoSpaces po startu Windows", 140, 14, 216, 278, 10, WS_TABSTOP
-    PUSHBUTTON      "Otevřít nastavení Windows…", 141, 14, 232, 120, 14
-    LTEXT           "Aby klik na ikonu běžící aplikace přepnul na její plochu, nastavte ve Windows v části Plochy „Na hlavním panelu zobrazovat všechna otevřená okna“ na „Na všech plochách“. Shift + klik na ikonu spustí novou instanci aplikace.", 142, 14, 250, 278, 28
-
-    PUSHBUTTON      "Rozložení ploch…", 143, 6, 288, 100, 14, WS_TABSTOP
-    DEFPUSHBUTTON   "OK", 1, 190, 288, 50, 14
-    PUSHBUTTON      "Storno", 2, 246, 288, 50, 14
-END
-
-103 DIALOGEX 0, 0, 330, 242
-STYLE DS_SHELLFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
-CAPTION "AutoSpaces – Rozložení ploch po startu"
-FONT 9, "MS Shell Dlg", 400, 0, 1
-BEGIN
-    AUTOCHECKBOX    "Po spuštění AutoSpaces rozmístit aplikace na plochy", 160, 6, 6, 318, 10, WS_TABSTOP
-    LTEXT           "Počet ploch po startu (nejméně 1):", 171, 6, 24, 190, 10
-    EDITTEXT        161, 200, 22, 26, 12, ES_NUMBER | ES_AUTOHSCROLL | WS_TABSTOP
-
-    GROUPBOX        "Aplikace na plochách (první = plocha 2, druhá = plocha 3 …)", -1, 6, 40, 318, 134
-    LISTBOX         163, 14, 52, 222, 94, LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | WS_BORDER | WS_VSCROLL | WS_HSCROLL | WS_TABSTOP
-    PUSHBUTTON      "Přidat z běžících…", 164, 242, 52, 76, 14, WS_TABSTOP
-    PUSHBUTTON      "Přidat soubor .exe…", 165, 242, 70, 76, 14, WS_TABSTOP
-    PUSHBUTTON      "Odebrat", 166, 242, 88, 76, 14, WS_TABSTOP
-    PUSHBUTTON      "Nahoru", 169, 242, 110, 76, 14, WS_TABSTOP
-    PUSHBUTTON      "Dolů", 170, 242, 128, 76, 14, WS_TABSTOP
-    LTEXT           "Pořadí změníte přetažením položky myší v seznamu, nebo tlačítky Nahoru a Dolů. Plocha 1 zůstává vám.", 172, 14, 152, 304, 20
-
-    LTEXT           "Při startu AutoSpaces doplní počet ploch, okna běžících aplikací přesune na zvolené plochy a ostatní aplikace spustí. Okno, které se do 30 sekund neobjeví, se vzdá a zapíše do protokolu. Pohled zůstane na vaší ploše.", -1, 6, 180, 318, 34
-    PUSHBUTTON      "Převzít současný stav", 167, 6, 220, 100, 14, WS_TABSTOP
-    PUSHBUTTON      "Použít teď", 168, 112, 220, 60, 14, WS_TABSTOP
-    DEFPUSHBUTTON   "OK", 1, 218, 220, 50, 14
-    PUSHBUTTON      "Storno", 2, 274, 220, 50, 14
-END
-
-102 DIALOGEX 0, 0, 240, 170
-STYLE DS_SHELLFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
-CAPTION "Vyloučit aplikaci"
-FONT 9, "MS Shell Dlg", 400, 0, 1
-BEGIN
-    LTEXT           "Aplikace s otevřeným oknem:", -1, 6, 6, 228, 10
-    LISTBOX         150, 6, 18, 228, 128, LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | WS_BORDER | WS_VSCROLL | WS_TABSTOP
-    DEFPUSHBUTTON   "Vyloučit", 1, 128, 150, 50, 14
-    PUSHBUTTON      "Storno", 2, 184, 150, 50, 14
-END
-
-// About dialog and support reminder (src/about_dlg.rs, one template for both); texts, version, link,
-// address and the Bitcoin/Lightning logo (owner-drawn, 220) are set at run time.
-104 DIALOGEX 0, 0, 300, 300
-STYLE DS_SHELLFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
-CAPTION "O aplikaci AutoSpaces"
-FONT 9, "MS Shell Dlg", 400, 0, 1
-BEGIN
-    CONTROL         "", 200, "Static", SS_ICON | SS_REALSIZECONTROL | SS_CENTERIMAGE, 10, 10, 24, 24
-    LTEXT           "AutoSpaces", 201, 42, 9, 248, 16
-    LTEXT           "", 202, 42, 27, 248, 10
-    LTEXT           "AutoSpaces přesune maximalizované okno nebo okno v celoobrazovkovém režimu na vlastní plochu Windows a po jeho zavření nebo zmenšení se na původní plochu zase vrátí.", 203, 10, 46, 280, 20
-    LTEXT           "Autor: Přemysl Vavroušek", 204, 10, 70, 280, 10
-    CONTROL         "", 205, "SysLink", WS_TABSTOP, 10, 82, 280, 10
-    LTEXT           "", 206, 10, 96, 280, 10
-
-    GROUPBOX        "Podpořit autora", 219, 6, 112, 288, 146
-    AUTORADIOBUTTON "Revolut", 215, 14, 124, 100, 10, WS_GROUP | WS_TABSTOP
-    AUTORADIOBUTTON "Účet v CZK", 216, 124, 124, 100, 10
-    CONTROL         "", 208, "Static", SS_BITMAP | SS_CENTERIMAGE, 12, 138, 112, 114
-    LTEXT           "", 209, 132, 138, 156, 22
-    CONTROL         "", 220, "Static", SS_OWNERDRAW, 132, 165, 12, 12
-    LTEXT           "Bitcoin přes Lightning Network:", 210, 148, 166, 140, 10
-    LTEXT           "", 211, 132, 178, 156, 10
-    PUSHBUTTON      "Kopírovat adresu", 212, 132, 194, 110, 14, WS_TABSTOP
-    PUSHBUTTON      "Otevřít v peněžence", 213, 132, 212, 110, 14, WS_TABSTOP
-    LTEXT           "", 214, 132, 230, 156, 22
-
-    AUTOCHECKBOX    "Tento dialog už nikdy nezobrazovat", 217, 6, 264, 232, 10, WS_TABSTOP
-    LTEXT           "Možnost podpory najdete kdykoli v nabídce ikony v oznamovací oblasti, položka „O aplikaci…“.", 218, 6, 277, 232, 20
-    DEFPUSHBUTTON   "Zavřít", 1, 244, 264, 50, 14, WS_TABSTOP
-END
-
-// Version information (Czech, Unicode): shown in the file's Properties and read by the installer.
+// Version information (Czech and English, Unicode): shown in the file's Properties and read by the installer.
 1 VERSIONINFO
 FILEVERSION AS_VER_COMMA
 PRODUCTVERSION AS_VER_COMMA
@@ -155,9 +81,20 @@ BEGIN
             VALUE "ProductName", "AutoSpaces"
             VALUE "ProductVersion", AS_VER_STR
         END
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName", "Přemysl Vavroušek"
+            VALUE "FileDescription", "AutoSpaces"
+            VALUE "FileVersion", AS_VER_STR
+            VALUE "InternalName", "AutoSpaces"
+            VALUE "LegalCopyright", "© Přemysl Vavroušek"
+            VALUE "OriginalFilename", "autospaces.exe"
+            VALUE "ProductName", "AutoSpaces"
+            VALUE "ProductVersion", AS_VER_STR
+        END
     END
     BLOCK "VarFileInfo"
     BEGIN
-        VALUE "Translation", 0x0405, 1200
+        VALUE "Translation", 0x0405, 1200, 0x0409, 1200
     END
 END

@@ -1,5 +1,6 @@
 //! Tray icon and context menu.
 
+use crate::i18n::{t, Key};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
 use windows_sys::Win32::Foundation::{HWND, POINT};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -72,7 +73,7 @@ pub fn add(hwnd: HWND) {
     } else {
         icon
     };
-    for (d, s) in nid.szTip.iter_mut().zip("AutoSpaces".encode_utf16()) {
+    for (d, s) in nid.szTip.iter_mut().zip(t(Key::TrayTip).encode_utf16()) {
         *d = s;
     }
     unsafe { Shell_NotifyIconW(NIM_ADD, &nid) };
@@ -94,21 +95,21 @@ pub fn show_menu(hwnd: HWND, learned: &[String]) -> usize {
     unsafe {
         let sub = CreatePopupMenu();
         if learned.is_empty() {
-            AppendMenuW(sub, MF_STRING | MF_GRAYED, 0, wide("(žádné)").as_ptr());
+            AppendMenuW(sub, MF_STRING | MF_GRAYED, 0, wide(t(Key::MenuNone)).as_ptr());
         }
         for (i, name) in learned.iter().enumerate() {
             AppendMenuW(sub, MF_STRING, CMD_FORGET_BASE + i, wide(name).as_ptr());
         }
         AppendMenuW(sub, MF_SEPARATOR, 0, std::ptr::null());
         let all = if learned.is_empty() { MF_GRAYED } else { 0 };
-        AppendMenuW(sub, MF_STRING | all, CMD_FORGET_ALL, wide("Zapomenout vše").as_ptr());
+        AppendMenuW(sub, MF_STRING | all, CMD_FORGET_ALL, wide(t(Key::MenuForgetAll)).as_ptr());
         let menu = CreatePopupMenu();
         let on = if ENABLED.load(Relaxed) { MF_CHECKED } else { 0 };
-        AppendMenuW(menu, MF_STRING | on, CMD_TOGGLE, wide("Zapnuto").as_ptr());
-        AppendMenuW(menu, MF_POPUP, sub as usize, wide("Naučené výjimky").as_ptr());
-        AppendMenuW(menu, MF_STRING, CMD_SETTINGS, wide("Nastavení…").as_ptr());
-        AppendMenuW(menu, MF_STRING, CMD_ABOUT, wide("O aplikaci…").as_ptr());
-        AppendMenuW(menu, MF_STRING, CMD_EXIT, wide("Ukončit").as_ptr());
+        AppendMenuW(menu, MF_STRING | on, CMD_TOGGLE, wide(t(Key::MenuEnabled)).as_ptr());
+        AppendMenuW(menu, MF_POPUP, sub as usize, wide(t(Key::MenuLearned)).as_ptr());
+        AppendMenuW(menu, MF_STRING, CMD_SETTINGS, wide(t(Key::MenuSettings)).as_ptr());
+        AppendMenuW(menu, MF_STRING, CMD_ABOUT, wide(t(Key::MenuAbout)).as_ptr());
+        AppendMenuW(menu, MF_STRING, CMD_EXIT, wide(t(Key::MenuExit)).as_ptr());
         let mut pt = POINT { x: 0, y: 0 };
         GetCursorPos(&mut pt);
         SetForegroundWindow(hwnd);

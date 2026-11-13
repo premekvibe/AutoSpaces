@@ -56,6 +56,9 @@ fn version_parts(v: &str) -> (String, String) {
 
 fn main() {
     println!("cargo:rerun-if-changed=assets/autospaces.rc");
+    println!("cargo:rerun-if-changed=assets/dialogs.inc");
+    println!("cargo:rerun-if-changed=assets/strings-cs.inc");
+    println!("cargo:rerun-if-changed=assets/strings-en.inc");
     println!("cargo:rerun-if-changed=assets/autospaces.ico");
     println!("cargo:rerun-if-changed=assets/autospaces.manifest");
     println!("cargo:rerun-if-changed=assets/donate-qr.bmp");

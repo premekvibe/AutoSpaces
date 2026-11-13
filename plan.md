@@ -536,6 +536,13 @@ Inno Setup, jeden `setup.exe`: `PrivilegesRequired=lowest` + `PrivilegesRequired
 - Zástupce v nabídce Start, volitelně spouštění po startu (HKCU Run / HKLM Run), odinstalace ukončí běžící aplikaci (`AppMutex`), nastavení v profilu uživatele se při aktualizaci zachová; při odinstalaci dotaz, zda je smazat.
 - Verze z `Cargo.toml` → VERSIONINFO v exe → instalátor. Podpis exe i instalátoru.
 
+**Skutečný stav (fáze 7) a odchylky:** `installer/autospaces.iss` + `tools/build-installer.ps1` (verze z `Cargo.toml` → `/DAppVersion`, výstup `dist/AutoSpaces-Setup-<verze>.exe`, `dist` v `.gitignore`).
+- Jazyk: `[Languages]` angličtina první (záloha), čeština druhá; `ShowLanguageDialog=no`, `LanguageDetectionMethod=uilanguage` → česky jen při českém UI Windows, jinak anglicky. Dialog volby režimu instalace se zobrazuje ve stejném jazyce.
+- Ukončení běžící aplikace: `AppMutex` je jen záloha (dotaz uživateli). Instalátor i odinstalátor nejdřív pošlou skrytému oknu `AutoSpacesHiddenWindow` `WM_CLOSE` a počkají (max ~15 s) na zmizení mutexu `Local\AutoSpaces_SingleInstance`. Aplikace nově `WM_CLOSE` zpracuje stejnou cestou jako „Ukončit“ v nabídce (`exit_clean`: vrátí okna, srovná plochy); nový parametr `--quit` totéž provede zvenčí a počká (kód 0 = skončila/neběžela, 1 = vypršel čas). `CloseApplications=no` (Restart Manager se nepoužívá).
+- Autostart: úloha zapisuje stejnou hodnotu jako aplikace, `HKCU\...\Run\AutoSpaces = "<cesta k exe>"`. I při instalaci pro všechny uživatele je to HKCU (jen pro instalujícího uživatele), ne HKLM Run – zaškrtávátko v nastavení aplikace čte jen HKCU a z HKLM by hodnotu nešlo vypnout. Ostatní uživatelé si autostart zapnou v nastavení aplikace. Odinstalace maže hodnotu Run vždy (i když ji zapnula aplikace), ale jen u odinstalujícího uživatele.
+- Odinstalace se po odebrání souborů zeptá (dvojjazyčně), zda smazat `%APPDATA%\AutoSpaces` a `%LOCALAPPDATA%\AutoSpaces` aktuálního uživatele; výchozí i při tichém režimu = ponechat.
+- Zástupce v nabídce Start se vytváří vždy (`/NOICONS` ho nevypíná, protože je stránka skupiny skrytá). Podpis exe i instalátoru zatím není (SmartScreen bude varovat „neznámý vydavatel“) – fáze 9.
+
 ### 12.4 O aplikaci – plán
 Nativní dialog z nabídky ikony: ikona, název, verze (`CARGO_PKG_VERSION`), autor, odkaz na web/GitHub, možnosti podpory (donate) ve stejné podobě jako v aplikaci Kolik platím (odkazy otevřít přes `ShellExecuteW`).
 
@@ -547,7 +554,7 @@ Nativní dialog z nabídky ikony: ikona, název, verze (`CARGO_PKG_VERSION`), au
 | 5 | settings.json + dialog Nastavení (12.2), spouštění po startu | hotovo |
 | 5b | profil rozložení ploch po startu (12.7) | hotovo (vyzkoušeno živě při 96 DPI) |
 | 6 | dialog O aplikaci (12.4), VERSIONINFO | hotovo (vyzkoušeno živě při 96 DPI; vysoké DPI neověřeno; odkaz na web a otevření peněženky živě neotevřeny) |
-| 7 | instalátor (12.3) | čeká |
+| 7 | instalátor (12.3) | hotovo (živě vyzkoušena tichá instalace, aktualizace a odinstalace při běžící aplikaci, autostart, průvodce česky i anglicky; režim pro všechny uživatele a smazání dat při odinstalaci živě ne; exe i instalátor nepodepsané) |
 | 8 | záložní režim pro neznámé verze Windows (5.2) | čeká |
 | 9 | testy na dalších verzích Windows, podpis, vydání | čeká |
 
@@ -619,3 +626,11 @@ Cíl: v nastavení určit, kolik ploch má po startu existovat a které aplikace
 - Stav v `%LOCALAPPDATA%\AutoSpaces\support.json` (`firstRun`, `nextAfter`, `never`), načítá se tolerantně; ostatní soubory se nemění. Čas zpět: první spuštění v budoucnosti se bere jako „teď“, vzdálené `nextAfter` se omezí na 30 dní.
 - Po zavření: zaškrtnuté „už nikdy nezobrazovat“ = nikdy; jinak nejdřív za dalších 30 dní (po 30 minutách běhu). Nejvýš jednou za běh.
 - Ohleduplnost: při celoobrazovkovém okně v popředí, běžícím profilu rozložení, čekajících přechodech nebo otevřeném jiném dialogu se odloží o 5 minut. Rozhodovací logika je čistá funkce času (`core/support.rs`, testy). Ladicí sestavení: proměnná `AUTOSPACES_SHOW_SUPPORT=1` zobrazí připomínku hned.
+
+### 12.10 Jazyk (čeština / angličtina)
+- **Pravidlo:** jazyk uživatelského rozhraní Windows (`GetUserDefaultUILanguage`, primární jazyk čeština) → česky, jinak anglicky. Volba v `settings.json`: `"language": "auto" | "cs" | "en"` (výchozí `auto`; chybějící či neznámá hodnota = `auto`). V dialogu nastavení je rozbalovací seznam „Jazyk / Language“ (Automaticky / Čeština / English).
+- **Použití:** menu ikony, tooltip a hlášky se řídí jazykem hned po potvrzení nastavení tlačítkem OK; dialogy otevřené později jsou už v novém jazyce (bez restartu aplikace). Otevřený dialog nastavení se nepřekresluje (dialog to říká v poznámce pod seznamem).
+- **Kde jsou texty:** šablony dialogů jednou v `assets/dialogs.inc`, texty v `assets/strings-cs.inc` a `assets/strings-en.inc` (makro `T(NAME)` → `T_<JAZYK>_NAME`); `autospaces.rc` je zahrnuje dvakrát pod `LANGUAGE 0x05,0x01` a `LANGUAGE 0x09,0x01`. Varianta se načítá výslovně (`FindResourceExW` + `DialogBoxIndirectParamW` v `src/i18n.rs`), ne podle výchozího chování systému. Ostatní texty (menu, tooltip, hlášky, „Plocha N – …“, „nejméně N“, filtry souborových dialogů) jsou v tabulce `strings!` v `src/i18n.rs`. RC ořezává texty ovládacích prvků na 256 znaků, proto dva dlouhé odstavce (nastavení, rozložení) jsou v tabulce a nastavují se za běhu; test hlídá, aby žádný text v `.inc` nepřesáhl limit.
+- **VERSIONINFO:** české (`040504B0`) i anglické (`040904B0`) bloky. QR obrázky jsou beze změny.
+- **Přidání jazyka:** (1) varianta v `Lang` (`LANG_COUNT`, `LANGS`, `code`, `primary`, `native_name`), (2) další sloupec v každém řádku `strings!` (kompilátor vyžaduje), (3) soubor `assets/strings-<kód>.inc` + další blok `LANGUAGE … #include` v `autospaces.rc` a položka v `build.rs` (`rerun-if-changed`). Testy hlídají úplnost tabulky i `.inc` souborů, shodu zástupných znaků `{0}` a detekci jazyka.
+- Log soubory zůstávají v jazyce, v jakém jsou. Pozor na různou délku textů: dialogy jsou dimenzovány na delší (anglickou) variantu.

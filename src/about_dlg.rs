@@ -2,6 +2,7 @@
 //! request (the reminder is the same template, modeless and shown without activation). The donate QR code is an RLE bitmap resource that is decoded and scaled when the
 //! dialog opens and freed when it closes (nothing stays in memory while idle).
 
+use crate::i18n::{self, t, tf, Key};
 use crate::tray::wide;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use windows_sys::Win32::Foundation::{GlobalFree, HWND, LPARAM, POINT, RECT, WPARAM};
@@ -18,7 +19,7 @@ use windows_sys::Win32::UI::Controls::{CheckRadioButton, DRAWITEMSTRUCT, IsDlgBu
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows_sys::Win32::UI::Shell::{ShellExecuteExW, ShellExecuteW, SEE_MASK_FLAG_NO_UI, SHELLEXECUTEINFOW};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateDialogParamW, DestroyWindow, DialogBoxParamW, EndDialog, GetClientRect, GetDlgItem, GetWindowRect,
+    DestroyWindow, EndDialog, GetClientRect, GetDlgItem, GetWindowRect,
     IsDialogMessageW, LoadImageW, PostMessageW, SendDlgItemMessageW, SendMessageW, SetDlgItemTextW,
     SetForegroundWindow, SetWindowPos, SetWindowTextW, ShowWindow, MSG, SWP_NOACTIVATE,
     SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE, WM_APP, WM_DRAWITEM, IDCANCEL, IDOK, IMAGE_BITMAP, IMAGE_ICON, LR_DEFAULTCOLOR, LR_SHARED,
@@ -104,9 +105,8 @@ impl Pay {
     }
     fn caption(self) -> String {
         match self {
-            Pay::Revolut => format!("Revolut: naskenujte QR kód
-{REVOLUT_NAME}"),
-            Pay::Account => "Platba na účet: naskenujte QR kód v bankovní aplikaci.".to_string(),
+            Pay::Revolut => tf(Key::PayRevolutCaption, &[REVOLUT_NAME]),
+            Pay::Account => t(Key::PayAccountCaption).to_string(),
         }
     }
 }
@@ -115,16 +115,16 @@ pub fn lightning_uri() -> String {
     format!("lightning:{LIGHTNING_ADDRESS}")
 }
 
-/// "Verze 0.1.0" (version from Cargo.toml, the single source of truth).
+/// "Version 0.1.0" (version from Cargo.toml, the single source of truth).
 pub fn version_label() -> String {
-    format!("Verze {}", env!("CARGO_PKG_VERSION"))
+    tf(Key::AboutVersion, &[env!("CARGO_PKG_VERSION")])
 }
 
 /// `backend` is the name reported by the desktop backend (e.g. "internal:win11-24h2"), if any.
 pub fn variant_label(backend: Option<&str>) -> String {
     match backend {
-        Some(b) => format!("Varianta Windows: {}", b.strip_prefix("internal:").unwrap_or(b)),
-        None => "Varianta Windows: nebyla rozpoznána, aplikace je neaktivní".to_string(),
+        Some(b) => tf(Key::AboutVariant, &[b.strip_prefix("internal:").unwrap_or(b)]),
+        None => t(Key::AboutVariantNone).to_string(),
     }
 }
 
@@ -138,13 +138,7 @@ pub fn show(backend: Option<&str>) {
     let ctx = Ctx { variant: variant_label(backend), support: false };
     unsafe {
         init_controls();
-        DialogBoxParamW(
-            GetModuleHandleW(std::ptr::null()),
-            std::ptr::without_provenance::<u16>(IDD_ABOUT as usize),
-            std::ptr::null_mut(),
-            Some(proc),
-            &ctx as *const Ctx as LPARAM,
-        );
+        i18n::dialog_box(IDD_ABOUT, std::ptr::null_mut(), Some(proc), &ctx as *const Ctx as LPARAM);
     }
     OPEN.store(0, Relaxed);
 }
@@ -166,13 +160,7 @@ pub fn show_support(owner: HWND) -> bool {
     unsafe {
         init_controls();
         SUPPORT_OWNER.store(owner as usize, Relaxed);
-        let dlg = CreateDialogParamW(
-            GetModuleHandleW(std::ptr::null()),
-            std::ptr::without_provenance::<u16>(IDD_ABOUT as usize),
-            std::ptr::null_mut(),
-            Some(proc),
-            &ctx as *const Ctx as LPARAM,
-        );
+        let dlg = i18n::create_dialog(IDD_ABOUT, std::ptr::null_mut(), Some(proc), &ctx as *const Ctx as LPARAM);
         if dlg.is_null() {
             OPEN.store(0, Relaxed);
             SUPPORT_HWND.store(0, Relaxed);
@@ -257,7 +245,7 @@ unsafe fn init(dlg: HWND, ctx: &Ctx) {
         }
     }
     set_text(dlg, ID_VERSION, &version_label());
-    set_text(dlg, ID_LINK, &format!("Web: <a href=\"{AUTHOR_URL}\">{}</a>", AUTHOR_URL.trim_start_matches("https://")));
+    set_text(dlg, ID_LINK, &tf(Key::AboutWeb, &[AUTHOR_URL, AUTHOR_URL.trim_start_matches("https://")]));
     set_text(dlg, ID_VARIANT, &ctx.variant);
     set_text(dlg, ID_ADDRESS, LIGHTNING_ADDRESS);
     CheckRadioButton(dlg, ID_PAY_REVOLUT, ID_PAY_ACCOUNT, ID_PAY_REVOLUT);
@@ -307,8 +295,8 @@ unsafe fn layout_about(dlg: HWND) {
 
 /// Reminder: the invitation replaces the description and author lines; the payment block moves up.
 unsafe fn layout_support(dlg: HWND) {
-    SetWindowTextW(dlg, wide("AutoSpaces – podpořte autora").as_ptr());
-    set_text(dlg, ID_SUMMARY, "Líbí se vám AutoSpaces? Podpořte prosím autora zasláním jakékoli částky jednou z možností níže.");
+    SetWindowTextW(dlg, wide(t(Key::SupportTitle)).as_ptr());
+    set_text(dlg, ID_SUMMARY, t(Key::SupportSummary));
     let dy = item_rect(dlg, ID_GROUP).top - item_rect(dlg, ID_AUTHOR).top;
     for id in [ID_AUTHOR, ID_LINK, ID_VARIANT] {
         hide(dlg, id);
@@ -433,9 +421,9 @@ unsafe fn on_command(dlg: HWND, id: i32, code: u32) {
         }
         ID_COPY => {
             let msg = if copy_to_clipboard(dlg, LIGHTNING_ADDRESS) {
-                "Adresa je zkopírována do schránky."
+                t(Key::CopyDone)
             } else {
-                "Schránku se nepodařilo otevřít."
+                t(Key::CopyFailed)
             };
             set_text(dlg, ID_STATUS, msg);
         }
@@ -444,10 +432,10 @@ unsafe fn on_command(dlg: HWND, id: i32, code: u32) {
             let copied = copy_to_clipboard(dlg, LIGHTNING_ADDRESS);
             let opened = lightning_handler_registered() && open_uri(dlg, &lightning_uri());
             let msg = match (opened, copied) {
-                (true, true) => "Adresa je zkopírována do schránky, peněženka se otevírá.",
-                (true, false) => "Peněženka se otevírá.",
-                (false, true) => "Žádná peněženka není nastavená pro odkazy lightning:. Adresa je zkopírována do schránky.",
-                (false, false) => "Žádná peněženka není nastavená pro odkazy lightning:.",
+                (true, true) => t(Key::WalletOpenedCopied),
+                (true, false) => t(Key::WalletOpened),
+                (false, true) => t(Key::WalletMissingCopied),
+                (false, false) => t(Key::WalletMissing),
             };
             set_text(dlg, ID_STATUS, msg);
         }
@@ -521,22 +509,24 @@ mod tests {
     #[test]
     fn version_comes_from_cargo() {
         let v = env!("CARGO_PKG_VERSION");
-        assert_eq!(version_label(), format!("Verze {v}"));
+        assert!(version_label().contains(v));
+        assert!(!version_label().contains('{'));
         assert!(v.split('.').count() >= 3 && v.split('.').all(|p| p.chars().next().is_some_and(|c| c.is_ascii_digit())));
     }
 
     #[test]
     fn variant_label_strips_backend_prefix() {
-        assert_eq!(variant_label(Some("internal:win11-24h2")), "Varianta Windows: win11-24h2");
-        assert_eq!(variant_label(Some("other")), "Varianta Windows: other");
-        assert!(variant_label(None).contains("neaktivní"));
+        assert!(variant_label(Some("internal:win11-24h2")).ends_with("win11-24h2"));
+        assert!(!variant_label(Some("internal:win11-24h2")).contains("internal:"));
+        assert!(variant_label(Some("other")).ends_with("other"));
+        assert_ne!(variant_label(None), variant_label(Some("other")));
     }
 
     #[test]
     fn pay_choices_map_to_distinct_bitmaps_and_captions() {
         assert_ne!(Pay::Revolut.bitmap_id(), Pay::Account.bitmap_id());
         assert!(Pay::Revolut.caption().contains(REVOLUT_NAME));
-        assert!(Pay::Account.caption().contains("účet"));
+        assert!(!Pay::Account.caption().contains(REVOLUT_NAME));
         assert!(REVOLUT_NAME.starts_with('@'));
     }
 

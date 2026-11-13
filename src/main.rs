@@ -3,6 +3,7 @@
 mod about_dlg;
 mod core;
 mod desktops;
+mod i18n;
 mod json;
 mod selftest;
 mod settings_dlg;
@@ -27,7 +28,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, KillTimer,
     MsgWaitForMultipleObjectsEx, PeekMessageW, PostQuitMessage, RegisterClassW, MWMO_INPUTAVAILABLE,
     PM_REMOVE, QS_ALLINPUT, WM_QUIT, RegisterWindowMessageW, SetTimer, TranslateMessage, MSG,
-    WM_DESTROY, WM_RBUTTONUP, WM_TIMER, WNDCLASSW,
+    WM_CLOSE, WM_DESTROY, WM_RBUTTONUP, WM_TIMER, WNDCLASSW,
 };
 use windowing::system::Win32Windows;
 use windowing::watcher;
@@ -264,6 +265,8 @@ fn open_settings(hwnd: HWND) {
     // Modal; events keep flowing meanwhile, so the orchestrator is looked up again afterwards.
     let Some(out) = settings_dlg::show(&current, learned, settings_dlg::running_apps, capture_layout) else { return };
     let Some(o) = orch() else { return };
+    // The tray menu and every dialog opened from now on use the chosen language.
+    i18n::set_pref(out.settings.language);
     for p in &out.forgotten {
         o.forget_learned(Some(p));
         log_line(&format!("learned: forgot {p}"));
@@ -277,7 +280,7 @@ fn open_settings(hwnd: HWND) {
         }
     }
     o.apply_settings(out.settings);
-    // "Použít teď": the profile is applied at once (the timer, if any, only runs while apps are awaited).
+    // "Apply now": the profile is applied at once (the timer, if any, only runs while apps are awaited).
     let sch = if out.apply_now { o.start_layout() } else { None };
     after_orchestrator(hwnd, o, sch);
 }
@@ -289,7 +292,7 @@ fn open_about() {
     about_dlg::show(backend.as_deref());
 }
 
-/// "Převzít současný stav" in the layout dialog.
+/// "Use current layout" button of the layout dialog.
 fn capture_layout() -> (usize, Vec<core::settings::LayoutRule>) {
     orch().map(|o| o.capture_layout()).unwrap_or_default()
 }
@@ -453,6 +456,39 @@ fn load_state() -> core::state::Stored {
     }
 }
 
+/// Gives every managed window back, levels the desktops and closes the hidden window (ends the loop).
+unsafe fn exit_clean(hwnd: HWND) {
+    if let Some(o) = orch() {
+        o.give_back_all();
+        after_orchestrator(hwnd, o, None);
+    }
+    DestroyWindow(hwnd);
+}
+
+/// `--quit`: asks the running instance to exit cleanly and waits for it (0 = gone or not running, 1 = timeout).
+fn quit_cli() -> i32 {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
+    use windows_sys::Win32::System::Threading::OpenMutexW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{FindWindowW, PostMessageW};
+    let name = tray::wide(SINGLE_INSTANCE);
+    unsafe {
+        let hwnd = FindWindowW(tray::wide(WINDOW_CLASS).as_ptr(), std::ptr::null());
+        if !hwnd.is_null() {
+            PostMessageW(hwnd, WM_CLOSE, 0, 0);
+        }
+        for _ in 0..100 {
+            let h = OpenMutexW(SYNCHRONIZE, 0, name.as_ptr());
+            if h.is_null() {
+                return 0;
+            }
+            CloseHandle(h);
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+    1
+}
+
 unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
         watcher::WM_WINEVENT => {
@@ -502,13 +538,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                             o.set_enabled(on);
                         }
                     }
-                    tray::CMD_EXIT => {
-                        if let Some(o) = orch() {
-                            o.give_back_all();
-                            after_orchestrator(hwnd, o, None);
-                        }
-                        DestroyWindow(hwnd);
-                    }
+                    tray::CMD_EXIT => exit_clean(hwnd),
                     tray::CMD_SETTINGS => open_settings(hwnd),
                     tray::CMD_ABOUT => {
                         open_about();
@@ -528,6 +558,11 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                     _ => {}
                 }
             }
+            0
+        }
+        // Asked from outside (installer, `--quit`, Restart Manager, ...): same clean path as the tray "Exit".
+        WM_CLOSE => {
+            exit_clean(hwnd);
             0
         }
         WM_DESTROY => {
@@ -551,6 +586,10 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
     }
 }
 
+/// Single-instance mutex (the installer's `AppMutex` is the same name) and the hidden window's class.
+const SINGLE_INSTANCE: &str = r"Local\AutoSpaces_SingleInstance";
+const WINDOW_CLASS: &str = "AutoSpacesHiddenWindow";
+
 fn main() {
     LOGGING.store(
         cfg!(debug_assertions) || std::env::var("AUTOSPACES_LOG").is_ok_and(|v| v == "1"),
@@ -561,6 +600,9 @@ fn main() {
         let code = selftest::run();
         drop(apartment);
         std::process::exit(code);
+    }
+    if std::env::args().nth(1).as_deref() == Some("--quit") {
+        std::process::exit(quit_cli());
     }
     if std::env::args().nth(1).as_deref() == Some("--restore") {
         let mutex = unsafe { CreateMutexW(std::ptr::null(), 0, tray::wide("Local\\AutoSpaces_SingleInstance").as_ptr()) };
@@ -583,7 +625,7 @@ fn main() {
         }
 
         let hinst = GetModuleHandleW(std::ptr::null());
-        let class_name = tray::wide("AutoSpacesHiddenWindow");
+        let class_name = tray::wide(WINDOW_CLASS);
         let mut wc: WNDCLASSW = std::mem::zeroed();
         wc.lpfnWndProc = Some(wnd_proc);
         wc.hInstance = hinst;
@@ -633,6 +675,7 @@ fn main() {
             }
         }
 
+        i18n::set_pref(settings_path().map_or(i18n::Pref::Auto, |p| Settings::load(&p).language));
         tray::add(hwnd);
         support_init(hwnd);
         #[cfg(debug_assertions)]
