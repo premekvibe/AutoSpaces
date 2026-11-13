@@ -10,7 +10,7 @@ use crate::core::settings::launch_label;
 use crate::json::{parse_json, quote, Json};
 
 /// The issue form on GitHub. No data of the user or the system is ever put into this address.
-pub const ISSUE_URL: &str = "https://github.com/premekvibe/AutoSpaces/issues/new?template=bug_report.yml";
+pub const ISSUE_URL: &str = "https://github.com/janakvibe/AutoSpaces/issues/new?template=bug_report.yml";
 
 /// How many trailing lines of `log.txt` go into the report.
 pub const LOG_TAIL_LINES: usize = 400;
@@ -333,14 +333,14 @@ mod tests {
 
     fn env() -> Env {
         Env {
-            user: "Preme".into(),
+            user: "Jana".into(),
             computer: "DESKTOP-4ABC".into(),
             domain: "DESKTOP-4ABC".into(),
             paths: vec![
-                (r"C:\Users\Preme\AppData\Local\Temp".into(), "%TEMP%".into()),
-                (r"C:\Users\Preme\AppData\Local".into(), "%LOCALAPPDATA%".into()),
-                (r"C:\Users\Preme\AppData\Roaming".into(), "%APPDATA%".into()),
-                (r"C:\Users\Preme".into(), "%USERPROFILE%".into()),
+                (r"C:\Users\Jana\AppData\Local\Temp".into(), "%TEMP%".into()),
+                (r"C:\Users\Jana\AppData\Local".into(), "%LOCALAPPDATA%".into()),
+                (r"C:\Users\Jana\AppData\Roaming".into(), "%APPDATA%".into()),
+                (r"C:\Users\Jana".into(), "%USERPROFILE%".into()),
             ],
         }
     }
@@ -348,12 +348,12 @@ mod tests {
     #[test]
     fn profile_folders_become_placeholders() {
         let e = env();
-        assert_eq!(anonymize(r"C:\Users\Preme\Documents\a.exe", &e), r"%USERPROFILE%\Documents\a.exe");
-        assert_eq!(anonymize(r"c:\users\PREME\appdata\local\Foo\b.exe", &e), r"%LOCALAPPDATA%\Foo\b.exe");
-        assert_eq!(anonymize(r"C:\Users\Preme\AppData\Local\Temp\x", &e), r"%TEMP%\x");
-        assert_eq!(anonymize(r"C:\Users\Preme\AppData\Roaming\AutoSpaces", &e), r"%APPDATA%\AutoSpaces");
+        assert_eq!(anonymize(r"C:\Users\Jana\Documents\a.exe", &e), r"%USERPROFILE%\Documents\a.exe");
+        assert_eq!(anonymize(r"c:\users\JANA\appdata\local\Foo\b.exe", &e), r"%LOCALAPPDATA%\Foo\b.exe");
+        assert_eq!(anonymize(r"C:\Users\Jana\AppData\Local\Temp\x", &e), r"%TEMP%\x");
+        assert_eq!(anonymize(r"C:\Users\Jana\AppData\Roaming\AutoSpaces", &e), r"%APPDATA%\AutoSpaces");
         // Not a prefix of a longer name.
-        assert_eq!(anonymize(r"C:\Users\Premek\x", &e), r"C:\Users\<user>\x");
+        assert_eq!(anonymize(r"C:\Users\Janak\x", &e), r"C:\Users\<user>\x");
         // Folders outside the profile stay.
         assert_eq!(anonymize(r"C:\Program Files\Foo\foo.exe", &e), r"C:\Program Files\Foo\foo.exe");
     }
@@ -371,9 +371,9 @@ mod tests {
     #[test]
     fn names_are_replaced_as_whole_words_only() {
         let e = env();
-        assert_eq!(anonymize("user Preme logged in", &e), "user <user> logged in");
+        assert_eq!(anonymize("user Jana logged in", &e), "user <user> logged in");
         assert_eq!(anonymize("host desktop-4abc!", &e), "host <computer>!");
-        assert_eq!(anonymize("Premeditated", &e), "Premeditated");
+        assert_eq!(anonymize("Janaditated", &e), "Janaditated");
         let short = Env { user: "ab".into(), ..Default::default() };
         assert_eq!(anonymize("a ab b", &short), "a ab b");
         assert_eq!(anonymize("", &e), "");
@@ -390,10 +390,10 @@ mod tests {
         let e = env();
         let settings = r#"{"mode":"all","excluded":["a.exe"],"excludedNames":{"a.exe":"Secret title - Document1"},
           "layout":{"enabled":true,"desktopCount":3,"rules":[
-            {"desktop":2,"name":"My Inbox - Outlook","launch":"C:\\Users\\Preme\\AppData\\Local\\Programs\\Foo\\foo.exe","args":"--profile Preme","match":{"process":"foo.exe"}},
+            {"desktop":2,"name":"My Inbox - Outlook","launch":"C:\\Users\\Jana\\AppData\\Local\\Programs\\Foo\\foo.exe","args":"--profile Jana","match":{"process":"foo.exe"}},
             {"desktop":3,"name":"","launch":"shell:AppsFolder\\Fam_8we!App","args":"","match":{"process":"x.exe"}}]}}"#;
         let out = redact_json(settings, &e);
-        for bad in ["Secret", "Inbox", "Preme", "Users", "--profile", "Programs"] {
+        for bad in ["Secret", "Inbox", "Jana", "Users", "--profile", "Programs"] {
             assert!(!out.contains(bad), "{bad} in {out}");
         }
         for good in ["\"a.exe\"", "\"foo.exe\"", "shell:AppsFolder\\\\Fam_8we!App", "\"desktopCount\": 3", "(omitted)"] {
@@ -414,9 +414,9 @@ mod tests {
 
     #[test]
     fn broken_json_is_not_copied() {
-        let out = redact_json(r#"{"secret": "Preme" oops"#, &env());
+        let out = redact_json(r#"{"secret": "Jana" oops"#, &env());
         assert!(out.starts_with("(unreadable"));
-        assert!(!out.contains("secret") && !out.contains("Preme"));
+        assert!(!out.contains("secret") && !out.contains("Jana"));
     }
 
     #[test]
@@ -438,14 +438,14 @@ mod tests {
             mode: "normal".into(),
             variant: Some("internal:win11-24h2".into()),
             variant_verified: true,
-            selection: vec![r"variants: C:\Users\Preme\AppData\Local\Programs\AutoSpaces\variants.json".into()],
+            selection: vec![r"variants: C:\Users\Jana\AppData\Local\Programs\AutoSpaces\variants.json".into()],
             desktops: Some("3".into()),
             logging: true,
             settings_json: Some(r#"{"mode":"all"}"#.into()),
             learned_json: None,
             log: Some(
                 (0..500)
-                    .map(|i| format!("2026-11-13 10:00:00.{i:03} layout: launched C:\\Users\\Preme\\x.exe for {i}"))
+                    .map(|i| format!("2026-11-13 10:00:00.{i:03} layout: launched C:\\Users\\Jana\\x.exe for {i}"))
                     .collect::<Vec<_>>()
                     .join("\n"),
             ),
@@ -472,7 +472,7 @@ mod tests {
         ] {
             assert!(r.contains(field), "{field} missing:\n{r}");
         }
-        assert!(!r.contains("Preme") && !r.to_lowercase().contains("desktop-4abc"), "{r}");
+        assert!(!r.contains("Jana") && !r.to_lowercase().contains("desktop-4abc"), "{r}");
         assert!(r.contains("%USERPROFILE%\\x.exe"));
         // Only the last 400 of the 500 lines.
         assert!(r.contains(".499 ") && r.contains(".100 ") && !r.contains(".099 "));
@@ -489,7 +489,7 @@ mod tests {
 
     #[test]
     fn issue_url_is_fixed_and_carries_no_data() {
-        assert_eq!(ISSUE_URL, "https://github.com/premekvibe/AutoSpaces/issues/new?template=bug_report.yml");
+        assert_eq!(ISSUE_URL, "https://github.com/janakvibe/AutoSpaces/issues/new?template=bug_report.yml");
         assert_eq!(ISSUE_URL.matches('?').count(), 1);
         assert!(!ISSUE_URL.contains('&'));
         assert!(!ISSUE_URL.contains(env!("CARGO_PKG_VERSION")));
