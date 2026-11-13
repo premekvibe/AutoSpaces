@@ -9,6 +9,7 @@
 #define T_EN_SET_GRP_TRIGGER "What moves a window to its own desktop"
 #define T_EN_SET_MODE_ALL "All maximized windows and full-screen mode"
 #define T_EN_SET_MODE_FS "Full-screen mode only (e.g. F11 in a browser)"
+#define T_EN_SET_ARRANGE "At startup, move already maximized windows to their own desktops"
 #define T_EN_SET_GRP_EXCL "Excluded apps (their windows stay where they are)"
 #define T_EN_SET_GRP_LEARNED "Learned exceptions (apps that could not be moved)"
 #define T_EN_SET_LEARNING "Learn from failed moves"

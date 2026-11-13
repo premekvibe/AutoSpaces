@@ -291,6 +291,11 @@ pub struct Settings {
     pub empty_desktop_grace_ms: u32,
     /// Self-learning block list (plan 6.7); false = nothing recorded, nothing blocked.
     pub learning: bool,
+    /// At startup, already maximized windows get their own desktops (plan 12.11).
+    pub arrange_at_start: bool,
+    /// Diagnostic log to `%LOCALAPPDATA%\AutoSpaces\log.txt` (key `"log"`, no UI; the same log
+    /// as `AUTOSPACES_LOG=1`).
+    pub log: bool,
     /// Days after which softly blocked apps (Flapping, ShortLived) are tried again.
     pub learned_retry_days: u32,
     /// Lower-case process names that are never moved (plan 12.2).
@@ -316,6 +321,8 @@ impl Default for Settings {
             trigger_on_fullscreen: true,
             empty_desktop_grace_ms: 300,
             learning: true,
+            arrange_at_start: true,
+            log: false,
             learned_retry_days: 30,
             excluded: Vec::new(),
             names: BTreeMap::new(),
@@ -395,6 +402,8 @@ impl Settings {
         }
         flag("autostart", &mut s.autostart);
         flag("learning", &mut s.learning);
+        flag("arrangeAtStart", &mut s.arrange_at_start);
+        flag("log", &mut s.log);
         flag("switchAnimation", &mut s.switch_animation);
         if let Some(code) = j.get("language").and_then(Json::as_str) {
             s.language = Pref::from_code(code);
@@ -434,8 +443,9 @@ impl Settings {
   \"excludedNames\": {{{}}},
   \"autostart\": {},
   \"learning\": {},
+  \"arrangeAtStart\": {},
   \"switchAnimation\": {},
-  \"language\": {},
+  \"language\": {},{}
   \"layout\": {}
 }}
 ",
@@ -444,8 +454,11 @@ impl Settings {
             names.join(", "),
             self.autostart,
             self.learning,
+            self.arrange_at_start,
             self.switch_animation,
             quote(self.language.code()),
+            // Written only when on: a hand-made key that survives saving from the dialog.
+            if self.log { "\n  \"log\": true," } else { "" },
             self.layout.to_json()
         )
     }

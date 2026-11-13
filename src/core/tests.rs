@@ -54,8 +54,16 @@ struct World {
     maximized: RefCell<Vec<usize>>,
     /// Windows `stop_flash` was called for (in order).
     unflashed: RefCell<Vec<usize>>,
+    /// Process start time per window id (0 = unknown).
+    starts: RefCell<HashMap<usize, u64>>,
     /// Windows without a maximize box (splash screens).
     no_max_box: RefCell<Vec<usize>>,
+    /// Desktops the orchestrator switched the view to, in order.
+    switches: RefCell<Vec<u32>>,
+    /// Like Windows: activating a window on another desktop switches the view there.
+    activate_follows: Cell<bool>,
+    /// Visible unowned top-level windows that are no candidates (splash screens without a title).
+    plain: RefCell<Vec<usize>>,
 }
 
 impl World {
@@ -145,6 +153,7 @@ impl DesktopBackend for FB {
         Ok(())
     }
     fn switch(&self, desk: Guid, _animated: bool) -> BResult<()> {
+        self.0.switches.borrow_mut().push(desk.d1);
         self.0.current.set(desk);
         Ok(())
     }
@@ -182,6 +191,9 @@ impl WindowSystem for FW {
     fn app_name(&self, pid: u32) -> String {
         format!("Name {}", pid - 1000)
     }
+    fn process_started(&self, pid: u32) -> u64 {
+        self.0.starts.borrow().get(&(pid as usize - 1000)).copied().unwrap_or(0)
+    }
     fn launch(&self, command: &str, _args: &str) -> bool {
         self.0.launched.borrow_mut().push(command.to_string());
         !self.0.launch_fails.get()
@@ -191,14 +203,24 @@ impl WindowSystem for FW {
     }
     fn app_windows(&self) -> Vec<HWND> {
         let w = self.0.wins.borrow();
-        w.iter()
+        let mut v: Vec<HWND> = w
+            .iter()
             .filter(|(_, v)| v.candidate && !matches!(v.state, State::Destroyed | State::Hidden))
             .map(|(k, _)| h(*k))
-            .collect()
+            .collect();
+        v.sort_by_key(|x| *x as usize); // z-order for the tests: the lowest id is the topmost window
+        v
     }
     fn activate(&self, hwnd: HWND) {
         self.0.activated.borrow_mut().push(hwnd as usize);
         self.0.fg.set(hwnd as usize);
+        if self.0.activate_follows.get() {
+            if let Some(d) = self.0.wins.borrow().get(&(hwnd as usize)).map(|w| w.desktop) {
+                if !d.is_zero() {
+                    self.0.current.set(d);
+                }
+            }
+        }
     }
     fn foreground(&self) -> HWND {
         h(self.0.fg.get())
@@ -229,6 +251,11 @@ impl WindowSystem for FW {
     }
     fn exe_stamp(&self, _pid: u32) -> String {
         "1:1".into()
+    }
+    fn is_plain_toplevel(&self, hwnd: HWND) -> bool {
+        let id = hwnd as usize;
+        self.0.plain.borrow().contains(&id)
+            && self.0.wins.borrow().get(&id).is_some_and(|w| !matches!(w.state, State::Hidden | State::Destroyed))
     }
 }
 
@@ -1354,7 +1381,7 @@ fn apply_settings_keeps_the_tray_toggle() {
 
 // ---------------------------------------------------------------- layout profile (plan 12.7)
 
-use super::orchestrator::{layout_start_token, layout_tick_token};
+use super::orchestrator::{layout_tick_token, startup_token};
 use super::settings::{Layout, LayoutRule};
 
 fn profile(count: u32, rules: &[(u32, &str)]) -> Settings {
@@ -1614,7 +1641,7 @@ fn layout_view_and_focus_taken_by_an_app_are_given_back() {
     o.poll(); // the desktop registry key changed
     assert_eq!(w.current.get(), g(1), "view returned");
     assert_eq!(w.fg.get(), 50);
-    assert!(logged(&mut o, "view returned"));
+    assert!(logged(&mut o, "view: returned"));
     // The user goes to desktop 2 on purpose (own window in front): that is respected.
     put(&w, 60, 2);
     proc_of(&w, 60, "notes.exe");
@@ -1651,7 +1678,6 @@ fn profile_off_behaves_like_no_profile() {
         proc_of(&w, 2, "mail.exe");
         let mut o = started(&w);
         o.apply_settings(settings);
-        assert!(o.layout_start_schedule().is_none());
         let mut trace = Vec::new();
         for (id, st) in [(1, State::Maximized), (2, State::Maximized), (1, State::Normal), (2, State::Normal)] {
             w.set_state(id, st);
@@ -1762,16 +1788,26 @@ fn layout_with_two_rules_for_one_app_uses_two_windows() {
 }
 
 #[test]
-fn layout_start_schedule_only_when_enabled() {
+fn startup_schedule_delay_at_logon_short_by_hand_none_when_nothing_to_do() {
     let w = World::new(1);
+    let mut off = Settings::default();
+    off.arrange_at_start = false;
+    let mut o = Orchestrator::new(FB(w.clone()), FW(w.clone()), off);
+    o.adopt(Vec::new(), None);
+    assert!(o.startup_schedule(true).is_none(), "no arrangement, no profile");
+    assert!(!o.layout_running());
     let mut o = started(&w);
-    assert!(o.layout_start_schedule().is_none());
     o.apply_settings(profile(2, &[]));
-    let s = o.layout_start_schedule().unwrap();
-    assert_eq!((s.hwnd, s.delay_ms), (layout_start_token(), 1000));
+    let s = o.startup_schedule(true).unwrap();
+    assert_eq!((s.hwnd, s.delay_ms), (startup_token(), 1000), "with Windows: the profile's delay");
+    assert!(o.layout_running(), "pending (the support reminder waits)");
+    assert_eq!(o.startup_schedule(false).unwrap().delay_ms, 500, "by hand: short");
     // The start timer applies the profile: an empty rule list just completes the desktops.
-    assert!(o.on_event(layout_start_token(), Event::Recheck).is_none());
+    assert!(o.on_event(startup_token(), Event::Recheck).is_none());
     assert_eq!(list(&w), vec![1, 2]);
+    assert!(!o.layout_running());
+    // A second (late) timer does nothing.
+    assert!(o.on_event(startup_token(), Event::Recheck).is_none());
 }
 
 #[test]
@@ -1822,4 +1858,505 @@ fn capture_layout_ignores_helper_desktops() {
     let (n, rules) = o.capture_layout();
     assert_eq!(n, 1, "the helper desktop is not part of the profile");
     assert!(rules.is_empty(), "desktop 1 is not captured");
+}
+
+// ---------------------------------------------------------------- startup arrangement (plan 12.11)
+
+/// Like a real start: adopt, then the startup sequence (arrangement + profile), with the given
+/// settings, at once (as if the delay were over and nothing happened meanwhile).
+fn started_with(w: &Rc<World>, s: Settings) -> (Orch, Log) {
+    let mut o = Orchestrator::new(FB(w.clone()), FW(w.clone()), s);
+    let log: Log = Rc::default();
+    o.set_learned(Box::new(Rec(log.clone())));
+    o.adopt(Vec::new(), None);
+    if let Some(s) = o.startup_schedule(false) {
+        o.on_event(s.hwnd, Event::Recheck);
+    }
+    (o, log)
+}
+
+fn open_as(w: &World, id: usize, st: State, proc: &str) {
+    w.open(id, st);
+    proc_of(w, id, proc);
+}
+
+#[test]
+fn arrange_gives_each_maximized_window_its_own_desktop_in_z_order_without_switching() {
+    let w = World::new(1);
+    open_as(&w, 1, State::Maximized, "a.exe");
+    open_as(&w, 2, State::Fullscreen, "b.exe");
+    open_as(&w, 3, State::Maximized, "c.exe");
+    open_as(&w, 4, State::Normal, "d.exe");
+    open_as(&w, 5, State::Minimized, "e.exe");
+    w.fg.set(4);
+    let (mut o, _) = started_with(&w, Settings::default());
+    assert_eq!(list(&w), vec![1, 2, 3, 4]);
+    assert_eq!((w.desk_of(1), w.desk_of(2), w.desk_of(3)), (g(2), g(3), g(4)));
+    assert_eq!((w.desk_of(4), w.desk_of(5)), (g(1), g(1)));
+    assert_eq!(w.current.get(), g(1), "foreground window was not moved: the view stays");
+    assert!(w.activated.borrow().is_empty());
+    assert_eq!(o.snapshot().len(), 3);
+    assert!(o.snapshot().iter().any(|s| s.hwnd == h(2) && s.fullscreen));
+    assert_eq!(o.baseline(), 1);
+    assert!(logged(&mut o, "arranged 3"));
+}
+
+#[test]
+fn arrange_follows_the_foreground_window_to_its_desktop_once() {
+    let w = World::new(1);
+    open_as(&w, 1, State::Maximized, "a.exe");
+    open_as(&w, 2, State::Maximized, "b.exe");
+    open_as(&w, 3, State::Maximized, "c.exe");
+    w.fg.set(2);
+    let (_o, _) = started_with(&w, Settings::default());
+    assert_eq!(w.current.get(), w.desk_of(2));
+    assert_eq!(w.desk_of(2), g(3));
+    assert_eq!(*w.activated.borrow(), vec![2]);
+}
+
+#[test]
+fn arrange_does_nothing_when_windows_are_on_several_desktops() {
+    let w = World::new(2);
+    put(&w, 1, 1);
+    w.set_state(1, State::Maximized);
+    put(&w, 2, 2); // a window (even a minimized one) on a second desktop: the user's own layout
+    w.set_state(2, State::Minimized);
+    let (o, _) = started_with(&w, Settings::default());
+    assert_eq!(list(&w), vec![1, 2]);
+    assert_eq!(w.desk_of(1), g(1));
+    assert!(o.snapshot().is_empty() && o.is_rejected(h(1)));
+}
+
+#[test]
+fn arrange_with_empty_desktops_uses_them_first_then_creates_new_ones() {
+    let w = World::new(3); // desktops 2 and 3 are empty
+    for id in 1..=3 {
+        open_as(&w, id, State::Maximized, &format!("app{id}.exe"));
+    }
+    let (_o, _) = started_with(&w, Settings::default());
+    assert_eq!((w.desk_of(1), w.desk_of(2), w.desk_of(3)), (g(2), g(3), g(4)));
+    assert_eq!(list(&w), vec![1, 2, 3, 4]);
+}
+
+#[test]
+fn arrange_order_is_by_process_start_then_z_order() {
+    let w = World::new(1);
+    for (id, p, t) in [(1, "new.exe", 300), (2, "old.exe", 100), (3, "unknown.exe", 0), (4, "old.exe", 100), (5, "mid.exe", 200)] {
+        open_as(&w, id, State::Maximized, p);
+        w.starts.borrow_mut().insert(id, t);
+    }
+    let (_o, _) = started_with(&w, Settings::default());
+    // old (2, then 4: same time, z-order), mid, new, unknown start time last.
+    let order: Vec<usize> = (2..=6).map(|d| (1..=5).find(|id| w.desk_of(*id) == g(d)).unwrap()).collect();
+    assert_eq!(order, vec![2, 4, 5, 1, 3]);
+}
+
+#[test]
+fn arrange_user_scenario_profile_on_three_desktops_two_empty() {
+    // Desktop 1: Edge, File Explorer, Outlook maximized; desktops 2 and 3 empty; profile 2 = Outlook, 3 = TradingView.
+    let w = World::new(3);
+    open_as(&w, 1, State::Maximized, "msedge.exe");
+    open_as(&w, 2, State::Maximized, "explorer.exe");
+    open_as(&w, 3, State::Maximized, "olk.exe");
+    w.wins.borrow_mut().get_mut(&2).unwrap().candidate = true;
+    for (id, t) in [(1, 500), (2, 100), (3, 300)] {
+        w.starts.borrow_mut().insert(id, t);
+    }
+    w.fg.set(1);
+    let (mut o, _) = started_with(&w, profile(3, &[(2, "olk.exe"), (3, "tv.exe")]));
+    assert_eq!(w.current.get(), g(5), "the user lands with Edge");
+    assert_eq!(w.desk_of(3), g(2), "Outlook on desktop 2 (by the profile, in the same step)");
+    assert_eq!(*w.launched.borrow(), vec!["tv.exe".to_string()], "TradingView is launched for desktop 3");
+    w.open(7, State::Normal);
+    proc_of(&w, 7, "tv.exe");
+    ev(&w, &mut o, 7, Event::Show);
+    assert_eq!(w.desk_of(7), g(3), "TradingView on desktop 3");
+    assert_eq!((w.desk_of(2), w.desk_of(1)), (g(4), g(5)), "Explorer (older process) 4, Edge 5");
+    assert_eq!(list(&w), vec![1, 2, 3, 4, 5], "no empty desktop between them");
+}
+
+#[test]
+fn arrange_off_is_the_old_behaviour_window_stays_until_restored_and_maximized_again() {
+    let w = World::new(1);
+    open_as(&w, 1, State::Maximized, "a.exe");
+    let mut s = Settings::default();
+    s.arrange_at_start = false;
+    let (mut o, _) = started_with(&w, s);
+    assert_eq!((list(&w), w.desk_of(1)), (vec![1], g(1)));
+    assert!(o.is_rejected(h(1)));
+    w.set_state(1, State::Normal);
+    ev(&w, &mut o, 1, Loc);
+    w.set_state(1, State::Maximized);
+    ev(&w, &mut o, 1, Loc);
+    assert!(o.is_managed(h(1)));
+}
+
+#[test]
+fn arrange_only_at_start_not_at_toggle_or_settings_change() {
+    let w = World::new(1);
+    let mut o = started(&w);
+    open_as(&w, 1, State::Maximized, "a.exe");
+    o.set_enabled(false);
+    o.set_enabled(true);
+    let s = o.settings.clone();
+    o.apply_settings(s);
+    assert_eq!((list(&w), w.desk_of(1)), (vec![1], g(1)));
+    assert!(o.snapshot().is_empty());
+}
+
+#[test]
+fn arrange_fullscreen_only_mode_takes_only_fullscreen_windows() {
+    let w = World::new(1);
+    open_as(&w, 1, State::Maximized, "a.exe");
+    open_as(&w, 2, State::Fullscreen, "b.exe");
+    let mut s = Settings::default();
+    s.set_fullscreen_only(true);
+    let (o, _) = started_with(&w, s);
+    assert_eq!((w.desk_of(1), w.desk_of(2)), (g(1), g(2)));
+    assert!(o.is_rejected(h(1)) && o.is_managed(h(2)));
+}
+
+#[test]
+fn arrange_respects_excluded_apps_and_other_candidate_rules() {
+    let w = World::new(1);
+    open_as(&w, 1, State::Maximized, "skip.exe");
+    open_as(&w, 2, State::Maximized, "a.exe");
+    open_as(&w, 3, State::Maximized, "b.exe");
+    open_as(&w, 4, State::Maximized, "c.exe");
+    w.wins.borrow_mut().get_mut(&3).unwrap().candidate = false;
+    let mut s = Settings::default();
+    s.exclude("skip.exe");
+    let (o, _) = started_with(&w, s);
+    assert_eq!(list(&w), vec![1, 2, 3]);
+    assert_eq!((w.desk_of(1), w.desk_of(2), w.desk_of(3), w.desk_of(4)), (g(1), g(2), g(1), g(3)));
+    assert!(o.is_rejected(h(1)) && o.is_managed(h(2)));
+}
+
+#[test]
+fn arrange_failures_are_not_learned_and_the_window_stays() {
+    let w = World::new(1);
+    open_as(&w, 1, State::Maximized, "a.exe");
+    open_as(&w, 2, State::Maximized, "b.exe");
+    w.wins.borrow_mut().get_mut(&1).unwrap().can_move = false;
+    w.input.set(true);
+    w.tick(10_000);
+    let (o, log) = started_with(&w, Settings::default());
+    assert!(log.borrow().is_empty(), "a failed bulk move never feeds the learned list");
+    assert!(o.is_rejected(h(1)) && !o.is_managed(h(1)));
+    assert_eq!((list(&w), w.desk_of(2)), (vec![1, 2], g(2)));
+}
+
+#[test]
+fn arrange_leaves_profile_apps_to_the_profile_no_double_move_no_extra_desktop() {
+    let w = World::new(1);
+    open_as(&w, 1, State::Maximized, "mail.exe");
+    open_as(&w, 2, State::Maximized, "other.exe");
+    let (o, _) = started_with(&w, profile(2, &[(2, "mail.exe")]));
+    assert_eq!(w.desk_of(2), g(3), "other.exe goes behind desktop 2");
+    assert_eq!(list(&w), vec![1, 2, 3]);
+    assert_eq!(w.desk_of(1), g(2), "the profile gives mail.exe desktop 2");
+    assert_eq!(w.desk_of(2), g(3));
+    assert!(o.is_managed(h(2)) && !o.is_managed(h(1)));
+}
+
+#[test]
+fn arranged_window_returns_to_desktop_1_when_restored_and_its_desktop_is_removed() {
+    let w = World::new(1);
+    open_as(&w, 1, State::Maximized, "a.exe");
+    open_as(&w, 2, State::Maximized, "b.exe");
+    w.fg.set(2);
+    let (mut o, _) = started_with(&w, Settings::default());
+    assert_eq!((list(&w), w.current.get()), (vec![1, 2, 3], g(3)));
+    w.set_state(2, State::Normal);
+    ev(&w, &mut o, 2, Loc);
+    assert_eq!((w.desk_of(2), w.current.get()), (g(1), g(1)));
+    assert_eq!(list(&w), vec![1, 2]);
+    // --restore / quit: the other window goes back to desktop 1 as well.
+    o.give_back_all();
+    assert_eq!((w.desk_of(1), list(&w)), (g(1), vec![1]));
+    assert!(o.snapshot().is_empty());
+}
+
+#[test]
+fn arrange_closing_an_arranged_window_removes_its_desktop() {
+    let w = World::new(1);
+    open_as(&w, 1, State::Maximized, "a.exe");
+    let (mut o, _) = started_with(&w, Settings::default());
+    assert_eq!(list(&w), vec![1, 2]);
+    w.set_state(1, State::Destroyed);
+    ev(&w, &mut o, 1, Event::Destroy);
+    assert_eq!(list(&w), vec![1]);
+    assert!(o.snapshot().is_empty());
+}
+
+#[test]
+fn arrange_setting_json_default_true_missing_key_true_and_roundtrip() {
+    assert!(Settings::default().arrange_at_start);
+    assert!(Settings::from_json("{}").unwrap().arrange_at_start);
+    let mut s = Settings::default();
+    s.arrange_at_start = false;
+    let json = s.to_json();
+    assert!(json.contains("\"arrangeAtStart\": false"));
+    assert!(!Settings::from_json(&json).unwrap().arrange_at_start);
+    assert!(Settings::from_json("{\"arrangeAtStart\": 1}").unwrap().arrange_at_start, "wrong type keeps the default");
+}
+
+// ---------------------------------------------------------------- startup sequence: arrangement + profile (plan 12.11 / 12.7)
+
+/// The user's settings: mode all, arrangement on, profile 2 = Outlook, 3 = TradingView, 5 s delay.
+fn user_profile() -> Settings {
+    let mut s = profile(3, &[(2, "olk.exe"), (3, "tradingview.exe")]);
+    s.layout.start_delay_ms = 5000;
+    s
+}
+
+/// Unrelated window events while the start is delayed (a tooltip shows and hides): the
+/// grace timer of the hide runs the ordinary desktop compaction (plan 12.1).
+fn delay_noise(w: &World, o: &mut Orch) {
+    w.open(99, State::Normal);
+    proc_of(w, 99, "shellexperiencehost.exe");
+    w.wins.borrow_mut().get_mut(&99).unwrap().candidate = false;
+    o.on_event(h(99), Event::Show);
+    w.tick(1000);
+    w.set_state(99, State::Hidden);
+    if let Some(s) = o.on_event(h(99), Event::Hide) {
+        w.tick(s.delay_ms as u64);
+        o.on_event(s.hwnd, Event::Recheck);
+    }
+}
+
+/// Startup exactly as the host (main.rs) does it, including the delay before the timer fires.
+/// Returns the orchestrator and the timer it asked for last.
+fn boot(w: &Rc<World>, s: Settings) -> (Orch, Option<Schedule>) {
+    let mut o = Orchestrator::new(FB(w.clone()), FW(w.clone()), s);
+    o.set_learned(Box::new(Rec(Rc::default())));
+    o.adopt(Vec::new(), None);
+    let first = o.startup_schedule(false);
+    delay_noise(w, &mut o);
+    let Some(first) = first else { return (o, None) };
+    w.tick(first.delay_ms as u64);
+    let sch = o.on_event(first.hwnd, Event::Recheck);
+    (o, sch)
+}
+
+/// Desktop 1: Edge, File Explorer and (optionally) Outlook maximized; desktops 2 and 3 empty.
+fn user_world(outlook: bool, fg: usize) -> Rc<World> {
+    let w = World::new(3);
+    open_as(&w, 1, State::Maximized, "msedge.exe");
+    open_as(&w, 2, State::Maximized, "explorer.exe");
+    w.starts.borrow_mut().insert(1, 500);
+    w.starts.borrow_mut().insert(2, 100);
+    if outlook {
+        open_as(&w, 3, State::Maximized, "olk.exe");
+        w.starts.borrow_mut().insert(3, 300);
+    }
+    w.fg.set(fg);
+    w.activate_follows.set(true);
+    w
+}
+
+/// TradingView starts: a splash screen without a title (no candidate, but an ordinary top-level
+/// window), then the main window, shown maximized, which activates itself (Windows follows it).
+fn tradingview_starts(w: &World, o: &mut Orch) {
+    w.open(20, State::Normal);
+    proc_of(w, 20, "tradingview.exe");
+    {
+        let mut ws = w.wins.borrow_mut();
+        ws.get_mut(&20).unwrap().candidate = false;
+    }
+    w.plain.borrow_mut().push(20);
+    ev(w, o, 20, Event::Show);
+    w.tick(1500);
+    w.set_state(20, State::Destroyed);
+    ev(w, o, 20, Event::Destroy);
+    w.open(21, State::Maximized);
+    proc_of(w, 21, "tradingview.exe");
+    ev(w, o, 21, Event::Show);
+    // The app activates its main window: Windows switches the view to it.
+    let d = w.desk_of(21);
+    w.fg.set(21);
+    w.current.set(d);
+    o.poll();
+}
+
+fn outlook_starts(w: &World, o: &mut Orch) {
+    w.open(30, State::Normal);
+    proc_of(w, 30, "olk.exe");
+    ev(w, o, 30, Event::Show);
+}
+
+/// Common end state: profile desktops 2 and 3 hold their apps, the arranged windows follow
+/// (Explorer = older process first), no empty desktop anywhere, compaction done.
+fn assert_user_layout(w: &World, o: &mut Orch, outlook: usize) {
+    settle(w, o);
+    let l = w.desktops.borrow().clone();
+    assert_eq!(l.len(), 5, "1 + two profile desktops + two arranged windows: {:?}", list(w));
+    assert_eq!(w.desk_of(outlook), l[1], "Outlook on desktop 2");
+    assert_eq!(w.desk_of(21), l[2], "TradingView on desktop 3");
+    assert_eq!(w.desk_of(2), l[3], "File Explorer on desktop 4");
+    assert_eq!(w.desk_of(1), l[4], "Edge on desktop 5");
+    // A later unrelated event does not change anything (no empty profile desktop to remove).
+    delay_noise(w, o);
+    assert_eq!(*w.desktops.borrow(), l);
+}
+
+#[test]
+fn startup_user_scenario_outlook_running_edge_in_front() {
+    let w = user_world(true, 1);
+    let (mut o, _) = boot(&w, user_profile());
+    assert_eq!(*w.launched.borrow(), vec!["tradingview.exe".to_string()], "Outlook runs: not started again");
+    let l = w.desktops.borrow().clone();
+    assert_eq!(w.desk_of(3), l[1], "Outlook already on desktop 2 when the arrangement is visible");
+    tradingview_starts(&w, &mut o);
+    assert_eq!(w.desk_of(20), w.desktops.borrow()[2], "the splash screen went to TradingView's desktop");
+    assert_user_layout(&w, &mut o, 3);
+    let edge = w.desk_of(1);
+    assert_eq!(w.current.get(), edge, "the user ends with the window they had in front");
+    assert!(w.switches.borrow().iter().all(|d| *d == edge.d1), "never switched anywhere else: {:?}", w.switches.borrow());
+    assert_eq!(w.fg.get(), 1);
+}
+
+#[test]
+fn startup_user_scenario_outlook_not_running() {
+    let w = user_world(false, 1);
+    let (mut o, _) = boot(&w, user_profile());
+    assert_eq!(*w.launched.borrow(), vec!["olk.exe".to_string(), "tradingview.exe".to_string()]);
+    outlook_starts(&w, &mut o);
+    tradingview_starts(&w, &mut o);
+    assert_user_layout(&w, &mut o, 30);
+    let edge = w.desk_of(1);
+    assert_eq!(w.current.get(), edge);
+    assert!(w.switches.borrow().iter().all(|d| *d == edge.d1), "{:?}", w.switches.borrow());
+}
+
+#[test]
+fn startup_user_scenario_outlook_in_front_view_follows_it_once() {
+    let w = user_world(true, 3);
+    let (mut o, _) = boot(&w, user_profile());
+    let outlook = w.desk_of(3);
+    assert_eq!(outlook, w.desktops.borrow()[1]);
+    assert_eq!(w.current.get(), outlook, "the view went with the window the user had in front");
+    tradingview_starts(&w, &mut o);
+    assert_user_layout(&w, &mut o, 3);
+    assert_eq!(w.current.get(), outlook, "and stays there: no return to desktop 1");
+    assert!(w.switches.borrow().iter().all(|d| *d == outlook.d1), "{:?}", w.switches.borrow());
+    assert_eq!(w.fg.get(), 3);
+}
+
+
+
+#[test]
+fn startup_nothing_moves_or_compacts_before_the_sequence_and_late_maximized_windows_join_it() {
+    let w = user_world(true, 1);
+    let mut o = Orchestrator::new(FB(w.clone()), FW(w.clone()), user_profile());
+    o.adopt(Vec::new(), None);
+    let first = o.startup_schedule(true).unwrap();
+    assert_eq!(first.delay_ms, 5000, "started with Windows: the whole sequence waits");
+    delay_noise(&w, &mut o);
+    // An app restores its window maximized during the delay (e.g. at logon).
+    open_as(&w, 8, State::Maximized, "late.exe");
+    w.starts.borrow_mut().insert(8, 900);
+    ev(&w, &mut o, 8, Event::Show);
+    assert_eq!(list(&w), vec![1, 2, 3], "nothing created, nothing removed while waiting");
+    assert_eq!((w.desk_of(1), w.desk_of(8)), (g(1), g(1)), "nothing moved while waiting");
+    assert!(w.switches.borrow().is_empty());
+    w.tick(5000);
+    o.on_event(first.hwnd, Event::Recheck);
+    let l = w.desktops.borrow().clone();
+    assert_eq!(w.desk_of(3), l[1]);
+    assert_eq!((w.desk_of(2), w.desk_of(1), w.desk_of(8)), (l[3], l[4], l[5]), "the late window last (youngest process)");
+    assert!(o.is_managed(h(8)));
+}
+
+#[test]
+fn startup_profile_app_that_never_starts_keeps_its_desktop_and_nothing_else_moves() {
+    let w = user_world(true, 1);
+    let (mut o, _) = boot(&w, user_profile());
+    let edge = w.desk_of(1);
+    for _ in 0..80 {
+        w.tick(500);
+        if o.on_event(layout_tick_token(), Event::Recheck).is_none() {
+            break;
+        }
+    }
+    assert!(!o.layout_running());
+    assert!(logged(&mut o, "gave up waiting for a window of tradingview.exe"));
+    let l = w.desktops.borrow().clone();
+    assert_eq!(l.len(), 5, "desktop 3 stays the profile's (part of B), helpers behind it");
+    assert_eq!((w.desk_of(3), w.desk_of(2), w.desk_of(1)), (l[1], l[3], l[4]));
+    assert_eq!(w.current.get(), edge);
+    // The end of the run compacts once; the profile desktop is kept even when empty.
+    delay_noise(&w, &mut o);
+    assert_eq!(*w.desktops.borrow(), l);
+    // TradingView started by hand later goes to its desktop like any profile app window.
+    w.current.set(g(1));
+    w.open(40, State::Maximized);
+    proc_of(&w, 40, "tradingview.exe");
+    ev(&w, &mut o, 40, Event::Show);
+    assert!(o.is_managed(h(40)), "outside the run it is an ordinary maximized window");
+}
+
+#[test]
+fn startup_start_window_without_a_view_stays_and_is_logged() {
+    let w = user_world(true, 1);
+    let (mut o, _) = boot(&w, user_profile());
+    w.open(20, State::Normal);
+    proc_of(&w, 20, "tradingview.exe");
+    w.wins.borrow_mut().get_mut(&20).unwrap().candidate = false;
+    w.wins.borrow_mut().get_mut(&20).unwrap().can_move = false;
+    w.plain.borrow_mut().push(20);
+    let here = w.current.get();
+    ev(&w, &mut o, 20, Event::Show);
+    assert_eq!(w.desk_of(20), here);
+    assert!(logged(&mut o, "cannot be moved; visible here until it closes"));
+    // Seen once: later events of it are not tried again.
+    let calls = w.can_move_calls.get();
+    ev(&w, &mut o, 20, Loc);
+    assert_eq!(w.can_move_calls.get(), calls);
+}
+
+#[test]
+fn startup_does_not_switch_when_the_foreground_window_was_not_moved() {
+    let w = user_world(true, 0);
+    put(&w, 9, 1);
+    proc_of(&w, 9, "notes.exe");
+    w.fg.set(9);
+    let (mut o, _) = boot(&w, user_profile());
+    tradingview_starts(&w, &mut o);
+    settle(&w, &mut o);
+    assert_eq!(w.current.get(), g(1), "the user stays on desktop 1 with their window");
+    assert!(w.switches.borrow().iter().all(|d| *d == 1), "only the guard's return: {:?}", w.switches.borrow());
+    assert_eq!(w.fg.get(), 9);
+}
+
+#[test]
+fn startup_debug_filter_moves_only_the_named_processes() {
+    let w = World::new(2);
+    open_as(&w, 1, State::Maximized, "user.exe");
+    open_as(&w, 2, State::Maximized, "test-a.exe");
+    put(&w, 3, 2); // a user's window on another desktop does not stop the arrangement of test windows
+    let mut o = Orchestrator::new(FB(w.clone()), FW(w.clone()), Settings::default());
+    o.set_only(vec!["test-a.exe".into()]);
+    o.adopt(Vec::new(), None);
+    let s = o.startup_schedule(false).unwrap();
+    o.on_event(s.hwnd, Event::Recheck);
+    assert_eq!((w.desk_of(1), w.desk_of(2), w.desk_of(3)), (g(1), g(3), g(2)));
+    assert_eq!(list(&w), vec![1, 2, 3], "the user's desktop 2 is never taken or removed");
+    // Later maximizing a user's window does nothing either.
+    w.set_state(1, State::Normal);
+    ev(&w, &mut o, 1, Loc);
+    w.set_state(1, State::Maximized);
+    ev(&w, &mut o, 1, Loc);
+    assert_eq!(w.desk_of(1), g(1));
+}
+
+#[test]
+fn settings_log_key_default_off_tolerant_and_kept() {
+    assert!(!Settings::default().log);
+    assert!(!Settings::from_json("{}").unwrap().log);
+    assert!(!Settings::from_json("{\"log\": \"yes\"}").unwrap().log, "wrong type keeps the default");
+    assert!(!Settings::default().to_json().contains("\"log\""), "not written while off");
+    let s = Settings::from_json("{\"log\": true}").unwrap();
+    assert!(s.log);
+    assert!(Settings::from_json(&s.to_json()).unwrap().log, "kept when the dialog saves");
 }

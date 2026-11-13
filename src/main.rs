@@ -199,6 +199,9 @@ fn show_support(main: HWND, forced: bool) {
     }
 }
 
+/// The log is kept below this size: a full `log.txt` becomes `log.old.txt` (replacing it).
+const LOG_MAX_BYTES: u64 = 1024 * 1024;
+
 fn log_line(line: &str) {
     if !LOGGING.load(Relaxed) {
         return;
@@ -206,13 +209,24 @@ fn log_line(line: &str) {
     let Some(dir) = app_dir() else {
         return;
     };
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(dir.join("log.txt"))
-    {
-        let _ = writeln!(f, "{line}");
+    let path = dir.join("log.txt");
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() >= LOG_MAX_BYTES) {
+        let _ = std::fs::rename(&path, dir.join("log.old.txt"));
     }
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let mut t: windows_sys::Win32::Foundation::SYSTEMTIME = unsafe { std::mem::zeroed() };
+        unsafe { windows_sys::Win32::System::SystemInformation::GetLocalTime(&mut t) };
+        let _ = writeln!(
+            f,
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03} {line}",
+            t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond, t.wMilliseconds
+        );
+    }
+}
+
+/// Log on when built for debugging, `AUTOSPACES_LOG=1`, or `"log": true` in settings.json.
+fn logging_wanted(settings_log: bool) -> bool {
+    cfg!(debug_assertions) || settings_log || std::env::var("AUTOSPACES_LOG").is_ok_and(|v| v == "1")
 }
 
 fn orch() -> Option<&'static mut Orch> {
@@ -279,6 +293,7 @@ fn open_settings(hwnd: HWND) {
             log_line(&format!("settings.json not saved: {e}"));
         }
     }
+    LOGGING.store(logging_wanted(out.settings.log), Relaxed);
     o.apply_settings(out.settings);
     // "Apply now": the profile is applied at once (the timer, if any, only runs while apps are awaited).
     let sch = if out.apply_now { o.start_layout() } else { None };
@@ -313,7 +328,21 @@ fn new_orchestrator(b: desktops::InternalBackend) -> Orch {
     let mut o = Orchestrator::new(b, Win32Windows::new(), settings);
     o.set_learned(learned);
     o.settings.enabled = tray::ENABLED.load(Relaxed);
+    // Debug builds only: live tests move nothing but their own test processes.
+    #[cfg(debug_assertions)]
+    if let Ok(v) = std::env::var("AUTOSPACES_ONLY") {
+        let names: Vec<String> = v.split(',').map(core::settings::norm_process).filter(|p| !p.is_empty()).collect();
+        log_line(&format!("debug: only these processes are moved: {}", names.join(", ")));
+        o.set_only(names);
+    }
     o
+}
+
+/// After `adopt` at startup: schedules the startup sequence (plan 12.11 + 12.7).
+fn begin_startup(main: HWND, o: &mut Orch) {
+    let at_logon = windowing::system::started_with_windows();
+    let sch = o.startup_schedule(at_logon);
+    after_orchestrator(main, o, sch);
 }
 
 fn flush_state(o: &mut Orch) {
@@ -422,10 +451,14 @@ fn reinit_backend(main: HWND) {
                     o.reconcile();
                 }
                 None => {
+                    // The backend was not ready at startup: this is the app's real start.
                     let mut o = new_orchestrator(b);
                     let st = load_state();
                     o.adopt(st.spaces, st.baseline);
                     *std::ptr::addr_of_mut!(ORCH) = Some(o);
+                    if let Some(o) = orch() {
+                        begin_startup(main, o);
+                    }
                 }
             }
             if let Some(o) = orch() {
@@ -591,10 +624,7 @@ const SINGLE_INSTANCE: &str = r"Local\AutoSpaces_SingleInstance";
 const WINDOW_CLASS: &str = "AutoSpacesHiddenWindow";
 
 fn main() {
-    LOGGING.store(
-        cfg!(debug_assertions) || std::env::var("AUTOSPACES_LOG").is_ok_and(|v| v == "1"),
-        Relaxed,
-    );
+    LOGGING.store(logging_wanted(settings_path().is_some_and(|p| Settings::load(&p).log)), Relaxed);
     if std::env::args().nth(1).as_deref() == Some("--selftest") {
         let apartment = desktops::Apartment::init();
         let code = selftest::run();
@@ -664,9 +694,8 @@ fn main() {
                 o.adopt(st.spaces, st.baseline);
                 *std::ptr::addr_of_mut!(ORCH) = Some(o);
                 if let Some(o) = orch() {
-                    // Layout profile (plan 12.7): applied after the configured delay, only when enabled.
-                    let sch = o.layout_start_schedule();
-                    after_orchestrator(hwnd, o, sch);
+                    // Arrangement + layout profile as one sequence, after the delay (plan 12.11).
+                    begin_startup(hwnd, o);
                 }
             }
             None => {

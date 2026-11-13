@@ -29,6 +29,7 @@ const IDD_SETTINGS: u16 = 101;
 const IDD_PICK: u16 = 102;
 const ID_MODE_ALL: i32 = 110;
 const ID_MODE_FS: i32 = 111;
+const ID_ARRANGE: i32 = 134;
 const ID_EXCL_LIST: i32 = 120;
 const ID_EXCL_ADD: i32 = 121;
 const ID_EXCL_DEL: i32 = 122;
@@ -86,11 +87,13 @@ struct Dlg {
     capture: fn() -> (usize, Vec<LayoutRule>),
 }
 
+const EXPLORER: &str = "explorer.exe";
+
 /// Running apps for the picker: one row per process, minus excluded ones, sorted by name.
 pub fn picker_entries(raw: Vec<(String, String)>, excluded: &[String], own: &str) -> Vec<(String, String)> {
     let mut v: Vec<(String, String)> = Vec::new();
     for (p, t) in raw {
-        if p.is_empty() || p == own || SYSTEM_HOSTS.contains(&p.as_str()) || excluded.contains(&p) || v.iter().any(|(q, _)| *q == p) {
+        if p.is_empty() || p == own || (p != EXPLORER && SYSTEM_HOSTS.contains(&p.as_str())) || excluded.contains(&p) || v.iter().any(|(q, _)| *q == p) {
             continue;
         }
         v.push((p, t));
@@ -200,6 +203,7 @@ unsafe fn init(dlg: HWND, d: &Dlg) {
         list_add(dlg, ID_LEARNED_LIST, &display_label(p, n), i);
     }
     CheckDlgButton(dlg, ID_LEARNING, check(d.settings.learning));
+    CheckDlgButton(dlg, ID_ARRANGE, check(d.settings.arrange_at_start));
     // Autostart is read from the system, not from settings.json.
     CheckDlgButton(dlg, ID_AUTOSTART, check(sysopts::autostart_enabled()));
     // Language: automatic, then every language under its own name.
@@ -223,6 +227,7 @@ unsafe fn collect(dlg: HWND, d: &mut Dlg) {
         }
     }
     s.learning = IsDlgButtonChecked(dlg, ID_LEARNING) == BST_CHECKED;
+    s.arrange_at_start = IsDlgButtonChecked(dlg, ID_ARRANGE) == BST_CHECKED;
     s.autostart = IsDlgButtonChecked(dlg, ID_AUTOSTART) == BST_CHECKED;
     let sel = SendDlgItemMessageW(dlg, ID_LANGUAGE, CB_GETCURSEL, 0, 0);
     s.language = if sel < 0 { d.settings.language } else { Pref::from_index(sel as usize) };
@@ -392,7 +397,7 @@ pub fn running_apps_full() -> Vec<(String, String, String)> {
     }
     seen.into_iter()
         .map(|(p, pid, title)| {
-            let name = ws.app_name(pid);
+            let name = if p == EXPLORER { t(Key::FileExplorer).to_string() } else { ws.app_name(pid) };
             (p, if name.is_empty() { title } else { name }, ws.launch_command(pid))
         })
         .collect()
@@ -679,11 +684,15 @@ mod tests {
             ("".to_string(), "unknown".to_string()),
             ("autospaces.exe".to_string(), "me".to_string()),
             ("x.exe".to_string(), "excluded".to_string()),
-            ("explorer.exe".to_string(), "e".to_string()),
+            ("explorer.exe".to_string(), "File Explorer".to_string()),
             ("systemsettings.exe".to_string(), "s".to_string()),
             ("autospaces.exe".to_string(), "a".to_string()),
         ];
         let v = picker_entries(raw, &["x.exe".to_string()], "autospaces.exe");
-        assert_eq!(v, vec![("a.exe".to_string(), "A".to_string()), ("b.exe".to_string(), "B1".to_string())]);
+        assert_eq!(v, vec![
+                ("a.exe".to_string(), "A".to_string()),
+                ("b.exe".to_string(), "B1".to_string()),
+                ("explorer.exe".to_string(), "File Explorer".to_string())
+            ]);
     }
 }

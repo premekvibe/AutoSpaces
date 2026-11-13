@@ -149,6 +149,7 @@ strings! {
     MenuExit => ["Ukončit", "Exit"],
     // Settings dialogs
     AppName => ["AutoSpaces", "AutoSpaces"],
+    FileExplorer => ["Průzkumník souborů", "File Explorer"],
     LangAuto => ["Automaticky", "Automatic"],
     // Long paragraphs of the dialogs (RC would cut them at 256 characters)
     SettingsHint => [

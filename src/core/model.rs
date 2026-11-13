@@ -74,6 +74,10 @@ pub trait WindowSystem {
     fn app_name(&self, _pid: u32) -> String {
         String::new()
     }
+    /// Start time of process `pid` (FILETIME, 100 ns units); 0 when unknown.
+    fn process_started(&self, _pid: u32) -> u64 {
+        0
+    }
     /// Full path of the exe of process `pid`; empty when unknown.
     fn exe_path(&self, _pid: u32) -> String {
         String::new()
@@ -106,6 +110,11 @@ pub trait WindowSystem {
     /// Maximizes without activating (asynchronous; the window's thread may be busy).
     /// False when the window cannot be maximized (no maximize box, e.g. a splash screen).
     fn maximize_inactive(&self, _hwnd: HWND) -> bool {
+        false
+    }
+    /// A visible, unowned top-level window that may not be a candidate (a splash screen without
+    /// a title): the profile moves such windows of the apps it launches.
+    fn is_plain_toplevel(&self, _hwnd: HWND) -> bool {
         false
     }
 }

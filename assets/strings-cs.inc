@@ -9,6 +9,7 @@
 #define T_CS_SET_GRP_TRIGGER "Co spouští přesun na samostatnou plochu"
 #define T_CS_SET_MODE_ALL "Všechna maximalizovaná okna i celoobrazovkový režim"
 #define T_CS_SET_MODE_FS "Jen celoobrazovkový režim (např. F11 v prohlížeči)"
+#define T_CS_SET_ARRANGE "Po spuštění rozmístit už maximalizovaná okna na samostatné plochy"
 #define T_CS_SET_GRP_EXCL "Vyloučené aplikace (okna zůstávají, kde jsou)"
 #define T_CS_SET_GRP_LEARNED "Naučené výjimky (aplikace, které se nepodařilo přesunout)"
 #define T_CS_SET_LEARNING "Učit se z neúspěšných přesunů"

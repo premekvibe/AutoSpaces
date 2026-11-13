@@ -42,12 +42,17 @@ const LAYOUT_FLASH_TICK_MS: u32 = 120;
 /// after a splash screen) go to its desktop, and focus / view taken by it are given back.
 const LAYOUT_SETTLE_MS: u64 = 10_000;
 const MAX_PROFILE_MAXIMIZE: u8 = 3;
+/// Startup sequence after a manual start (the windows exist already; only the Start menu or
+/// Explorer that launched us has to give the foreground back). After a start with Windows the
+/// profile's `startDelayMs` applies to the whole sequence instead.
+const MANUAL_START_MS: u32 = 500;
+const MAX_NOTES: usize = 512;
 
-/// Pseudo window handles of the host timers of the layout profile (never real windows).
+/// Pseudo window handles of the host timers (never real windows).
 pub fn layout_tick_token() -> HWND {
     (usize::MAX - 1) as HWND
 }
-pub fn layout_start_token() -> HWND {
+pub fn startup_token() -> HWND {
     (usize::MAX - 2) as HWND
 }
 
@@ -69,6 +74,10 @@ struct LayoutRun {
     user_fg_pid: u32,
     /// A window waits for its application view: the timer runs fast meanwhile.
     fast: bool,
+    /// Rules without a running window: launched by `launch_missing`.
+    to_launch: Vec<usize>,
+    /// Non-candidate windows of launched apps (splash screens) already moved or given up.
+    plain_seen: Vec<HWND>,
 }
 
 /// A window the profile placed.
@@ -125,6 +134,16 @@ pub struct Orchestrator<B: DesktopBackend, W: WindowSystem> {
     shown: HashMap<HWND, u64>,
     /// Maximized windows waiting for their application view: attempts so far.
     view_waits: HashMap<HWND, u8>,
+    /// Startup arrangement (plan 12.11) is running: no view switch, no focus change, no learning.
+    bulk: bool,
+    /// The startup sequence is scheduled or running: compaction waits for its end.
+    hold: bool,
+    /// The startup sequence is scheduled and has not run yet.
+    startup_pending: bool,
+    /// Windows maximized while the startup sequence was pending: arranged by it.
+    deferred: Vec<HWND>,
+    /// Debug builds only: windows of other processes are never moved (live tests).
+    only: Option<Vec<String>>,
     log: Vec<String>,
 }
 
@@ -154,8 +173,23 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
             struck: HashSet::new(),
             shown: HashMap::new(),
             view_waits: HashMap::new(),
+            bulk: false,
+            hold: false,
+            startup_pending: false,
+            deferred: Vec::new(),
+            only: None,
             log: Vec::new(),
         }
+    }
+
+    /// Debug builds (`AUTOSPACES_ONLY`): only windows of these processes are ever moved, and the
+    /// startup arrangement looks only at them. Compaction still sees every window.
+    #[allow(dead_code)]
+    pub fn set_only(&mut self, names: Vec<String>) {
+        self.only = Some(names);
+    }
+    fn allowed(&self, process: &str) -> bool {
+        self.only.as_ref().is_none_or(|l| l.iter().any(|p| p == process))
     }
 
     pub fn set_learned(&mut self, l: Box<dyn Learned>) {
@@ -196,6 +230,12 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
     /// Gives every managed window back to its (resolved) origin, switches there when the user
     /// is viewing a helper desktop, then compacts. Leaves the managed list empty.
     pub fn give_back_all(&mut self) {
+        // Leaving: nothing of the startup sequence or the profile run is waited for any more.
+        self.hold = false;
+        self.startup_pending = false;
+        if self.layout.take().is_some() {
+            self.ws.hold_foreground(false);
+        }
         let Some(list) = self.sync_list() else { return };
         let all = self.snapshot();
         let targets: Vec<Guid> = all.iter().map(|sp| self.resolve_origin(sp.origin, &list)).collect();
@@ -265,7 +305,7 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
     }
 
     fn note(&mut self, s: String) {
-        if self.log.len() < 64 {
+        if self.log.len() < MAX_NOTES {
             self.log.push(s);
         }
     }
@@ -280,8 +320,8 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
         if hwnd == layout_tick_token() {
             return self.layout_tick();
         }
-        if hwnd == layout_start_token() {
-            return self.start_layout();
+        if hwnd == startup_token() {
+            return self.run_startup();
         }
         match ev {
             Event::Destroy => {
@@ -416,12 +456,217 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
             self.rejected.insert(hwnd); // profile windows keep the desktop the profile gave them
             return None;
         }
+        // Maximized before the startup sequence ran: it gets its desktop from the sequence,
+        // behind the profile's desktops (plan 12.11).
+        if self.startup_pending {
+            if !self.deferred.contains(&hwnd) && self.deferred.len() < MAX_TRACKED {
+                self.note(format!("startup: {:#x} maximized before the startup sequence; deferred", hwnd as usize));
+                self.deferred.push(hwnd);
+            }
+            return None;
+        }
         // Fullscreen is detected geometrically, so let the window settle first;
         // maximize is a discrete state and is acted on immediately.
         if state == State::Fullscreen && ev != Event::Recheck && s.fullscreen_settle_ms > 0 {
             return Some(Schedule { hwnd, delay_ms: s.fullscreen_settle_ms });
         }
         self.enter_space(hwnd, state == State::Fullscreen)
+    }
+
+    // ------------------------------------------------------------ startup sequence (plan 12.11 + 12.7)
+
+    /// Host timer request right after `adopt`: when to run the startup sequence (arrangement of
+    /// already maximized windows + layout profile, as one step). `at_logon` = started with
+    /// Windows: the profile's `startDelayMs` applies (apps are still starting and restoring their
+    /// windows); a manual start runs it after `MANUAL_START_MS`. None = nothing to do at startup.
+    /// Until it has run, compaction waits and newly maximized windows are deferred to it.
+    pub fn startup_schedule(&mut self, at_logon: bool) -> Option<Schedule> {
+        let s = &self.settings;
+        if !s.layout.enabled && !(s.enabled && s.arrange_at_start) {
+            return None;
+        }
+        let delay_ms = if at_logon { s.layout.start_delay_ms.max(10) } else { MANUAL_START_MS };
+        self.hold = true;
+        self.startup_pending = true;
+        self.note(format!(
+            "startup: sequence in {delay_ms} ms ({})",
+            if at_logon { "started with Windows" } else { "manual start" }
+        ));
+        Some(Schedule { hwnd: startup_token(), delay_ms })
+    }
+
+    /// "#k {guid}" of a desktop (k = 1-based position now; "#?" when not in the list).
+    fn desk_label(&self, d: Guid) -> String {
+        match self.backend.desktops().ok().and_then(|l| l.iter().position(|x| *x == d)) {
+            Some(i) => format!("#{} {d}", i + 1),
+            None => format!("#? {d}"),
+        }
+    }
+
+    fn window_label(&self, w: HWND) -> String {
+        if w.is_null() {
+            return "none".into();
+        }
+        format!("{:#x} {} {}", w as usize, self.ws.process(w).0, self.ws.class(w))
+    }
+
+    fn note_desktops(&mut self, what: &str) {
+        let list = self.backend.desktops().unwrap_or_default();
+        let cur = self.backend.current().ok().map_or("?".into(), |c| self.desk_label(c));
+        let ids: Vec<String> = list.iter().map(|d| d.to_string()).collect();
+        self.note(format!(
+            "{what}: {} desktop(s) [{}], viewing {cur}, baseline {}, profile desktops {}",
+            list.len(),
+            ids.join(", "),
+            self.baseline,
+            self.pinned
+        ));
+    }
+
+    /// The startup sequence (one coordinated step): (1) the windows to arrange are chosen while
+    /// nothing has moved yet; (2) the profile completes its desktops 2..N and moves the windows
+    /// of profile apps that run; (3) the other maximized windows get desktops behind the
+    /// profile's, oldest process first; (4) the view switches at most once, to the desktop of the
+    /// window the user had in front if it was moved; (5) missing profile apps are launched (their
+    /// windows appear on the desktop now viewed and are moved at once). Compaction runs once at
+    /// the very end (after the profile run).
+    fn run_startup(&mut self) -> Option<Schedule> {
+        if !self.startup_pending {
+            return None;
+        }
+        self.startup_pending = false;
+        let deferred = std::mem::take(&mut self.deferred);
+        if self.reinit || self.baseline == 0 {
+            self.note("startup: backend not ready; sequence skipped".into());
+            self.hold = false;
+            self.compact(None);
+            return None;
+        }
+        let fg = self.ws.foreground();
+        self.note_desktops("startup: begin");
+        let fg_label = self.window_label(fg);
+        self.note(format!("startup: foreground {fg_label}"));
+        let found = self.arrange_candidates(&deferred);
+        let mut run = if self.settings.layout.enabled { self.begin_layout() } else { None };
+        self.arrange(found);
+        // One switch at most: to the window the user had in front, when it was moved.
+        let target = self
+            .by_window
+            .get(&fg)
+            .copied()
+            .or_else(|| run.as_ref().filter(|r| r.claimed.iter().any(|c| c.hwnd == fg)).and_then(|_| self.backend.window_desktop(fg)));
+        if let Some(t) = target {
+            if self.backend.current().ok() != Some(t) {
+                match self.backend.switch(t, false) {
+                    Ok(()) => {
+                        let l = self.desk_label(t);
+                        self.note(format!("view: -> {l} (startup: the foreground window {fg_label} was moved there)"));
+                    }
+                    Err(e) => self.note(format!("view: switch failed: {e}")),
+                }
+            }
+            self.ws.activate(fg);
+        }
+        self.hold = false;
+        let Some(mut r) = run.take() else {
+            self.compact(None);
+            self.note_desktops("startup: done");
+            return None;
+        };
+        // The profile's guard keeps the user here (not on the desktop viewed before the sequence).
+        r.return_to = self.backend.current().ok();
+        r.user_fg = fg;
+        r.user_fg_pid = if fg.is_null() { 0 } else { self.ws.process(fg).1 };
+        self.ws.hold_foreground(true);
+        self.launch_missing(&mut r);
+        self.layout_continue(r)
+    }
+
+    /// Windows the startup sequence arranges, oldest process first (ties: z-order, top first):
+    /// all maximized / fullscreen windows (per the launch mode) when the app windows are on one
+    /// desktop at most (empty desktops do not count: plan 12.1 "occupied") and no state was
+    /// adopted, plus the windows maximized while the sequence was pending. Windows of profile
+    /// apps are left to the profile.
+    fn arrange_candidates(&mut self, deferred: &[HWND]) -> Vec<(u64, HWND, bool)> {
+        let s = &self.settings;
+        if !s.enabled {
+            return Vec::new();
+        }
+        let wins = self.ws.app_windows();
+        let mut all = s.arrange_at_start && self.spaces.is_empty();
+        if all {
+            // Occupied desktops, among the windows that may be moved at all (debug filter).
+            let mut occ: HashSet<Guid> = HashSet::new();
+            for &w in &wins {
+                if self.allowed(&self.ws.process(w).0) {
+                    if let Some(g) = self.backend.window_desktop(w).filter(|g| !g.is_zero()) {
+                        occ.insert(g);
+                    }
+                }
+            }
+            if occ.len() > 1 {
+                self.note(format!("startup: windows on {} desktops: the user's own layout, nothing arranged", occ.len()));
+                all = false;
+            }
+        } else if s.arrange_at_start {
+            self.note("startup: adopted state: nothing arranged".into());
+        }
+        let mut found: Vec<(u64, HWND, bool)> = Vec::new();
+        for w in wins {
+            if !all && !deferred.contains(&w) {
+                continue;
+            }
+            let s = &self.settings;
+            let fullscreen = match self.ws.state(w) {
+                State::Maximized if s.trigger_on_maximize => false,
+                State::Fullscreen if s.trigger_on_fullscreen => true,
+                _ => continue,
+            };
+            if self.by_window.contains_key(&w) || self.profile_windows.contains(&w) {
+                continue;
+            }
+            let (process, pid) = self.ws.process(w);
+            if !self.allowed(&process) {
+                continue;
+            }
+            if s.layout.enabled && s.layout.rules.iter().any(|r| r.process == process) {
+                continue; // the layout profile places this app
+            }
+            let t = self.ws.process_started(pid);
+            found.push((if t == 0 { u64::MAX } else { t }, w, fullscreen));
+        }
+        found.sort_by_key(|f| f.0); // stable: equal start times keep the z-order
+        found
+    }
+
+    /// Gives each window a desktop of its own by the ordinary enter path, in bulk: no animation,
+    /// no view switch, no activation, nothing learned. Empty desktops are used before new ones,
+    /// except the profile's (they are pinned by then).
+    fn arrange(&mut self, found: Vec<(u64, HWND, bool)>) {
+        if found.is_empty() {
+            return;
+        }
+        self.bulk = true;
+        let mut moved = 0;
+        for (_, w, fullscreen) in found {
+            let label = self.window_label(w);
+            self.rejected.remove(&w);
+            self.enter_space(w, fullscreen);
+            match self.by_window.get(&w).copied() {
+                Some(d) => {
+                    moved += 1;
+                    let l = self.desk_label(d);
+                    self.note(format!("startup: {label} -> {l}"));
+                }
+                None => {
+                    self.view_waits.remove(&w);
+                    self.rejected.insert(w); // stays where it is until restored
+                    self.note(format!("startup: {label} stays (not moved)"));
+                }
+            }
+        }
+        self.bulk = false;
+        self.note(format!("startup: arranged {moved} window(s)"));
     }
 
     // ------------------------------------------------------------ enter
@@ -432,6 +677,10 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
         let class = self.ws.class(hwnd);
         if is_system_window(&process, &class) {
             self.rejected.insert(hwnd); // lock screen, touch keyboard, shell: never touched
+            return None;
+        }
+        if !self.allowed(&process) {
+            self.rejected.insert(hwnd); // debug filter (live tests): not one of the test processes
             return None;
         }
         if self.settings.is_excluded(&process) {
@@ -488,7 +737,7 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
                 return None;
             }
         }
-        let viewing = cur == origin;
+        let viewing = cur == origin && !self.bulk;
         let (d, created) = match self.find_empty(origin) {
             Some(d) => (d, false),
             None => (self.do_create().ok()?, true),
@@ -509,7 +758,9 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
             self.rollback(hwnd, d, origin, created);
             return None;
         }
-        self.ws.activate(hwnd);
+        if !self.bulk {
+            self.ws.activate(hwnd);
+        }
         let entered_at = self.ws.now();
         self.note(format!("enter {:#x} {process} {class} {origin} -> {d}", hwnd as usize));
         self.spaces
@@ -539,7 +790,7 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
     /// viewed, shown more than `YOUNG_MS` ago, no profile run or Explorer restart going on, not a
     /// system window, and at most once per window (one odd window never blocks its app alone).
     fn counts_for_learning(&mut self, hwnd: HWND, process: &str, class: &str) -> bool {
-        if !self.settings.learning || self.reinit || self.layout.is_some() || never_learn(process, class) {
+        if !self.settings.learning || self.reinit || self.bulk || self.layout.is_some() || never_learn(process, class) {
             return false;
         }
         let now = self.ws.now();
@@ -577,7 +828,7 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
     /// Feeds the learned list, unless learning is off, the backend is being re-initialised, the
     /// profile is being applied or the window is a system one.
     fn record(&mut self, process: &str, class: &str, pid: u32, reason: FailReason) {
-        if !self.settings.learning || self.reinit || self.layout.is_some() || never_learn(process, class) {
+        if !self.settings.learning || self.reinit || self.bulk || self.layout.is_some() || never_learn(process, class) {
             return;
         }
         let stamp = self.ws.exe_stamp(pid);
@@ -715,8 +966,10 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
     /// Invariants 1-5 of plan 12.1. `hint` = (desktop, where to go) for the case that the
     /// desktop the user is viewing is removed because a managed window just left it.
     fn compact(&mut self, hint: Option<(Guid, Guid)>) {
-        if self.layout.is_some() {
-            self.need_compact = true; // paused while the profile is being applied (plan 12.7)
+        if self.hold || self.layout.is_some() {
+            // Paused while the startup sequence or the profile runs (plan 12.7 / 12.11): done
+            // once at their end.
+            self.need_compact = true;
             return;
         }
         self.need_compact = false;
@@ -935,23 +1188,33 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
         list.into_iter().filter(|d| !self.spaces.contains_key(d)).nth(k.max(1) as usize - 1)
     }
 
-    /// Host timer request: when to start the profile after launch (None = profile is off).
-    pub fn layout_start_schedule(&self) -> Option<Schedule> {
-        self.settings
-            .layout
-            .enabled
-            .then(|| Schedule { hwnd: layout_start_token(), delay_ms: self.settings.layout.start_delay_ms.max(10) })
-    }
-
-    /// True while launched profile applications are still awaited or settling.
+    /// True while the startup sequence is pending or launched profile applications are still
+    /// awaited or settling.
     pub fn layout_running(&self) -> bool {
-        self.layout.is_some()
+        self.layout.is_some() || self.startup_pending
     }
 
-    /// Applies the profile now: completes the desktops, moves and maximizes the windows of
-    /// running applications, launches the others and awaits their windows by events (plus a short timer
-    /// that only runs meanwhile). Returns the timer request for the host. Never switches the view.
+    /// Applies the profile now ("Apply now"): completes the desktops, moves and maximizes the
+    /// windows of running applications, launches the others and awaits their windows by events
+    /// (plus a short timer that only runs meanwhile). Returns the timer request for the host.
+    /// Never switches the view. While the startup sequence is still pending it runs that instead.
     pub fn start_layout(&mut self) -> Option<Schedule> {
+        if self.startup_pending {
+            return self.run_startup();
+        }
+        self.layout = None;
+        self.ws.hold_foreground(true);
+        let Some(mut run) = self.begin_layout() else {
+            self.ws.hold_foreground(false);
+            return None;
+        };
+        self.launch_missing(&mut run);
+        self.layout_continue(run)
+    }
+
+    /// First part of applying the profile: completes the desktops 2..N (pinned from now on),
+    /// moves and maximizes the windows of running profile apps. Launches nothing.
+    fn begin_layout(&mut self) -> Option<LayoutRun> {
         if self.reinit || self.baseline == 0 {
             self.note("layout: backend not ready".into());
             return None;
@@ -992,37 +1255,48 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
             user_fg,
             user_fg_pid,
             fast: false,
+            to_launch: Vec::new(),
+            plain_seen: Vec::new(),
         };
         let deadline = self.ws.now() + LAYOUT_TIMEOUT_MS;
-        self.ws.hold_foreground(true);
         for i in 0..run.rules.len() {
             let process = run.rules[i].process.clone();
             match self.layout_find(&run, &wins, &process) {
                 // A running app is not started again: its window (the first unclaimed one, in
                 // window enumeration order) is moved and maximized like a launched one, also when
                 // minimized or on another desktop. If it is the user's foreground window, it still
-                // moves and the view stays (consistent: the profile never switches the view).
+                // moves (the startup sequence then takes the view along, "Apply now" does not).
                 Some(w) => {
                     if self.place(&mut run, i, w, true) == Placed::NotYet {
                         run.pending.push((i, deadline, true));
                     }
                 }
-                None => {
-                    let (cmd, args) = (run.rules[i].launch.clone(), run.rules[i].args.clone());
-                    if self.ws.launch(&cmd, &args) {
-                        self.note(format!("layout: launched {cmd}"));
-                        run.pending.push((i, deadline, true));
-                    } else {
-                        self.note(format!("layout: cannot launch {cmd}"));
-                    }
-                }
+                None => run.to_launch.push(i),
             }
         }
-        self.layout_continue(run)
+        Some(run)
+    }
+
+    /// Second part: launches the apps of the profile that do not run.
+    fn launch_missing(&mut self, run: &mut LayoutRun) {
+        let deadline = self.ws.now() + LAYOUT_TIMEOUT_MS;
+        for i in std::mem::take(&mut run.to_launch) {
+            let (cmd, args) = (run.rules[i].launch.clone(), run.rules[i].args.clone());
+            if self.ws.launch(&cmd, &args) {
+                let target = self.layout_target(run.rules[i].desktop).map_or("?".into(), |d| self.desk_label(d));
+                self.note(format!("layout: launched {cmd} for desktop {} ({target})", run.rules[i].desktop));
+                run.pending.push((i, deadline, true));
+            } else {
+                self.note(format!("layout: cannot launch {cmd}"));
+            }
+        }
     }
 
     /// A window of `process` that is not yet claimed and not managed.
     fn layout_find(&self, run: &LayoutRun, wins: &[HWND], process: &str) -> Option<HWND> {
+        if !self.allowed(process) {
+            return None;
+        }
         wins.iter().copied().find(|w| {
             !run.claimed.iter().any(|c| c.hwnd == *w) && !self.by_window.contains_key(w) && self.ws.process(*w).0 == process
         })
@@ -1033,6 +1307,9 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
     /// never moves it to a helper desktop (plan 12.7).
     fn place(&mut self, run: &mut LayoutRun, i: usize, hwnd: HWND, maximize: bool) -> Placed {
         let (desk, proc) = (run.rules[i].desktop, run.rules[i].process.clone());
+        if !self.allowed(&proc) {
+            return Placed::No;
+        }
         let Some(target) = self.layout_target(desk) else {
             self.note(format!("layout: {proc}: desktop {desk} does not exist"));
             return Placed::No;
@@ -1063,7 +1340,8 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
                 return Placed::No;
             }
         }
-        self.note(format!("layout: {proc} {:#x} -> desktop {desk}", hwnd as usize));
+        let l = self.desk_label(target);
+        self.note(format!("layout: {proc} {:#x} {} -> desktop {desk} ({l})", hwnd as usize, self.ws.class(hwnd)));
         run.claimed.push(Claim { hwnd, maximize, tries: 0 });
         self.profile_windows.insert(hwnd);
         self.rejected.insert(hwnd);
@@ -1109,18 +1387,30 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
                     let p = self.ws.process(fg).0;
                     run.rules.iter().any(|r| r.process == p)
                 }));
+        let mut cur = cur;
         if let Some(rt) = run.return_to {
             if cur != rt {
                 if by_app {
                     if self.backend.desktops().is_ok_and(|l| l.contains(&rt)) && self.backend.switch(rt, false).is_ok() {
-                        self.note(format!("layout: view returned to {rt} (an app activated its window)"));
+                        let (l, who) = (self.desk_label(rt), self.window_label(fg));
+                        self.note(format!("view: returned to {l} ({who} of a profile app activated itself)"));
+                        cur = rt;
                     }
                 } else if !fg.is_null() {
+                    let l = self.desk_label(cur);
+                    self.note(format!("layout: the user went to {l}; the view stays there"));
                     run.return_to = Some(cur);
                 }
             }
         }
-        if by_app && fg != run.user_fg && !run.user_fg.is_null() && self.ws.is_alive(run.user_fg, run.user_fg_pid) {
+        // Focus back only to a window on the desktop being viewed: activating a window on another
+        // desktop would make Windows switch the view to it.
+        if by_app
+            && fg != run.user_fg
+            && !run.user_fg.is_null()
+            && self.ws.is_alive(run.user_fg, run.user_fg_pid)
+            && self.backend.window_desktop(run.user_fg).is_none_or(|d| d.is_zero() || d == cur)
+        {
             self.ws.activate(run.user_fg);
         }
     }
@@ -1153,9 +1443,11 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
         self.layout_guard(&mut run);
         self.note("layout: done".into());
         self.dirty = true;
+        self.hold = false;
         if self.settings.enabled {
             self.compact(None);
         }
+        self.note_desktops("layout: end");
     }
 
     /// A window event while the profile runs. `Some(timer)` = the event was the profile's
@@ -1180,8 +1472,11 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
             self.layout_maximize(run, c);
             return true;
         }
-        if self.by_window.contains_key(&hwnd) || !self.ws.is_candidate(hwnd) {
+        if self.by_window.contains_key(&hwnd) {
             return false;
+        }
+        if !self.ws.is_candidate(hwnd) {
+            return self.layout_plain(run, hwnd);
         }
         let process = self.ws.process(hwnd).0;
         let now = self.ws.now();
@@ -1209,6 +1504,52 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
             Some(&(i, _)) => self.place(run, i, hwnd, true) != Placed::No,
             None => false,
         }
+    }
+
+    /// A window of an awaited or just launched profile app that is no candidate (a splash screen
+    /// without a title, a borderless start window): Windows shows it on the desktop being viewed,
+    /// so it goes to the app's desktop as soon as it can be moved (never claimed or maximized).
+    /// One without an application view (tool windows) cannot be moved and stays visible here
+    /// until it closes.
+    fn layout_plain(&mut self, run: &mut LayoutRun, hwnd: HWND) -> bool {
+        if run.plain_seen.contains(&hwnd) || run.known.contains(&hwnd) || !self.ws.is_plain_toplevel(hwnd) {
+            return false;
+        }
+        let process = self.ws.process(hwnd).0;
+        let now = self.ws.now();
+        let rule = run
+            .pending
+            .iter()
+            .find(|p| p.2 && run.rules[p.0].process == process)
+            .map(|p| p.0)
+            .or_else(|| run.watch.iter().find(|w| now < w.1 && run.rules[w.0].process == process).map(|w| w.0));
+        let Some(i) = rule else { return false };
+        let Some(target) = self.layout_target(run.rules[i].desktop) else { return false };
+        let label = self.window_label(hwnd);
+        let done = match self.backend.can_move(hwnd) {
+            _ if self.backend.window_desktop(hwnd) == Some(target) => true,
+            Ok(true) => match self.backend.move_window(hwnd, target) {
+                Ok(()) => {
+                    let l = self.desk_label(target);
+                    self.note(format!("layout: start window {label} -> {l}"));
+                    true
+                }
+                Err(e) if e.is_transient() || e.is_no_view() => false,
+                Err(e) => {
+                    self.note(format!("layout: start window {label} not moved: {e}"));
+                    true
+                }
+            },
+            Err(e) if e.is_transient() || e.is_no_view() => false, // again at its next event
+            _ => {
+                self.note(format!("layout: start window {label} cannot be moved; visible here until it closes"));
+                true
+            }
+        };
+        if done && run.plain_seen.len() < MAX_TRACKED {
+            run.plain_seen.push(hwnd);
+        }
+        true
     }
 
     /// Timer while the profile runs: late windows, giving up after the limit, the guard.

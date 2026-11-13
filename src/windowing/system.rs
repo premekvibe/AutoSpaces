@@ -30,6 +30,42 @@ fn pid_of(hwnd: HWND) -> u32 {
     pid
 }
 
+/// Creation time of process `pid` (FILETIME, 100 ns units); 0 when unknown.
+pub fn process_start_time(pid: u32) -> u64 {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::GetProcessTimes;
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h.is_null() {
+            return 0;
+        }
+        let z = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+        let (mut c, mut e, mut k, mut u) = (z, z, z, z);
+        let ok = GetProcessTimes(h, &mut c, &mut e, &mut k, &mut u);
+        CloseHandle(h);
+        if ok == 0 {
+            return 0;
+        }
+        (c.dwHighDateTime as u64) << 32 | c.dwLowDateTime as u64
+    }
+}
+
+/// True when this process started within two minutes of the shell (Explorer) of the session:
+/// a start with Windows (Run key) rather than by hand. No shell yet = logon still under way.
+pub fn started_with_windows() -> bool {
+    use windows_sys::Win32::System::Threading::GetCurrentProcessId;
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetShellWindow;
+    let shell = unsafe { GetShellWindow() };
+    if shell.is_null() {
+        return true;
+    }
+    let (me, sh) = (process_start_time(unsafe { GetCurrentProcessId() }), process_start_time(pid_of(shell)));
+    if me == 0 || sh == 0 {
+        return false;
+    }
+    me.saturating_sub(sh) < 120 * 10_000_000
+}
+
 fn process_path(pid: u32) -> Option<String> {
     if pid == 0 {
         return None;
@@ -224,6 +260,20 @@ impl WindowSystem for Win32Windows {
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map_or(0, |d| d.as_secs());
         format!("{}:{mtime}", m.len())
+    }
+    fn is_plain_toplevel(&self, hwnd: HWND) -> bool {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            GetWindow, GetWindowLongW, IsWindowVisible, GWL_STYLE, GW_OWNER, WS_CHILD,
+        };
+        unsafe {
+            IsWindow(hwnd) != 0
+                && IsWindowVisible(hwnd) != 0
+                && GetWindow(hwnd, GW_OWNER).is_null()
+                && GetWindowLongW(hwnd, GWL_STYLE) as u32 & WS_CHILD == 0
+        }
+    }
+    fn process_started(&self, pid: u32) -> u64 {
+        process_start_time(pid)
     }
     fn app_name(&self, pid: u32) -> String {
         process_path(pid).map(|p| version_name(&p)).unwrap_or_default()
