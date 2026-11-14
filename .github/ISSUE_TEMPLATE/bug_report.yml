@@ -42,7 +42,7 @@ body:
     attributes:
       label: AutoSpaces version / Verze AutoSpaces
       description: Shown in About… (tray icon menu) and at the top of report.txt. / Zobrazí se v „O aplikaci…“ (nabídka ikony) a na začátku souboru report.txt.
-      placeholder: "0.1.0"
+      placeholder: "x.y.z"
     validations:
       required: true
   - type: input
