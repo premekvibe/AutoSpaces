@@ -10,7 +10,7 @@ use crate::core::settings::launch_label;
 use crate::json::{parse_json, quote, Json};
 
 /// The issue form on GitHub. No data of the user or the system is ever put into this address.
-pub const ISSUE_URL: &str = "https://github.com/janakvibe/AutoSpaces/issues/new?template=bug_report.yml";
+pub const ISSUE_URL: &str = "https://github.com/premekvibe/AutoSpaces/issues/new?template=bug_report.yml";
 
 /// How many trailing lines of `log.txt` go into the report.
 pub const LOG_TAIL_LINES: usize = 400;
@@ -489,7 +489,7 @@ mod tests {
 
     #[test]
     fn issue_url_is_fixed_and_carries_no_data() {
-        assert_eq!(ISSUE_URL, "https://github.com/janakvibe/AutoSpaces/issues/new?template=bug_report.yml");
+        assert_eq!(ISSUE_URL, "https://github.com/premekvibe/AutoSpaces/issues/new?template=bug_report.yml");
         assert_eq!(ISSUE_URL.matches('?').count(), 1);
         assert!(!ISSUE_URL.contains('&'));
         assert!(!ISSUE_URL.contains(env!("CARGO_PKG_VERSION")));
