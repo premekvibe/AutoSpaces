@@ -92,7 +92,42 @@ pub trait DesktopBackend {
     fn remove(&self, desk: Guid, fallback: Guid) -> Result<()>;
     /// Public API; `None` when unknown (hidden window, TYPE_E_ELEMENTNOTFOUND, ...).
     fn window_desktop(&self, hwnd: HWND) -> Option<Guid>;
+
+    // ---- carrying a window (plan 12.13); the defaults mean "not available".
+
+    /// `switch(_, true)` really animates (the variant has `SwitchDesktopWithAnimation`).
+    fn animates(&self) -> bool {
+        false
+    }
+    /// The variant has `SwitchDesktopAndMoveForegroundView`.
+    fn has_move_switch(&self) -> bool {
+        false
+    }
+    /// Moves the foreground window to `desk` and switches there (one call).
+    fn move_switch(&self, _desk: Guid) -> Result<()> {
+        Err(Error::Permanent(E_NOTIMPL))
+    }
+    /// The variant describes `IVirtualDesktopPinnedApps` (sources agree); nothing is called yet.
+    fn has_pin(&self) -> bool {
+        false
+    }
+    /// Read-only check before the first pin of a run: the interface is obtained by `QueryService`
+    /// and `IsViewPinned` of `hwnd` (a window the public API places on a desktop, so it is not
+    /// pinned) must answer false. Err = description of what failed.
+    fn pin_probe(&self, _hwnd: HWND) -> std::result::Result<(), String> {
+        Err("no pinning interface".into())
+    }
+    /// Pins (`true`) or unpins the window's view to / from all desktops.
+    fn set_pinned(&self, _hwnd: HWND, _on: bool) -> Result<()> {
+        Err(Error::Permanent(E_NOTIMPL))
+    }
+    /// `IsViewPinned` of the window.
+    fn is_pinned(&self, _hwnd: HWND) -> Result<bool> {
+        Err(Error::Permanent(E_NOTIMPL))
+    }
 }
+
+pub const E_NOTIMPL: i32 = 0x8000_4001_u32 as i32;
 
 #[cfg(test)]
 mod tests {

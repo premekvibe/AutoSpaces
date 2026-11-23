@@ -50,6 +50,51 @@ pub fn process_start_time(pid: u32) -> u64 {
     }
 }
 
+/// Mandatory integrity level (RID, e.g. 0x2000 medium, 0x3000 high) of a process handle.
+fn integrity_level(process: windows_sys::Win32::Foundation::HANDLE) -> Option<u32> {
+    use windows_sys::Win32::Security::{
+        GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, TokenIntegrityLevel, TOKEN_MANDATORY_LABEL,
+        TOKEN_QUERY,
+    };
+    use windows_sys::Win32::System::Threading::OpenProcessToken;
+    unsafe {
+        let mut tok = std::ptr::null_mut();
+        if OpenProcessToken(process, TOKEN_QUERY, &mut tok) == 0 {
+            return None;
+        }
+        let mut buf = [0u64; 16]; // aligned, large enough for the label and its SID
+        let mut len = 0u32;
+        let ok = GetTokenInformation(tok, TokenIntegrityLevel, buf.as_mut_ptr().cast(), std::mem::size_of_val(&buf) as u32, &mut len);
+        CloseHandle(tok);
+        if ok == 0 {
+            return None;
+        }
+        let label = &*(buf.as_ptr() as *const TOKEN_MANDATORY_LABEL);
+        let sid = label.Label.Sid;
+        let n = *GetSidSubAuthorityCount(sid);
+        if n == 0 {
+            return None;
+        }
+        Some(*GetSidSubAuthority(sid, n as u32 - 1))
+    }
+}
+
+/// The window's process runs above this process's integrity level; a token that cannot even be
+/// read (elevated or protected process) counts as above.
+fn runs_elevated(hwnd: HWND) -> bool {
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let own = integrity_level(unsafe { GetCurrentProcess() }).unwrap_or(0x2000);
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid_of(hwnd));
+        if h.is_null() {
+            return true;
+        }
+        let other = integrity_level(h);
+        CloseHandle(h);
+        other.is_none_or(|l| l > own)
+    }
+}
+
 /// True when this process started within two minutes of the shell (Explorer) of the session:
 /// a start with Windows (Run key) rather than by hand. No shell yet = logon still under way.
 pub fn started_with_windows() -> bool {
@@ -367,5 +412,8 @@ impl WindowSystem for Win32Windows {
             let mut li = LASTINPUTINFO { cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32, dwTime: 0 };
             GetLastInputInfo(&mut li) != 0 && GetTickCount().wrapping_sub(li.dwTime) <= ms
         }
+    }
+    fn is_elevated(&self, hwnd: HWND) -> bool {
+        runs_elevated(hwnd)
     }
 }

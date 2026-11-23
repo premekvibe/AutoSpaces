@@ -217,6 +217,18 @@ pub fn run(select_only: bool) -> i32 {
     };
     let tag = if b.verified() { "" } else { " (unverified variant)" };
     out.say(&format!("PASS {sel_ms:>8} ms  select: {}{tag}", b.name()));
+    {
+        // What carrying a window (plan 12.13) can use, from the variant's description only: nothing
+        // is called here (pinning is checked read-only before its first use in a run).
+        use crate::desktops::DesktopBackend;
+        let yes = |b: bool| if b { "yes" } else { "no" };
+        out.say(&format!(
+            "carry: pinning interface described {}, SwitchDesktopAndMoveForegroundView {}, animated switch {}",
+            yes(b.has_pin()),
+            yes(b.has_move_switch()),
+            yes(b.animates())
+        ));
+    }
     if select_only {
         out.say("RESULT: PASS");
         return 0;

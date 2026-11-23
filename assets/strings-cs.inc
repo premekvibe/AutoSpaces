@@ -54,3 +54,7 @@
 #define T_CS_SET_GRP_STARTUP "Spuštění a jazyk"
 #define T_CS_SET_GRP_TASKBAR "Hlavní panel"
 #define T_CS_SET_GRP_DIAG "Diagnostika"
+#define T_CS_SET_GRP_CARRY "Přenášení okna mezi plochami"
+#define T_CS_SET_CARRY "Přenášet okno zkratkou Win+Ctrl+Shift+←/→"
+#define T_CS_SET_CARRY_NEW "Za poslední plochou vytvořit novou plochu (jinak se plochy točí dokola)"
+#define T_CS_SET_CARRY_NOTE "Držte Win+Ctrl+Shift a šipkami posouvejte aktivní okno po plochách. Puštěním kláves okno upustíte, klávesou Esc ho vrátíte zpět."

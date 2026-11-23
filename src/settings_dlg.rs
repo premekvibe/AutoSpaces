@@ -67,7 +67,11 @@ const ID_PICK_LIST: i32 = 150;
 const ID_TAB: i32 = 300;
 const ID_PAGE0: i32 = 310;
 const IDD_PAGE0: u16 = 106;
-const PAGES: usize = 3;
+const PAGES: usize = 4;
+/// Page "Keys" (dialog 109): carrying a window (plan 12.13).
+const ID_CARRY: i32 = 180;
+const ID_CARRY_NEW: i32 = 181;
+const ID_CARRY_STATUS: i32 = 184;
 
 /// Handle of the open dialog (0 = none): a second request just brings it forward.
 static OPEN: AtomicUsize = AtomicUsize::new(0);
@@ -99,6 +103,8 @@ struct Dlg {
     running: fn() -> Vec<(String, String)>,
     /// Current desktops and windows as a layout profile (number of desktops, rules).
     capture: fn() -> (usize, Vec<LayoutRule>),
+    /// Why carrying is not available (shortcut taken, unsupported Windows); None = fine.
+    carry_status: Option<String>,
 }
 
 const EXPLORER: &str = "explorer.exe";
@@ -122,6 +128,7 @@ pub fn show(
     learned: Vec<(String, String)>,
     running: fn() -> Vec<(String, String)>,
     capture: fn() -> (usize, Vec<LayoutRule>),
+    carry_status: Option<String>,
 ) -> Option<Outcome> {
     let prev = OPEN.load(Relaxed);
     if prev != 0 {
@@ -136,6 +143,7 @@ pub fn show(
         out: None,
         running,
         capture,
+        carry_status,
     };
     unsafe {
         InitCommonControlsEx(&INITCOMMONCONTROLSEX { dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32, dwICC: ICC_TAB_CLASSES });
@@ -315,6 +323,11 @@ unsafe fn update_buttons(dlg: HWND) {
     }
 }
 
+/// "New desktop after the last one" only matters while carrying is on.
+unsafe fn update_carry(dlg: HWND) {
+    EnableWindow(GetDlgItem(pg(dlg, ID_CARRY_NEW), ID_CARRY_NEW), checked(dlg, ID_CARRY) as i32);
+}
+
 unsafe fn state<'a>(dlg: HWND) -> Option<&'a mut Dlg> {
     (GetWindowLongPtrW(dlg, GWLP_USERDATA) as *mut Dlg).as_mut()
 }
@@ -348,7 +361,7 @@ pub(crate) unsafe fn set_icons(dlg: HWND) {
 /// Tabs, pages (child dialogs) and their initial layout; the first tab is shown.
 unsafe fn create_pages(dlg: HWND) {
     let tab = GetDlgItem(dlg, ID_TAB);
-    for (i, key) in [Key::TabGeneral, Key::TabApps, Key::TabAdvanced].into_iter().enumerate() {
+    for (i, key) in [Key::TabGeneral, Key::TabApps, Key::TabAdvanced, Key::TabKeys].into_iter().enumerate() {
         let text = wide(t(key));
         let mut item: TCITEMW = std::mem::zeroed();
         item.mask = TCIF_TEXT;
@@ -361,6 +374,12 @@ unsafe fn create_pages(dlg: HWND) {
     }
     layout_pages(dlg);
     show_page(dlg, 0);
+    // Debug builds: `AUTOSPACES_SETTINGS_TAB=<n>` opens on tab n (screenshots).
+    #[cfg(debug_assertions)]
+    if let Some(n) = std::env::var("AUTOSPACES_SETTINGS_TAB").ok().and_then(|v| v.parse::<usize>().ok()).filter(|n| *n < PAGES) {
+        SendMessageW(tab, TCM_SETCURSEL, n, 0);
+        show_page(dlg, n);
+    }
 }
 
 unsafe fn init(dlg: HWND, d: &Dlg) {
@@ -378,6 +397,10 @@ unsafe fn init(dlg: HWND, d: &Dlg) {
     CheckDlgButton(pg(dlg, ID_LEARNING), ID_LEARNING, check(d.settings.learning));
     CheckDlgButton(pg(dlg, ID_ARRANGE), ID_ARRANGE, check(d.settings.arrange_at_start));
     CheckDlgButton(pg(dlg, ID_LOG), ID_LOG, check(d.settings.log));
+    CheckDlgButton(pg(dlg, ID_CARRY), ID_CARRY, check(d.settings.carry_enabled));
+    CheckDlgButton(pg(dlg, ID_CARRY_NEW), ID_CARRY_NEW, check(d.settings.carry_create_new));
+    SetDlgItemTextW(pg(dlg, ID_CARRY_STATUS), ID_CARRY_STATUS, wide(d.carry_status.as_deref().unwrap_or("")).as_ptr());
+    update_carry(dlg);
     // Autostart is read from the system, not from settings.json.
     CheckDlgButton(pg(dlg, ID_AUTOSTART), ID_AUTOSTART, check(sysopts::autostart_enabled()));
     // Language: automatic, then every language under its own name.
@@ -410,6 +433,8 @@ unsafe fn collect(dlg: HWND, d: &mut Dlg) {
     s.arrange_at_start = checked(dlg, ID_ARRANGE);
     s.autostart = checked(dlg, ID_AUTOSTART);
     s.log = checked(dlg, ID_LOG);
+    s.carry_enabled = checked(dlg, ID_CARRY);
+    s.carry_create_new = checked(dlg, ID_CARRY_NEW);
     let sel = SendDlgItemMessageW(pg(dlg, ID_LANGUAGE), ID_LANGUAGE, CB_GETCURSEL, 0, 0);
     s.language = if sel < 0 { d.settings.language } else { Pref::from_index(sel as usize) };
     d.out = Some(Outcome {
@@ -493,6 +518,7 @@ unsafe extern "system" fn proc(dlg: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> i
                     }
                 }
                 ID_EXCL_LIST | ID_LEARNED_LIST => update_buttons(dlg),
+                ID_CARRY => update_carry(dlg),
                 _ => return 0,
             }
             1

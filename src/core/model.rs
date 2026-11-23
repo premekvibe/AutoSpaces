@@ -117,4 +117,9 @@ pub trait WindowSystem {
     fn is_plain_toplevel(&self, _hwnd: HWND) -> bool {
         false
     }
+    /// The window's process runs at a higher integrity level than this app (e.g. as
+    /// administrator): input and window changes from here are blocked by UIPI (plan 12.13).
+    fn is_elevated(&self, _hwnd: HWND) -> bool {
+        false
+    }
 }

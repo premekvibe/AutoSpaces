@@ -54,3 +54,7 @@
 #define T_EN_SET_GRP_STARTUP "Startup and language"
 #define T_EN_SET_GRP_TASKBAR "Taskbar"
 #define T_EN_SET_GRP_DIAG "Diagnostics"
+#define T_EN_SET_GRP_CARRY "Carrying a window between desktops"
+#define T_EN_SET_CARRY "Carry a window with Win+Ctrl+Shift+←/→"
+#define T_EN_SET_CARRY_NEW "Create a new desktop after the last one (otherwise the desktops go round)"
+#define T_EN_SET_CARRY_NOTE "Hold Win+Ctrl+Shift and use the arrow keys to move the active window across desktops. Release the keys to drop it; press Esc to take it back."

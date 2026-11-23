@@ -22,6 +22,7 @@ Windows has virtual desktops, but you have to create them, move windows onto the
 - **Learned exceptions:** an app whose windows repeatedly cannot be moved is remembered and left alone. The list is visible and editable.
 - **Arrange at startup:** windows that are already maximized when AutoSpaces starts are spread over separate desktops, as long as all your windows are on a single desktop.
 - **Desktop layout:** choose apps that should open on their own desktops when AutoSpaces starts (desktop 2 – mail, desktop 3 – charts, …). Apps that are already running are moved and maximized instead of being started again. They are launched in the background, without switching your desktop.
+- **Carry a window:** hold **Win+Ctrl+Shift** and press **←/→** to take the active window to the previous or next desktop; the desktops slide under it, so you see where it lands. Release the keys to drop it there, press **Esc** to take it back. Past the last desktop it goes round to desktop 1, or (an option in *Settings → Keys*) a new desktop is created.
 - **Start with Windows.**
 - **Czech and English,** chosen by the Windows display language, with a manual override in Settings.
 - **Light on resources:** a single executable under 1 MB, about 3 MB of private memory, event-driven with no polling.

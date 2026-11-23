@@ -64,6 +64,20 @@ BEGIN
     LTEXT           T(SET_LOG_NOTE), 148, 12, 107, 262, 18
 END
 
+// Fourth tab "Keys" (plan 12.13): carrying the foreground window with Win+Ctrl+Shift+Left/Right. The status line (184)
+// is set at run time, only when the shortcut could not be registered.
+109 DIALOGEX 0, 0, 284, 130
+STYLE DS_SHELLFONT | DS_CONTROL | WS_CHILD
+EXSTYLE WS_EX_CONTROLPARENT
+FONT 9, "MS Shell Dlg", 400, 0, 1
+BEGIN
+    GROUPBOX        T(SET_GRP_CARRY), -1, 4, 4, 276, 104
+    AUTOCHECKBOX    T(SET_CARRY), 180, 12, 17, 262, 10, WS_TABSTOP
+    AUTOCHECKBOX    T(SET_CARRY_NEW), 181, 24, 31, 250, 20, BS_MULTILINE | WS_TABSTOP
+    LTEXT           T(SET_CARRY_NOTE), 183, 12, 56, 262, 28
+    LTEXT           "", 184, 12, 88, 262, 18
+END
+
 103 DIALOGEX 0, 0, 330, 246
 STYLE DS_SHELLFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
 CAPTION T(LAY_CAPTION)

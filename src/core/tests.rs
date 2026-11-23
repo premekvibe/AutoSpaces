@@ -64,6 +64,24 @@ struct World {
     activate_follows: Cell<bool>,
     /// Visible unowned top-level windows that are no candidates (splash screens without a title).
     plain: RefCell<Vec<usize>>,
+    // ---- carrying (plan 12.13)
+    /// The variant has the pinning interface / SwitchDesktopAndMoveForegroundView / animation.
+    has_pin: Cell<bool>,
+    has_move_switch: Cell<bool>,
+    animates: Cell<bool>,
+    pin_probe_fails: Cell<bool>,
+    fail_pin: Cell<bool>,
+    fail_switch: Cell<bool>,
+    /// Windows pinned to all desktops right now.
+    pinned: RefCell<Vec<usize>>,
+    /// Every PinView (true) / UnpinView (false) call.
+    pin_calls: RefCell<Vec<(usize, bool)>>,
+    pin_probes: Cell<u32>,
+    move_switches: RefCell<Vec<u32>>,
+    /// Windows of an elevated process.
+    elevated: RefCell<Vec<usize>>,
+    /// state.json texts written through `set_persist`, with the pinned list at that moment.
+    persisted: RefCell<Vec<(String, Vec<usize>)>>,
 }
 
 impl World {
@@ -153,9 +171,53 @@ impl DesktopBackend for FB {
         Ok(())
     }
     fn switch(&self, desk: Guid, _animated: bool) -> BResult<()> {
+        if self.0.fail_switch.get() {
+            return Err(PERMANENT);
+        }
         self.0.switches.borrow_mut().push(desk.d1);
         self.0.current.set(desk);
         Ok(())
+    }
+    fn animates(&self) -> bool {
+        self.0.animates.get()
+    }
+    fn has_move_switch(&self) -> bool {
+        self.0.has_move_switch.get()
+    }
+    fn move_switch(&self, desk: Guid) -> BResult<()> {
+        let fg = self.0.fg.get();
+        self.0.move_switches.borrow_mut().push(desk.d1);
+        if let Some(w) = self.0.wins.borrow_mut().get_mut(&fg) {
+            w.desktop = desk;
+        }
+        self.0.current.set(desk);
+        Ok(())
+    }
+    fn has_pin(&self) -> bool {
+        self.0.has_pin.get()
+    }
+    fn pin_probe(&self, hwnd: HWND) -> std::result::Result<(), String> {
+        self.0.pin_probes.set(self.0.pin_probes.get() + 1);
+        if self.0.pin_probe_fails.get() || self.0.pinned.borrow().contains(&(hwnd as usize)) {
+            return Err("IsViewPinned answered true".into());
+        }
+        Ok(())
+    }
+    fn set_pinned(&self, hwnd: HWND, on: bool) -> BResult<()> {
+        let id = hwnd as usize;
+        self.0.pin_calls.borrow_mut().push((id, on));
+        if on && self.0.fail_pin.get() {
+            return Err(PERMANENT);
+        }
+        let mut p = self.0.pinned.borrow_mut();
+        p.retain(|x| *x != id);
+        if on {
+            p.push(id);
+        }
+        Ok(())
+    }
+    fn is_pinned(&self, hwnd: HWND) -> BResult<bool> {
+        Ok(self.0.pinned.borrow().contains(&(hwnd as usize)))
     }
     fn remove(&self, desk: Guid, fallback: Guid) -> BResult<()> {
         if let Some(e) = self.0.fail_remove.get() {
@@ -256,6 +318,9 @@ impl WindowSystem for FW {
         let id = hwnd as usize;
         self.0.plain.borrow().contains(&id)
             && self.0.wins.borrow().get(&id).is_some_and(|w| !matches!(w.state, State::Hidden | State::Destroyed))
+    }
+    fn is_elevated(&self, hwnd: HWND) -> bool {
+        self.0.elevated.borrow().contains(&(hwnd as usize))
     }
 }
 
@@ -2516,4 +2581,399 @@ fn settings_log_key_default_off_tolerant_and_kept() {
     let s = Settings::from_json("{\"log\": true}").unwrap();
     assert!(s.log);
     assert!(Settings::from_json(&s.to_json()).unwrap().log, "kept when the dialog saves");
+}
+
+// ---------------------------------------------------------------- carrying a window (plan 12.13)
+
+use super::carry::Edge;
+use super::orchestrator::{carry_token, CarryOutcome};
+use super::settings::CarryStyle;
+
+/// `n` desktops, each holding one ordinary window (901..), and window 1 on desktop 1 in front.
+fn carry_world(n: u32) -> (Rc<World>, Orch) {
+    let w = World::new(n);
+    for d in 1..=n {
+        put(&w, 900 + d as usize, d);
+    }
+    put(&w, 1, 1);
+    w.fg.set(1);
+    let o = started(&w);
+    (w, o)
+}
+
+fn step(o: &mut Orch, right: bool) -> CarryOutcome {
+    o.carry_step(right).0
+}
+
+#[test]
+fn carry_rotates_both_ways_and_drops_where_the_view_is() {
+    let (w, mut o) = carry_world(3);
+    assert_eq!(step(&mut o, true), CarryOutcome::Carrying);
+    assert!(o.carrying());
+    assert_eq!((w.desk_of(1).d1, w.current.get().d1), (2, 2));
+    step(&mut o, true);
+    assert_eq!((w.desk_of(1).d1, w.current.get().d1), (3, 3));
+    assert_eq!(o.carry_osd().unwrap().right, Edge::Wrap);
+    step(&mut o, true); // right from the last: desktop 1
+    assert_eq!((w.desk_of(1).d1, w.current.get().d1), (1, 1));
+    assert_eq!(o.carry_osd().unwrap().left, Edge::Wrap);
+    step(&mut o, false); // left from desktop 1: the last
+    assert_eq!((w.desk_of(1).d1, w.current.get().d1), (3, 3));
+    assert_eq!(o.carry_drop(false), None);
+    assert!(!o.carrying() && o.carry_osd().is_none());
+    assert_eq!((w.desk_of(1).d1, w.current.get().d1, list(&w)), (3, 3, vec![1, 2, 3]));
+    assert_eq!(w.creates.get(), 0);
+}
+
+#[test]
+fn carry_create_new_desktop_and_stop_at_desktop_one() {
+    let (w, mut o) = carry_world(3);
+    o.settings.carry_create_new = true;
+    step(&mut o, true);
+    step(&mut o, true);
+    assert_eq!(o.carry_osd().unwrap().right, Edge::New);
+    step(&mut o, true); // behind the last: a new desktop
+    assert_eq!((w.count(), w.desk_of(1).d1, w.current.get().d1), (4, 4, 4));
+    for _ in 0..3 {
+        step(&mut o, false);
+    }
+    assert_eq!(w.desk_of(1).d1, 1);
+    step(&mut o, false); // left from desktop 1: stays
+    assert_eq!((w.desk_of(1).d1, w.current.get().d1), (1, 1));
+    // No tidying while carrying: the new, now empty desktop is still there ...
+    assert_eq!(w.count(), 4);
+    o.carry_drop(false);
+    // ... and goes once the window is dropped (empty, behind the last occupied one, above B).
+    assert_eq!(list(&w), vec![1, 2, 3]);
+}
+
+#[test]
+fn carry_on_a_single_desktop_goes_nowhere() {
+    let (w, mut o) = carry_world(1);
+    assert_eq!(step(&mut o, true), CarryOutcome::Carrying);
+    step(&mut o, false);
+    assert!(w.switches.borrow().is_empty());
+    o.carry_drop(false);
+    assert_eq!((w.desk_of(1).d1, list(&w)), (1, vec![1]));
+}
+
+#[test]
+fn fast_steps_are_merged_while_the_animation_runs() {
+    let (w, mut o) = carry_world(4);
+    w.animates.set(true);
+    let (_, sch) = o.carry_step(true);
+    assert_eq!(*w.switches.borrow(), vec![2]);
+    let sch = sch.expect("timer for the end of the animation");
+    assert_eq!((sch.hwnd, sch.delay_ms), (carry_token(), 440));
+    // Two more presses during the animation: the target (and the indicator) move at once ...
+    o.carry_step(true);
+    o.carry_step(true);
+    assert_eq!(o.carry_osd().unwrap().target, 3);
+    assert_eq!(*w.switches.borrow(), vec![2], "no switch per press");
+    // ... and when the animation ends, one switch goes straight there.
+    w.tick(440);
+    let next = o.on_event(carry_token(), Event::Recheck);
+    assert_eq!(*w.switches.borrow(), vec![2, 4]);
+    assert_eq!(w.desk_of(1).d1, 4);
+    assert_eq!(next.map(|s| s.delay_ms), Some(440));
+    // A drop during that animation finishes only after it.
+    assert!(o.carry_drop(false).is_some());
+    assert!(o.carrying());
+    w.tick(440);
+    o.on_event(carry_token(), Event::Recheck);
+    assert!(!o.carrying());
+    assert_eq!((w.desk_of(1).d1, w.current.get().d1), (4, 4));
+}
+
+#[test]
+fn esc_takes_window_and_view_back() {
+    let (w, mut o) = carry_world(3);
+    step(&mut o, true);
+    step(&mut o, true);
+    assert_eq!(w.desk_of(1).d1, 3);
+    o.carry_drop(true);
+    assert!(!o.carrying());
+    assert_eq!((w.desk_of(1).d1, w.current.get().d1), (1, 1));
+    assert_eq!(*w.switches.borrow(), vec![2, 3, 1]);
+    // The modifiers released after Esc change nothing.
+    assert_eq!(o.carry_drop(false), None);
+    assert_eq!(list(&w), vec![1, 2, 3]);
+}
+
+#[test]
+fn carried_managed_window_is_released_and_its_desktop_tidied_after_the_drop() {
+    let w = World::new(2);
+    put(&w, 901, 1);
+    put(&w, 902, 2);
+    put(&w, 1, 1);
+    let mut o = started(&w);
+    w.set_state(1, State::Maximized);
+    ev(&w, &mut o, 1, Loc);
+    assert!(o.is_managed(h(1)));
+    assert_eq!((w.count(), w.current.get().d1), (3, 3));
+    w.fg.set(1);
+    w.tick(1000);
+    step(&mut o, false); // to desktop 2
+    assert_eq!(w.desk_of(1).d1, 2);
+    assert_eq!(w.count(), 3, "the empty helper desktop stays while carrying");
+    o.carry_drop(false);
+    assert!(!o.is_managed(h(1)) && o.snapshot().is_empty());
+    assert!(o.is_rejected(h(1)), "maximized: stays where it was dropped until restored");
+    assert_eq!((list(&w), w.desk_of(1).d1), (vec![1, 2], 2));
+    // Restoring it later does not take it "back" anywhere.
+    w.set_state(1, State::Normal);
+    ev(&w, &mut o, 1, Loc);
+    assert_eq!((w.desk_of(1).d1, list(&w)), (2, vec![1, 2]));
+}
+
+#[test]
+fn nothing_is_tidied_or_entered_while_carrying() {
+    let (w, mut o) = carry_world(3);
+    o.always_own_desktop = true;
+    step(&mut o, true);
+    // The only window of desktop 2 closes: no compaction during the carry.
+    w.set_state(902, State::Destroyed);
+    assert_eq!(o.on_event(h(902), Event::Destroy), None);
+    assert_eq!(o.on_event(std::ptr::null_mut(), Event::Recheck), None);
+    // The carried window is maximized meanwhile: no desktop of its own either.
+    w.set_state(1, State::Maximized);
+    assert_eq!(o.on_event(h(1), Loc), None);
+    assert_eq!((w.count(), w.creates.get()), (3, 0));
+    assert!(!o.is_managed(h(1)));
+    step(&mut o, true); // on to desktop 3, desktop 2 is now empty
+    assert_eq!(list(&w), vec![1, 2, 3]);
+    o.carry_drop(false);
+    // Once dropped: the gap goes (B = 3 is kept by a new desktop at the end), the window stays.
+    assert!(!list(&w).contains(&2));
+    assert_eq!((w.count(), w.desk_of(1).d1), (3, 3));
+    assert!(!o.is_managed(h(1)) && o.is_rejected(h(1)));
+}
+
+#[test]
+fn dropped_maximized_window_stays_beside_another_maximized_one() {
+    let (w, mut o) = carry_world(2);
+    o.always_own_desktop = false;
+    w.set_state(902, State::Maximized);
+    w.set_state(1, State::Maximized);
+    step(&mut o, true);
+    o.carry_drop(false);
+    assert_eq!((w.desk_of(1).d1, w.desk_of(902).d1, list(&w)), (2, 2, vec![1, 2]));
+    assert!(!o.is_managed(h(1)) && !o.is_managed(h(902)));
+    // Later events change nothing until the user restores it.
+    ev(&w, &mut o, 1, Loc);
+    assert_eq!((w.desk_of(1).d1, w.count()), (2, 2));
+}
+
+/// Carries window 1 (normal) to desktop 2, where window 902 is `other`, then maximizes it.
+fn maximize_after_carry(n: u32, other: State) -> (Rc<World>, Orch) {
+    let w = World::new(n);
+    put(&w, 901, 1);
+    put(&w, 902, 2);
+    put(&w, 1, 1);
+    w.set_state(902, other);
+    w.fg.set(1);
+    let mut o = started(&w);
+    o.always_own_desktop = false;
+    assert_eq!(step(&mut o, true), CarryOutcome::Carrying);
+    o.carry_drop(false);
+    assert_eq!(w.desk_of(1).d1, 2);
+    w.set_state(1, State::Maximized);
+    ev(&w, &mut o, 1, Loc);
+    (w, o)
+}
+
+#[test]
+fn maximized_after_carry_beside_a_maximized_window_takes_a_free_empty_desktop() {
+    // B = 4, desktops 3 and 4 empty at the end: the first free one is used, none is created.
+    let (w, o) = maximize_after_carry(4, State::Maximized);
+    assert!(o.is_managed(h(1)));
+    assert_eq!((w.desk_of(1).d1, w.creates.get(), w.count()), (3, 0, 4));
+    assert_eq!(w.current.get().d1, 3);
+}
+
+#[test]
+fn maximized_after_carry_beside_a_maximized_window_without_a_free_desktop_gets_a_new_one() {
+    let (w, o) = maximize_after_carry(2, State::Maximized);
+    assert!(o.is_managed(h(1)));
+    assert_eq!((w.desk_of(1).d1, w.creates.get(), w.count()), (3, 1, 3));
+}
+
+#[test]
+fn maximized_after_carry_alone_stays() {
+    let (w, o) = maximize_after_carry(3, State::Normal);
+    assert!(!o.is_managed(h(1)) && o.is_rejected(h(1)));
+    assert_eq!((w.desk_of(1).d1, w.creates.get(), w.count()), (2, 0, 3));
+}
+
+#[test]
+fn window_that_cannot_be_moved_is_left_alone_and_nothing_is_learned() {
+    let cases: [fn(&World); 5] = [
+        |w| w.wins.borrow_mut().get_mut(&1).unwrap().can_move = false,
+        |w| w.elevated.borrow_mut().push(1),
+        |w| w.wins.borrow_mut().get_mut(&1).unwrap().desktop = Guid::ZERO, // pinned to all desktops
+        |w| w.wins.borrow_mut().get_mut(&1).unwrap().candidate = false,
+        |w| {
+            w.procs.borrow_mut().insert(1, "textinputhost.exe".into());
+        },
+    ];
+    for (i, make) in cases.iter().enumerate() {
+        let (w, mut o) = carry_world(3);
+        let log: Log = Rc::default();
+        o.set_learned(Box::new(Rec(log.clone())));
+        make(&w);
+        assert_eq!(step(&mut o, true), CarryOutcome::CannotMove, "case {i}");
+        assert!(!o.carrying(), "case {i}");
+        assert!(w.switches.borrow().is_empty() && w.pin_calls.borrow().is_empty(), "case {i}");
+        assert!(log.borrow().is_empty(), "case {i}: nothing learned");
+        assert_eq!(list(&w), vec![1, 2, 3], "case {i}");
+    }
+}
+
+#[test]
+fn carry_off_or_no_foreground_window_is_ignored() {
+    let (w, mut o) = carry_world(2);
+    o.settings.carry_enabled = false;
+    assert_eq!(step(&mut o, true), CarryOutcome::Ignored);
+    o.settings.carry_enabled = true;
+    w.fg.set(0);
+    assert_eq!(step(&mut o, true), CarryOutcome::Ignored);
+    assert!(w.switches.borrow().is_empty());
+}
+
+/// A world where the variant has the pinning interface; state.json writes are recorded.
+fn pin_world(n: u32) -> (Rc<World>, Orch) {
+    let (w, mut o) = carry_world(n);
+    w.has_pin.set(true);
+    let ww = w.clone();
+    o.set_persist(Box::new(move |t| {
+        let pinned = ww.pinned.borrow().clone();
+        ww.persisted.borrow_mut().push((t, pinned));
+    }));
+    (w, o)
+}
+
+#[test]
+fn pin_style_keeps_the_window_in_place_and_always_unpins() {
+    let (w, mut o) = pin_world(3);
+    assert_eq!(step(&mut o, true), CarryOutcome::Carrying);
+    assert_eq!(w.pin_probes.get(), 1);
+    assert_eq!(*w.pin_calls.borrow(), vec![(1, true)]);
+    // Recorded in state.json before PinView was called.
+    let (text, pinned_then) = w.persisted.borrow()[0].clone();
+    assert!(text.contains("\"pinned\":[{\"hwnd\":1,\"pid\":1001}]"), "{text}");
+    assert!(pinned_then.is_empty());
+    assert_eq!(o.pinned_by_carry(), &[(h(1), 1001)]);
+    // The desktops switch under the pinned window; it is not moved meanwhile.
+    step(&mut o, true);
+    assert_eq!((w.current.get().d1, w.desk_of(1).d1), (3, 1));
+    assert!(w.move_switches.borrow().is_empty());
+    o.carry_drop(false);
+    assert_eq!(*w.pin_calls.borrow(), vec![(1, true), (1, false)]);
+    assert!(w.pinned.borrow().is_empty() && o.pinned_by_carry().is_empty());
+    assert_eq!(w.desk_of(1).d1, 3, "moved to the desktop being viewed when unpinned");
+    assert!(!w.persisted.borrow().last().unwrap().0.contains("pinned"));
+    // The interface is checked once per run.
+    step(&mut o, false);
+    o.carry_drop(false);
+    assert_eq!(w.pin_probes.get(), 1);
+}
+
+#[test]
+fn failed_pin_check_falls_back_and_never_pins() {
+    let (w, mut o) = pin_world(3);
+    w.pin_probe_fails.set(true);
+    w.has_move_switch.set(true);
+    step(&mut o, true);
+    assert!(w.pin_calls.borrow().is_empty());
+    assert_eq!(*w.move_switches.borrow(), vec![2], "moveSwitch is the next best");
+    o.carry_drop(false);
+    step(&mut o, true);
+    o.carry_drop(false);
+    assert_eq!(w.pin_probes.get(), 1, "pinning stays off for the rest of the run");
+    assert!(w.pin_calls.borrow().is_empty());
+}
+
+#[test]
+fn failed_pin_is_undone_and_the_carry_goes_on_without_it() {
+    let (w, mut o) = pin_world(3);
+    w.fail_pin.set(true);
+    assert_eq!(step(&mut o, true), CarryOutcome::Carrying);
+    assert_eq!(*w.pin_calls.borrow(), vec![(1, true), (1, false)]);
+    assert!(o.pinned_by_carry().is_empty());
+    assert_eq!(w.desk_of(1).d1, 2, "switchMove: the window travels with the view");
+    o.carry_drop(false);
+    assert!(!o.carrying());
+}
+
+#[test]
+fn failed_switch_unpins_and_ends_the_carry() {
+    let (w, mut o) = pin_world(3);
+    step(&mut o, true);
+    w.fail_switch.set(true);
+    step(&mut o, true);
+    assert!(!o.carrying());
+    assert!(w.pinned.borrow().is_empty());
+    assert_eq!(w.desk_of(1).d1, 2, "stays where the view is");
+}
+
+#[test]
+fn exit_during_a_pinned_carry_unpins() {
+    let (w, mut o) = pin_world(3);
+    step(&mut o, true);
+    assert_eq!(*w.pinned.borrow(), vec![1]);
+    o.give_back_all();
+    assert!(!o.carrying() && w.pinned.borrow().is_empty());
+    assert_eq!(w.desk_of(1).d1, w.current.get().d1);
+}
+
+#[test]
+fn closed_window_ends_the_carry_and_unpin_is_not_called_on_it() {
+    let (w, mut o) = pin_world(3);
+    step(&mut o, true);
+    w.set_state(1, State::Destroyed);
+    o.on_event(h(1), Event::Destroy);
+    step(&mut o, true);
+    assert!(!o.carrying() && o.pinned_by_carry().is_empty());
+    assert_eq!(*w.pin_calls.borrow(), vec![(1, true)]);
+}
+
+#[test]
+fn windows_left_pinned_by_a_crash_are_unpinned_at_start() {
+    let (w, mut o) = pin_world(3);
+    w.pinned.borrow_mut().push(1);
+    w.pinned.borrow_mut().push(902);
+    // Both windows are still pinned (they are unpinned); window 77 no longer exists (skipped).
+    o.release_pins(vec![(h(1), 1001), (h(77), 1077), (h(902), 1902)]);
+    assert_eq!(*w.pin_calls.borrow(), vec![(1, false), (902, false)]);
+    assert!(w.pinned.borrow().is_empty());
+    // A window that is not pinned is not touched.
+    o.release_pins(vec![(h(1), 1001)]);
+    assert_eq!(w.pin_calls.borrow().len(), 2);
+}
+
+#[test]
+fn carry_style_setting_is_honoured_within_what_is_available() {
+    // switchMove chosen by hand: no pin check, no pin.
+    let (w, mut o) = pin_world(3);
+    o.settings.carry_style = CarryStyle::SwitchMove;
+    step(&mut o, true);
+    assert_eq!((w.pin_probes.get(), w.pin_calls.borrow().len(), w.desk_of(1).d1), (0, 0, 2));
+    o.carry_drop(false);
+    // moveSwitch chosen but the variant lacks it: auto order (pin here).
+    let (w, mut o) = pin_world(3);
+    o.settings.carry_style = CarryStyle::MoveSwitch;
+    step(&mut o, true);
+    assert_eq!(*w.pin_calls.borrow(), vec![(1, true)]);
+    o.carry_drop(false);
+    // moveSwitch available and chosen.
+    let (w, mut o) = pin_world(3);
+    w.has_move_switch.set(true);
+    o.settings.carry_style = CarryStyle::MoveSwitch;
+    step(&mut o, true);
+    assert_eq!((w.move_switches.borrow().clone(), w.pin_calls.borrow().len()), (vec![2], 0));
+    // moveSwitch only moves the foreground window: when another one took the focus, the carried
+    // window is moved explicitly.
+    w.fg.set(902);
+    step(&mut o, true);
+    assert_eq!((w.desk_of(1).d1, w.move_switches.borrow().len()), (3, 1));
 }

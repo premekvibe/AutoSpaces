@@ -1,5 +1,6 @@
 //! Platform-independent core: orchestrator, models and abstractions (no direct Win32 calls).
 
+pub mod carry;
 pub mod learned;
 pub mod model;
 pub mod orchestrator;

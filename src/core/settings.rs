@@ -321,6 +321,46 @@ pub struct Settings {
     /// Desktop backend (key `"backend"`, no UI, plan 5.2/5.3): `auto` = internal interface when a
     /// variant passes; anything else = the "not supported" mode (nothing is moved), for trying it.
     pub backend: BackendPref,
+    /// Carrying the foreground window with Win+Ctrl+Shift+Left/Right (plan 12.13).
+    pub carry_enabled: bool,
+    /// Right from the last desktop creates a new one (left stops at desktop 1); off = rotation.
+    pub carry_create_new: bool,
+    /// Hidden key `"carryStyle"` (no UI): how the carried window stays in view (plan 12.13).
+    pub carry_style: CarryStyle,
+}
+
+/// Value of the hidden `"carryStyle"` key: the visual method of carrying a window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CarryStyle {
+    /// The best one available: pin, else moveSwitch, else switchMove.
+    Auto,
+    /// The window is pinned to all desktops while the desktops slide under it.
+    Pin,
+    /// `SwitchDesktopAndMoveForegroundView` (one call per step).
+    MoveSwitch,
+    /// The window is moved to the target, then the view switches with animation.
+    SwitchMove,
+}
+
+impl CarryStyle {
+    /// Unknown values keep the default (`auto`).
+    pub fn from_code(s: &str) -> CarryStyle {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "pin" => CarryStyle::Pin,
+            "moveswitch" => CarryStyle::MoveSwitch,
+            "switchmove" => CarryStyle::SwitchMove,
+            _ => CarryStyle::Auto,
+        }
+    }
+
+    pub fn code(self) -> &'static str {
+        match self {
+            CarryStyle::Auto => "auto",
+            CarryStyle::Pin => "pin",
+            CarryStyle::MoveSwitch => "moveSwitch",
+            CarryStyle::SwitchMove => "switchMove",
+        }
+    }
 }
 
 /// Value of the hidden `"backend"` key.
@@ -372,6 +412,9 @@ impl Default for Settings {
             layout: Layout::default(),
             language: Pref::Auto,
             backend: BackendPref::Auto,
+            carry_enabled: true,
+            carry_create_new: false,
+            carry_style: CarryStyle::Auto,
         }
     }
 }
@@ -448,6 +491,11 @@ impl Settings {
         flag("arrangeAtStart", &mut s.arrange_at_start);
         flag("log", &mut s.log);
         flag("switchAnimation", &mut s.switch_animation);
+        flag("carryEnabled", &mut s.carry_enabled);
+        flag("carryCreateNew", &mut s.carry_create_new);
+        if let Some(code) = j.get("carryStyle").and_then(Json::as_str) {
+            s.carry_style = CarryStyle::from_code(code);
+        }
         if let Some(code) = j.get("language").and_then(Json::as_str) {
             s.language = Pref::from_code(code);
         }
@@ -491,7 +539,9 @@ impl Settings {
   \"learning\": {},
   \"arrangeAtStart\": {},
   \"switchAnimation\": {},
-  \"language\": {},{}{}
+  \"carryEnabled\": {},
+  \"carryCreateNew\": {},
+  \"language\": {},{}{}{}
   \"layout\": {}
 }}
 ",
@@ -502,7 +552,14 @@ impl Settings {
             self.learning,
             self.arrange_at_start,
             self.switch_animation,
+            self.carry_enabled,
+            self.carry_create_new,
             quote(self.language.code()),
+            // Hidden key, written only when not "auto".
+            match self.carry_style {
+                CarryStyle::Auto => String::new(),
+                c => format!("\n  \"carryStyle\": {},", quote(c.code())),
+            },
             // Written only when on: a hand-made key that survives saving from the dialog.
             if self.log { "\n  \"log\": true," } else { "" },
             // Same for the hidden backend switch.
@@ -585,6 +642,33 @@ mod tests {
             s.language = p;
             assert_eq!(Settings::from_json(&s.to_json()).unwrap().language, p);
         }
+    }
+
+    #[test]
+    fn carry_keys_are_tolerant_and_style_is_hidden() {
+        let d = Settings::from_json("{}").unwrap();
+        assert!(d.carry_enabled && !d.carry_create_new && d.carry_style == CarryStyle::Auto);
+        let s = Settings::from_json(r#"{"carryEnabled":"no","carryCreateNew":1,"carryStyle":7}"#).unwrap();
+        assert!(s.carry_enabled && !s.carry_create_new && s.carry_style == CarryStyle::Auto);
+        let s = Settings::from_json(r#"{"carryEnabled":false,"carryCreateNew":true,"carryStyle":" PIN "}"#).unwrap();
+        assert!(!s.carry_enabled && s.carry_create_new && s.carry_style == CarryStyle::Pin);
+        for (code, want) in [
+            ("pin", CarryStyle::Pin),
+            ("moveSwitch", CarryStyle::MoveSwitch),
+            ("switchmove", CarryStyle::SwitchMove),
+            ("auto", CarryStyle::Auto),
+            ("fancy", CarryStyle::Auto),
+        ] {
+            assert_eq!(CarryStyle::from_code(code), want, "{code}");
+        }
+        // Written only when not "auto"; survives saving from the dialog.
+        assert!(!Settings::default().to_json().contains("carryStyle"));
+        let mut s = Settings::default();
+        s.carry_style = CarryStyle::MoveSwitch;
+        s.carry_create_new = true;
+        let text = s.to_json();
+        assert!(text.contains("\"carryStyle\": \"moveSwitch\""));
+        assert_eq!(Settings::from_json(&text).unwrap(), s);
     }
 
     #[test]

@@ -24,6 +24,12 @@
         "SwitchDesktopWithAnimation": 22,
         "WaitForAnimationToComplete": 24
       },
+      "pinnedApps": {
+        "source": "IVirtualDesktopPinnedApps: same IID, service and method order in MScholtes/VirtualDesktop (file of this variant) and mrob95/pyvda com_defns.py (not build-dependent); for 22621+ also Ciantic/VirtualDesktopAccessor src/interfaces.rs",
+        "service": "B5A399E7-1C87-46B8-88E9-FC5747B171BD",
+        "iid": "4CE81583-1E4C-4632-A621-07A53543148F",
+        "slots": { "IsViewPinned": 6, "PinView": 7, "UnpinView": 8 }
+      },
       "desktopSlots": { "GetId": 4 },
       "viewSlots": { "GetViewForHwnd": 6 }
     },
@@ -48,6 +54,12 @@
         "FindDesktop": 13,
         "SetDesktopName": 15
       },
+      "pinnedApps": {
+        "source": "IVirtualDesktopPinnedApps: same IID, service and method order in MScholtes/VirtualDesktop (file of this variant) and mrob95/pyvda com_defns.py (not build-dependent); for 22621+ also Ciantic/VirtualDesktopAccessor src/interfaces.rs",
+        "service": "B5A399E7-1C87-46B8-88E9-FC5747B171BD",
+        "iid": "4CE81583-1E4C-4632-A621-07A53543148F",
+        "slots": { "IsViewPinned": 6, "PinView": 7, "UnpinView": 8 }
+      },
       "desktopSlots": { "GetId": 4 }
     },
     {
@@ -70,6 +82,12 @@
         "RemoveDesktop": 12,
         "FindDesktop": 13,
         "SetDesktopName": 15
+      },
+      "pinnedApps": {
+        "source": "IVirtualDesktopPinnedApps: same IID, service and method order in MScholtes/VirtualDesktop (file of this variant) and mrob95/pyvda com_defns.py (not build-dependent); for 22621+ also Ciantic/VirtualDesktopAccessor src/interfaces.rs",
+        "service": "B5A399E7-1C87-46B8-88E9-FC5747B171BD",
+        "iid": "4CE81583-1E4C-4632-A621-07A53543148F",
+        "slots": { "IsViewPinned": 6, "PinView": 7, "UnpinView": 8 }
       },
       "desktopSlots": { "GetId": 4 }
     },
@@ -94,6 +112,12 @@
         "FindDesktop": 14,
         "SetDesktopName": 16
       },
+      "pinnedApps": {
+        "source": "IVirtualDesktopPinnedApps: same IID, service and method order in MScholtes/VirtualDesktop (file of this variant) and mrob95/pyvda com_defns.py (not build-dependent); for 22621+ also Ciantic/VirtualDesktopAccessor src/interfaces.rs",
+        "service": "B5A399E7-1C87-46B8-88E9-FC5747B171BD",
+        "iid": "4CE81583-1E4C-4632-A621-07A53543148F",
+        "slots": { "IsViewPinned": 6, "PinView": 7, "UnpinView": 8 }
+      },
       "desktopSlots": { "GetId": 4 }
     },
     {
@@ -117,6 +141,12 @@
         "FindDesktop": 13,
         "SetDesktopName": 15
       },
+      "pinnedApps": {
+        "source": "IVirtualDesktopPinnedApps: same IID, service and method order in MScholtes/VirtualDesktop (file of this variant) and mrob95/pyvda com_defns.py (not build-dependent); for 22621+ also Ciantic/VirtualDesktopAccessor src/interfaces.rs",
+        "service": "B5A399E7-1C87-46B8-88E9-FC5747B171BD",
+        "iid": "4CE81583-1E4C-4632-A621-07A53543148F",
+        "slots": { "IsViewPinned": 6, "PinView": 7, "UnpinView": 8 }
+      },
       "desktopSlots": { "GetId": 4 }
     },
     {
@@ -138,6 +168,12 @@
         "CreateDesktop": 10,
         "RemoveDesktop": 11,
         "FindDesktop": 12
+      },
+      "pinnedApps": {
+        "source": "IVirtualDesktopPinnedApps: same IID, service and method order in MScholtes/VirtualDesktop (file of this variant) and mrob95/pyvda com_defns.py (not build-dependent); for 22621+ also Ciantic/VirtualDesktopAccessor src/interfaces.rs",
+        "service": "B5A399E7-1C87-46B8-88E9-FC5747B171BD",
+        "iid": "4CE81583-1E4C-4632-A621-07A53543148F",
+        "slots": { "IsViewPinned": 6, "PinView": 7, "UnpinView": 8 }
       },
       "desktopSlots": { "GetId": 4 }
     }

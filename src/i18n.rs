@@ -172,6 +172,17 @@ strings! {
     TabGeneral => ["Obecné", "General"],
     TabApps => ["Aplikace", "Apps"],
     TabAdvanced => ["Pokročilé", "Advanced"],
+    TabKeys => ["Klávesy", "Keys"],
+    // Carrying a window (plan 12.13)
+    CarryHotkeyBusy => [
+        "Zkratku Win+Ctrl+Shift+←/→ používá jiná aplikace, přenášení okna je proto vypnuté.",
+        "Another app uses Win+Ctrl+Shift+←/→, so carrying a window is off."
+    ],
+    CarryUnavailable => [
+        "Přenášení okna není k dispozici: tato verze Windows není podporována.",
+        "Carrying a window is not available: this version of Windows is not supported."
+    ],
+    CarryCannotMove => ["Toto okno nelze přesunout", "This window cannot be moved"],
     // Long paragraphs of the dialogs (RC would cut them at 256 characters)
     SettingsHint => [
         "Aby klik na ikonu běžící aplikace přepnul na její plochu, nastavte ve Windows v části Plochy „Na hlavním panelu zobrazovat všechna otevřená okna“ na „Na všech plochách“. Shift + klik na ikonu spustí novou instanci aplikace.",

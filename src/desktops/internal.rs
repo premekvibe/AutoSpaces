@@ -164,6 +164,10 @@ pub struct InternalBackend {
     mgr: ComPtr,
     views: ComPtr,
     public: ComPtr,
+    /// The immersive shell (IServiceProvider), for services asked for later (pinning).
+    shell: ComPtr,
+    /// `IVirtualDesktopPinnedApps`, obtained on first use (plan 12.13).
+    pins: std::cell::RefCell<Option<ComPtr>>,
 }
 
 /// No variant passed; carries diagnostics for extending `variants.json` (plan 5.3).
@@ -345,7 +349,8 @@ impl Candidate for System<'_> {
         let views = query_service(self.shell, &vc, &vc).map_err(|e| Skip::Views(e.hr()))?;
         let public = create_instance(CLSID_VDM_PUBLIC, CLSCTX_ALL, IID_VDM_PUBLIC).map_err(|e| Skip::Views(e.hr()))?;
         let name = format!("internal:{}", v.name);
-        self.opened = Some(InternalBackend { name, v: v.clone(), mgr, views, public });
+        let shell = self.shell.query(&guid(IID_SERVICE_PROVIDER)).map_err(|e| Skip::Views(e.hr()))?;
+        self.opened = Some(InternalBackend { name, v: v.clone(), mgr, views, public, shell, pins: Default::default() });
         Ok(())
     }
 
@@ -393,6 +398,28 @@ impl InternalBackend {
     /// The variant in use was checked on a real system (`"verified": true` in variants.json).
     pub fn verified(&self) -> bool {
         self.v.verified
+    }
+
+    /// `IVirtualDesktopPinnedApps` of the variant, asked for once by `QueryService` (a wrong IID is
+    /// refused with E_NOINTERFACE; nothing is called).
+    fn pins(&self) -> Result<std::cell::Ref<'_, ComPtr>> {
+        let p = self.v.pinned_apps.as_ref().ok_or(Error::Permanent(super::backend::E_NOTIMPL))?;
+        if self.pins.borrow().is_none() {
+            let obj = query_service(&self.shell, &p.service, &p.iid)?;
+            *self.pins.borrow_mut() = Some(obj);
+        }
+        Ok(std::cell::Ref::map(self.pins.borrow(), |o| o.as_ref().expect("set above")))
+    }
+
+    /// `IsViewPinned`; the answer goes into a zeroed buffer (BOOL per one source, a 1-byte bool per
+    /// another): any non-zero byte is "pinned", bytes written beyond 4 mean a wrong layout.
+    fn view_pinned(&self, hwnd: HWND) -> Result<[u8; 8]> {
+        let view = self.view(hwnd)?;
+        let pins = self.pins()?;
+        let slot = self.v.pinned_apps.as_ref().map_or(0, |p| p.is_view_pinned);
+        let mut buf = [0u8; 8];
+        check(unsafe { pins.slot::<FnInOutBool>(slot)(pins.raw(), view.raw(), buf.as_mut_ptr() as *mut i32) })?;
+        Ok(buf)
     }
 
     /// Picks the first variant whose build range matches, whose IID Explorer accepts and which
@@ -538,5 +565,62 @@ impl DesktopBackend for InternalBackend {
         let (p, mut g) = (&self.public, Guid::ZERO);
         let hr = unsafe { p.slot::<FnHwndGuidOut>(SLOT_GET_WINDOW_DESKTOP_ID)(p.raw(), hwnd, &mut g) };
         (hr >= 0 && !g.is_zero()).then_some(g)
+    }
+
+    fn animates(&self) -> bool {
+        self.v.slots.opt("SwitchDesktopWithAnimation").is_some()
+    }
+
+    fn has_move_switch(&self) -> bool {
+        self.v.slots.opt("SwitchDesktopAndMoveForegroundView").is_some()
+    }
+
+    fn move_switch(&self, desk: Guid) -> Result<()> {
+        let slot = self.v.slots.opt("SwitchDesktopAndMoveForegroundView").ok_or(Error::Permanent(super::backend::E_NOTIMPL))?;
+        let d = self.find(desk)?;
+        let m = &self.mgr;
+        check(unsafe { m.slot::<FnIn1>(slot)(m.raw(), d.raw()) })
+    }
+
+    fn has_pin(&self) -> bool {
+        self.v.pinned_apps.is_some()
+    }
+
+    fn pin_probe(&self, hwnd: HWND) -> std::result::Result<(), String> {
+        // The pinning slots come from public sources only: like the self-test of an unverified
+        // variant, a check that never finished (the process died in it) is not repeated on this build.
+        let mut guard = match std::env::var_os("LOCALAPPDATA") {
+            Some(base) => Guard::open(std::path::Path::new(&base).join("AutoSpaces").join("selftest-guard.txt")),
+            None => Guard::default(),
+        };
+        let (name, build) = (format!("pin:{}", self.v.name), os_build());
+        if guard.crashed(&name, build) {
+            return Err("an earlier check on this build did not finish".into());
+        }
+        guard.begin(&name, build);
+        let res = self.view_pinned(hwnd);
+        guard.end();
+        let buf = res.map_err(|e| format!("IsViewPinned: {e}"))?;
+        if buf[4..].iter().any(|&b| b != 0) {
+            *self.pins.borrow_mut() = None;
+            return Err("IsViewPinned wrote more than a BOOL".into());
+        }
+        if buf[..4].iter().any(|&b| b != 0) {
+            *self.pins.borrow_mut() = None;
+            return Err("IsViewPinned answered true for a window on a desktop".into());
+        }
+        Ok(())
+    }
+
+    fn set_pinned(&self, hwnd: HWND, on: bool) -> Result<()> {
+        let p = self.v.pinned_apps.as_ref().ok_or(Error::Permanent(super::backend::E_NOTIMPL))?;
+        let view = self.view(hwnd)?;
+        let pins = self.pins()?;
+        let slot = if on { p.pin_view } else { p.unpin_view };
+        check(unsafe { pins.slot::<FnIn1>(slot)(pins.raw(), view.raw()) })
+    }
+
+    fn is_pinned(&self, hwnd: HWND) -> Result<bool> {
+        Ok(self.view_pinned(hwnd)?.iter().any(|&b| b != 0))
     }
 }

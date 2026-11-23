@@ -1,6 +1,7 @@
 #![windows_subsystem = "windows"]
 
 mod about_dlg;
+mod carry_ui;
 mod core;
 mod desktops;
 mod i18n;
@@ -49,6 +50,13 @@ const TIMER_BASE: usize = 100;
 const TIMER_REINIT: usize = 1;
 /// One-shot timer of the support reminder (plan 12.9).
 const TIMER_SUPPORT: usize = 2;
+/// While a window is carried: a safety check that the modifiers are still held (in case the
+/// keyboard hook was removed by Windows), and the delayed hiding of the indicator (plan 12.13).
+const TIMER_CARRY_WATCH: usize = 3;
+const TIMER_OSD_HIDE: usize = 4;
+const CARRY_WATCH_MS: u32 = 250;
+/// "This window cannot be moved" stays this long.
+const OSD_REFUSED_MS: u32 = 1200;
 /// Retry delay when the user is busy (full-screen app, layout profile, another dialog).
 const SUPPORT_RETRY_SECS: u64 = 5 * 60;
 /// Tick count at start (uptime of this run) and whether the reminder was shown in this run.
@@ -153,6 +161,11 @@ fn enter_no_backend(main: HWND, why: &NoBackend) {
         }
     };
     tray::set_mode(main, mode);
+    // Debug builds: `AUTOSPACES_NO_NOTICE=1` keeps a test copy quiet.
+    #[cfg(debug_assertions)]
+    if std::env::var_os("AUTOSPACES_NO_NOTICE").is_some() {
+        NOTICE_SHOWN.store(true, Relaxed);
+    }
     if !NOTICE_SHOWN.swap(true, Relaxed) {
         tray::notify(main, &text);
     }
@@ -421,7 +434,9 @@ fn open_settings(hwnd: HWND) {
     }
     let learned = o.learned_mut().list_named();
     // Modal; events keep flowing meanwhile, so the orchestrator is looked up again afterwards.
-    let Some(out) = settings_dlg::show(&current, learned, settings_dlg::running_apps, capture_layout) else { return };
+    let Some(out) = settings_dlg::show(&current, learned, settings_dlg::running_apps, capture_layout, carry_status()) else {
+        return;
+    };
     let Some(o) = orch() else { return };
     // The tray menu and every dialog opened from now on use the chosen language.
     i18n::set_pref(out.settings.language);
@@ -442,6 +457,7 @@ fn open_settings(hwnd: HWND) {
     // "Apply now": the profile is applied at once (the timer, if any, only runs while apps are awaited).
     let sch = if out.apply_now { o.start_layout() } else { None };
     after_orchestrator(hwnd, o, sch);
+    update_hotkey(hwnd);
 }
 
 /// Opens the About dialog (modal; shows the backend variant the app runs on, if any).
@@ -478,6 +494,8 @@ fn new_orchestrator(b: desktops::InternalBackend) -> Orch {
     };
     let mut o = Orchestrator::new(b, Win32Windows::new(), settings);
     o.set_learned(learned);
+    // Windows pinned by a carry are recorded in state.json before they are pinned (plan 12.13).
+    o.set_persist(Box::new(write_state));
     o.settings.enabled = tray::ENABLED.load(Relaxed);
     // Debug builds only: live tests move nothing but their own test processes.
     #[cfg(debug_assertions)]
@@ -498,11 +516,16 @@ fn begin_startup(main: HWND, o: &mut Orch) {
 
 fn flush_state(o: &mut Orch) {
     if o.take_dirty() {
-        if let Some(dir) = app_dir() {
-            let tmp = dir.join("state.json.tmp");
-            if std::fs::write(&tmp, core::state::to_json(&o.snapshot(), o.baseline())).is_ok() {
-                let _ = std::fs::rename(&tmp, dir.join("state.json"));
-            }
+        write_state(o.state_json());
+    }
+}
+
+/// Writes `state.json` (via a temporary file, so a crash never leaves half a file).
+fn write_state(text: String) {
+    if let Some(dir) = app_dir() {
+        let tmp = dir.join("state.json.tmp");
+        if std::fs::write(&tmp, text).is_ok() {
+            let _ = std::fs::rename(&tmp, dir.join("state.json"));
         }
     }
 }
@@ -524,6 +547,7 @@ fn restore_cli() -> i32 {
             let st = load_state();
             out.push(format!("state.json: {} managed window(s), baseline {:?}", st.spaces.len(), st.baseline));
             o.adopt(st.spaces, st.baseline);
+            o.release_pins(st.pinned);
             o.give_back_all();
             out.extend(o.drain_log());
             flush_state(&mut o);
@@ -546,6 +570,119 @@ fn after_orchestrator(hwnd: HWND, o: &mut Orch, sch: Option<Schedule>) {
     if let Some(s) = sch {
         schedule(hwnd, s);
     }
+    carry_sync(hwnd, o);
+}
+
+// ---------------------------------------------------------------- carrying a window (plan 12.13)
+
+/// Registers or releases Win+Ctrl+Shift+Left/Right as the settings say (only with a backend).
+fn update_hotkey(main: HWND) {
+    let want = orch().is_some_and(|o| o.settings.carry_enabled);
+    // Debug builds: `AUTOSPACES_NO_HOTKEY=1` leaves the shortcut to the installed instance.
+    #[cfg(debug_assertions)]
+    let want = want && std::env::var_os("AUTOSPACES_NO_HOTKEY").is_none();
+    if want {
+        if carry_ui::registered() {
+            return;
+        }
+        if carry_ui::register(main) {
+            log_line("carry: Win+Ctrl+Shift+Left/Right registered");
+        } else {
+            log_line("carry: Win+Ctrl+Shift+Left/Right is taken by another app; carrying is off");
+        }
+    } else if !want {
+        carry_ui::unregister(main);
+    }
+}
+
+/// Text for the settings dialog when carrying cannot work.
+fn carry_status() -> Option<String> {
+    if orch().is_none() {
+        Some(i18n::t(i18n::Key::CarryUnavailable).to_string())
+    } else if carry_ui::register_failed() {
+        Some(i18n::t(i18n::Key::CarryHotkeyBusy).to_string())
+    } else {
+        None
+    }
+}
+
+fn on_hotkey(main: HWND, id: i32) {
+    let Some(o) = orch() else { return };
+    let first = !o.carrying();
+    let (outcome, sch) = o.carry_step(id == carry_ui::HK_RIGHT);
+    match outcome {
+        core::orchestrator::CarryOutcome::Carrying if first && o.carrying() => {
+            // Win was used with a key: releasing it must not open the Start menu.
+            carry_ui::mask_win_key();
+            carry_ui::hook_on(main);
+            unsafe { SetTimer(main, TIMER_CARRY_WATCH, CARRY_WATCH_MS, None) };
+        }
+        core::orchestrator::CarryOutcome::CannotMove => {
+            carry_ui::mask_win_key();
+            carry_ui::osd_show(&core::carry::Osd::cannot_move(), std::ptr::null_mut(), i18n::t(i18n::Key::CarryCannotMove));
+            unsafe { SetTimer(main, TIMER_OSD_HIDE, OSD_REFUSED_MS, None) };
+        }
+        _ => {}
+    }
+    after_orchestrator(main, o, sch);
+}
+
+/// The hook saw the modifiers released (`cancel` = false) or Esc (`cancel`).
+fn on_carry_drop(main: HWND, cancel: bool) {
+    if cancel {
+        carry_ui::mask_win_key(); // Esc was swallowed while Win is held
+    }
+    if let Some(o) = orch() {
+        let sch = o.carry_drop(cancel);
+        after_orchestrator(main, o, sch);
+    }
+}
+
+/// Keeps the hook, the safety timer and the indicator in line with the orchestrator.
+fn carry_sync(main: HWND, o: &Orch) {
+    if o.carrying() {
+        if let Some(osd) = o.carry_osd() {
+            unsafe { KillTimer(main, TIMER_OSD_HIDE) };
+            carry_ui::osd_show(&osd, o.carried(), "");
+        }
+    } else if carry_ui::hook_installed() {
+        carry_ui::hook_off();
+        unsafe {
+            KillTimer(main, TIMER_CARRY_WATCH);
+            SetTimer(main, TIMER_OSD_HIDE, core::carry::OSD_LINGER_MS, None);
+        }
+    }
+}
+
+/// Ends any carry (unpinning the window) and removes everything of the carry UI.
+fn carry_shutdown(main: HWND) {
+    if let Some(o) = orch() {
+        o.carry_abort();
+        for l in o.drain_log() {
+            log_line(&l);
+        }
+        flush_state(o);
+    }
+    carry_ui::hook_off();
+    carry_ui::unregister(main);
+    carry_ui::osd_hide();
+}
+
+/// Debug builds only: `AUTOSPACES_SHOW_CARRY_OSD=<count>:<target>[:new]` or `=nomove` shows the
+/// indicator for 10 s without carrying anything (screenshots).
+#[cfg(debug_assertions)]
+fn debug_carry_osd(main: HWND) {
+    let Ok(v) = std::env::var("AUTOSPACES_SHOW_CARRY_OSD") else { return };
+    if v == "nomove" {
+        carry_ui::osd_show(&core::carry::Osd::cannot_move(), std::ptr::null_mut(), i18n::t(i18n::Key::CarryCannotMove));
+    } else {
+        let mut it = v.split(':');
+        let count = it.next().and_then(|s| s.parse().ok()).unwrap_or(4);
+        let target: usize = it.next().and_then(|s| s.parse().ok()).unwrap_or(2);
+        let new = it.next() == Some("new");
+        carry_ui::osd_show(&core::carry::Osd::new(count, target.saturating_sub(1), new), std::ptr::null_mut(), "");
+    }
+    unsafe { SetTimer(main, TIMER_OSD_HIDE, 10_000, None) };
 }
 
 fn schedule(main: HWND, s: Schedule) {
@@ -582,6 +719,21 @@ fn on_timer(main: HWND, id: usize) {
             on_support_timer(main);
             return;
         }
+        if id == TIMER_CARRY_WATCH {
+            if !orch().is_some_and(|o| o.carrying()) {
+                KillTimer(main, id);
+            } else if !carry_ui::modifiers_held() {
+                on_carry_drop(main, false);
+            }
+            return;
+        }
+        if id == TIMER_OSD_HIDE {
+            KillTimer(main, id);
+            if !orch().is_some_and(|o| o.carrying()) {
+                carry_ui::osd_hide();
+            }
+            return;
+        }
         KillTimer(main, id);
         let timers = &mut *std::ptr::addr_of_mut!(TIMERS);
         if let Some(pos) = timers.iter().position(|t| t.0 == id) {
@@ -609,10 +761,12 @@ fn reinit_backend(main: HWND) {
                     let mut o = new_orchestrator(b);
                     let st = load_state();
                     o.adopt(st.spaces, st.baseline);
+                    o.release_pins(st.pinned);
                     *std::ptr::addr_of_mut!(ORCH) = Some(o);
                     if let Some(o) = orch() {
                         begin_startup(main, o);
                     }
+                    update_hotkey(main);
                 }
             }
             if let Some(o) = orch() {
@@ -633,7 +787,7 @@ fn reinit_backend(main: HWND) {
 }
 
 fn load_state() -> core::state::Stored {
-    let none = || core::state::Stored { spaces: Vec::new(), baseline: None };
+    let none = core::state::Stored::empty;
     let Some(dir) = app_dir() else {
         return none();
     };
@@ -648,6 +802,7 @@ fn load_state() -> core::state::Stored {
 
 /// Gives every managed window back, levels the desktops and closes the hidden window (ends the loop).
 unsafe fn exit_clean(hwnd: HWND) {
+    carry_shutdown(hwnd);
     if let Some(o) = orch() {
         o.give_back_all();
         after_orchestrator(hwnd, o, None);
@@ -720,6 +875,14 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             on_timer(hwnd, wp);
             0
         }
+        windows_sys::Win32::UI::WindowsAndMessaging::WM_HOTKEY => {
+            on_hotkey(hwnd, wp as i32);
+            0
+        }
+        carry_ui::WM_CARRY_DROP => {
+            on_carry_drop(hwnd, wp != 0);
+            0
+        }
         tray::WM_TRAY => {
             if lp as u32 == WM_RBUTTONUP {
                 let named = orch().map(|o| o.learned_mut().list_named()).unwrap_or_default();
@@ -762,6 +925,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             0
         }
         WM_DESTROY => {
+            carry_shutdown(hwnd);
             tray::remove(hwnd);
             if let Some(w) = (*std::ptr::addr_of_mut!(WATCHER)).as_mut() {
                 w.stop();
@@ -862,6 +1026,7 @@ fn main() {
                 let mut o = new_orchestrator(b);
                 let st = load_state();
                 o.adopt(st.spaces, st.baseline);
+                o.release_pins(st.pinned);
                 *std::ptr::addr_of_mut!(ORCH) = Some(o);
                 if let Some(o) = orch() {
                     // Arrangement + layout profile as one sequence, after the delay (plan 12.11).
@@ -879,6 +1044,9 @@ fn main() {
         }
 
         tray::add(hwnd);
+        update_hotkey(hwnd);
+        #[cfg(debug_assertions)]
+        debug_carry_osd(hwnd);
         if let Some(why) = no_backend {
             enter_no_backend(hwnd, &why);
         }

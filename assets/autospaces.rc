@@ -27,6 +27,7 @@
 #define SS_REALSIZECONTROL 0x40
 #define SS_OWNERDRAW 0xD
 #define CBS_DROPDOWNLIST 3
+#define BS_MULTILINE 0x2000
 
 // AS_VER_COMMA / AS_VER_STR come from build.rs (version in Cargo.toml is the single source).
 #include "version.h"

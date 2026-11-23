@@ -68,6 +68,42 @@ pub struct Variant {
     /// Checked on a real system (`"verified": true`). Unverified variants (slots taken from public
     /// sources only) need a closed build range and are used only after the read-only self-test.
     pub verified: bool,
+    /// `IVirtualDesktopPinnedApps` (plan 12.13), only where two independent sources agree.
+    pub pinned_apps: Option<PinnedApps>,
+}
+
+/// `IVirtualDesktopPinnedApps`: obtained by `QueryService(service, iid)` on the immersive shell.
+/// Used only to pin a carried window for the duration of the carry (plan 12.13).
+#[derive(Clone, Debug, PartialEq)]
+pub struct PinnedApps {
+    pub service: Guid,
+    pub iid: Guid,
+    pub is_view_pinned: usize,
+    pub pin_view: usize,
+    pub unpin_view: usize,
+}
+
+fn parse_pinned(o: &Json) -> Result<PinnedApps, String> {
+    let slots = o.get("slots").ok_or("pinnedApps: missing 'slots'")?;
+    if let Json::Obj(m) = slots {
+        if let Some((k, _)) = m.iter().find(|(k, _)| !["IsViewPinned", "PinView", "UnpinView"].contains(&k.as_str())) {
+            return Err(format!("pinnedApps: unknown slot '{k}'"));
+        }
+    } else {
+        return Err("pinnedApps: 'slots' must be an object".into());
+    }
+    let p = PinnedApps {
+        service: guid_field(o, "service", None).map_err(|e| format!("pinnedApps: {e}"))?,
+        iid: guid_field(o, "iid", None).map_err(|e| format!("pinnedApps: {e}"))?,
+        is_view_pinned: required_slot(slots, "IsViewPinned")?,
+        pin_view: required_slot(slots, "PinView")?,
+        unpin_view: required_slot(slots, "UnpinView")?,
+    };
+    // Same order in every known layout: IsViewPinned < PinView < UnpinView.
+    if !(p.is_view_pinned < p.pin_view && p.pin_view < p.unpin_view) {
+        return Err("pinnedApps: slots must be IsViewPinned < PinView < UnpinView".into());
+    }
+    Ok(p)
 }
 
 impl Variant {
@@ -208,6 +244,10 @@ fn parse_variant(o: &Json) -> Result<Variant, String> {
         },
         desktop_get_id: required_slot(desktop_slots, "GetId").map_err(ctx)?,
         view_for_hwnd,
+        pinned_apps: match o.get("pinnedApps") {
+            None | Some(Json::Null) => None,
+            Some(p) => Some(parse_pinned(p).map_err(ctx)?),
+        },
         name: name.clone(),
     };
     if v.max_build.is_some_and(|m| m < v.min_build) {
@@ -354,6 +394,30 @@ mod tests {
         assert!(parse_variants(&opt("\"SetDesktopName\":11")).is_err());
         assert!(parse_variants(&opt("\"SwitchDesktopAndMoveForegroundView\":8")).is_err());
         assert!(parse_variants(&opt("\"SwitchDesktopWithAnimation\":20,\"WaitForAnimationToComplete\":20")).is_err());
+    }
+
+    #[test]
+    fn pinning_interface_from_two_sources_in_every_variant() {
+        for v in parse_variants(EMBEDDED).unwrap() {
+            let p = v.pinned_apps.as_ref().unwrap_or_else(|| panic!("{}", v.name));
+            assert_eq!(p.service.to_string(), "B5A399E7-1C87-46B8-88E9-FC5747B171BD", "{}", v.name);
+            assert_eq!(p.iid.to_string(), "4CE81583-1E4C-4632-A621-07A53543148F", "{}", v.name);
+            assert_eq!((p.is_view_pinned, p.pin_view, p.unpin_view), (6, 7, 8), "{}", v.name);
+        }
+        // Optional: a variant without it parses; a wrong order or an unknown slot does not.
+        assert_eq!(parse_variants(MIN).unwrap()[0].pinned_apps, None);
+        let with = |slots: &str| {
+            MIN.replace(
+                "\"desktopSlots\"",
+                &format!(
+                    "\"pinnedApps\":{{\"service\":\"B5A399E7-1C87-46B8-88E9-FC5747B171BD\",\"iid\":\"4CE81583-1E4C-4632-A621-07A53543148F\",\"slots\":{{{slots}}}}},\"desktopSlots\""
+                ),
+            )
+        };
+        assert!(parse_variants(&with("\"IsViewPinned\":6,\"PinView\":7,\"UnpinView\":8")).is_ok());
+        assert!(parse_variants(&with("\"IsViewPinned\":7,\"PinView\":6,\"UnpinView\":8")).is_err());
+        assert!(parse_variants(&with("\"IsViewPinned\":6,\"PinView\":7")).is_err());
+        assert!(parse_variants(&with("\"IsViewPinned\":6,\"PinView\":7,\"UnpinView\":8,\"PinAppID\":4")).is_err());
     }
 
     #[test]
