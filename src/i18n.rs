@@ -183,6 +183,7 @@ strings! {
         "Carrying a window is not available: this version of Windows is not supported."
     ],
     CarryCannotMove => ["Toto okno nelze přesunout", "This window cannot be moved"],
+    DesktopWord => ["Plocha", "Desktop"],
     // Long paragraphs of the dialogs (RC would cut them at 256 characters)
     SettingsHint => [
         "Aby klik na ikonu běžící aplikace přepnul na její plochu, nastavte ve Windows v části Plochy „Na hlavním panelu zobrazovat všechna otevřená okna“ na „Na všech plochách“. Shift + klik na ikonu spustí novou instanci aplikace.",

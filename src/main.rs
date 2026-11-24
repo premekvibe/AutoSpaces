@@ -4,7 +4,9 @@ mod about_dlg;
 mod carry_ui;
 mod core;
 mod desktops;
+mod glass;
 mod i18n;
+mod overlay_ui;
 mod json;
 mod report;
 mod report_dlg;
@@ -51,12 +53,15 @@ const TIMER_REINIT: usize = 1;
 /// One-shot timer of the support reminder (plan 12.9).
 const TIMER_SUPPORT: usize = 2;
 /// While a window is carried: a safety check that the modifiers are still held (in case the
-/// keyboard hook was removed by Windows), and the delayed hiding of the indicator (plan 12.13).
+/// keyboard hook was removed by Windows), plan 12.13.
 const TIMER_CARRY_WATCH: usize = 3;
-const TIMER_OSD_HIDE: usize = 4;
+/// Hides the hint "This window cannot be moved".
+const TIMER_HINT_HIDE: usize = 4;
 const CARRY_WATCH_MS: u32 = 250;
 /// "This window cannot be moved" stays this long.
-const OSD_REFUSED_MS: u32 = 1200;
+const HINT_MS: u32 = 1200;
+/// Win+Ctrl+Shift held alone: the preview's delay (only while the three are held).
+const TIMER_PREVIEW: usize = 5;
 /// Retry delay when the user is busy (full-screen app, layout profile, another dialog).
 const SUPPORT_RETRY_SECS: u64 = 5 * 60;
 /// Tick count at start (uptime of this run) and whether the reminder was shown in this run.
@@ -504,6 +509,7 @@ fn new_orchestrator(b: desktops::InternalBackend) -> Orch {
         log_line(&format!("debug: only these processes are moved: {}", names.join(", ")));
         o.set_only(names);
     }
+    o.set_overlay_available(overlay_ui::available());
     o
 }
 
@@ -570,6 +576,9 @@ fn after_orchestrator(hwnd: HWND, o: &mut Orch, sch: Option<Schedule>) {
     if let Some(s) = sch {
         schedule(hwnd, s);
     }
+    for s in o.drain_schedules() {
+        schedule(hwnd, s);
+    }
     carry_sync(hwnd, o);
 }
 
@@ -587,11 +596,16 @@ fn update_hotkey(main: HWND) {
         }
         if carry_ui::register(main) {
             log_line("carry: Win+Ctrl+Shift+Left/Right registered");
+            if !carry_ui::raw_on(main) {
+                log_line("carry: Raw Input refused; no preview while Win+Ctrl+Shift is held");
+            }
         } else {
             log_line("carry: Win+Ctrl+Shift+Left/Right is taken by another app; carrying is off");
         }
     } else if !want {
         carry_ui::unregister(main);
+        carry_ui::raw_off();
+        preview_hide(true);
     }
 }
 
@@ -606,8 +620,129 @@ fn carry_status() -> Option<String> {
     }
 }
 
+/// Win+Ctrl+Shift held alone (plan 12.13): the state machine fed by Raw Input, and whether the
+/// layers on screen are a preview (no carry yet).
+static mut CHORD: core::carry::Chord = core::carry::Chord::NEW;
+static PREVIEW: AtomicBool = AtomicBool::new(false);
+
+fn chord() -> &'static mut core::carry::Chord {
+    unsafe { &mut *std::ptr::addr_of_mut!(CHORD) }
+}
+
+/// Debug builds: number of key events seen (AUTOSPACES_RAW_PROBE; only the count, no keys).
+#[cfg(debug_assertions)]
+static RAW_EVENTS: AtomicU64 = AtomicU64::new(0);
+/// Debug builds: all WM_INPUT messages (the probe also registers the mouse, to show delivery).
+#[cfg(debug_assertions)]
+static RAW_MESSAGES: AtomicU64 = AtomicU64::new(0);
+
+/// Milliseconds on a fine clock (the preview's delay is short).
+fn fine_ms() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+}
+
+/// WM_INPUT: a key went up or down somewhere (only its kind is looked at).
+fn on_raw_input(main: HWND, lp: LPARAM) {
+    use core::carry::ChordAction;
+    #[cfg(debug_assertions)]
+    RAW_MESSAGES.fetch_add(1, Relaxed);
+    let Some((key, down)) = carry_ui::raw_key(lp) else { return };
+    #[cfg(debug_assertions)]
+    RAW_EVENTS.fetch_add(1, Relaxed);
+    let act = chord().key(key, down, fine_ms());
+    if orch().is_some_and(|o| o.carrying()) {
+        return; // the carry (and its keyboard hook) is in charge
+    }
+    match act {
+        ChordAction::Arm => {
+            // Built now, invisible: when the delay is over it only fades in.
+            unsafe { SetTimer(main, TIMER_PREVIEW, core::carry::PREVIEW_MS, None) };
+            preview_prepare();
+        }
+        ChordAction::Hide => preview_hide(false),
+        ChordAction::HideNow => preview_hide(true),
+        ChordAction::Show | ChordAction::None => {}
+    }
+    // Released (or another key) before the delay: the prepared layers go, unseen.
+    if PREVIEW.load(Relaxed) && !chord().armed() && !chord().shown() {
+        unsafe { KillTimer(main, TIMER_PREVIEW) };
+        preview_hide(true);
+    }
+}
+
+/// The preview's timer: Win+Ctrl+Shift has been held alone long enough.
+fn on_preview_timer(main: HWND) {
+    use core::carry::ChordAction;
+    unsafe { KillTimer(main, TIMER_PREVIEW) };
+    match chord().tick(fine_ms()) {
+        ChordAction::Show => {
+            if PREVIEW.load(Relaxed) {
+                overlay_ui::reveal();
+            } else {
+                chord().reset_preview(); // could not be prepared (window cannot be moved, ...)
+            }
+        }
+        // A timer may come a little early: wait for the rest.
+        _ if chord().armed() => unsafe {
+            SetTimer(main, TIMER_PREVIEW, 15, None);
+        },
+        _ => {}
+    }
+}
+
+/// Builds the overlay for the foreground window, invisible, without carrying anything (false =
+/// not here: the window cannot be moved, a full-screen app, the overlay is not used, ...).
+fn preview_prepare() -> bool {
+    use desktops::DesktopBackend;
+    let Some(o) = orch() else { return false };
+    let Some(w) = o.carry_preview() else { return false };
+    let Ok(list) = o.backend().desktops() else { return false };
+    let Some(cur) = o.backend().current().ok().and_then(|c| list.iter().position(|d| *d == c)) else { return false };
+    let b = o.backend();
+    let desk_of = |h: HWND| b.window_desktop(h);
+    let res = overlay_ui::begin(overlay_ui::Begin {
+        carried: w,
+        desktops: list,
+        start: cur,
+        target: cur,
+        create_new: o.settings.carry_create_new,
+        full: true,
+        hidden: true,
+        desk_of: &desk_of,
+        word: i18n::t(i18n::Key::DesktopWord),
+    });
+    match res {
+        Ok(()) => {
+            PREVIEW.store(true, Relaxed);
+            true
+        }
+        Err(e) => {
+            log_line(&format!("carry: preview cannot be drawn: {e}"));
+            overlay_ui::destroy();
+            false
+        }
+    }
+}
+
+/// Ends a preview: fading (`now` = false) or at once (another key: nothing may linger).
+fn preview_hide(now: bool) {
+    if PREVIEW.swap(false, Relaxed) {
+        if now {
+            overlay_ui::destroy();
+        } else {
+            overlay_ui::finish(None);
+        }
+    }
+}
+
+/// Time of the last carry key (GetTickCount64), for the safety timeout.
+static CARRY_LAST_KEY: AtomicU64 = AtomicU64::new(0);
+const CARRY_TIMEOUT_MS: u64 = 30_000;
+
 fn on_hotkey(main: HWND, id: i32) {
     let Some(o) = orch() else { return };
+    CARRY_LAST_KEY.store(unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount64() }, Relaxed);
     let first = !o.carrying();
     let (outcome, sch) = o.carry_step(id == carry_ui::HK_RIGHT);
     match outcome {
@@ -619,8 +754,8 @@ fn on_hotkey(main: HWND, id: i32) {
         }
         core::orchestrator::CarryOutcome::CannotMove => {
             carry_ui::mask_win_key();
-            carry_ui::osd_show(&core::carry::Osd::cannot_move(), std::ptr::null_mut(), i18n::t(i18n::Key::CarryCannotMove));
-            unsafe { SetTimer(main, TIMER_OSD_HIDE, OSD_REFUSED_MS, None) };
+            carry_ui::hint_show(i18n::t(i18n::Key::CarryCannotMove));
+            unsafe { SetTimer(main, TIMER_HINT_HIDE, HINT_MS, None) };
         }
         _ => {}
     }
@@ -638,19 +773,92 @@ fn on_carry_drop(main: HWND, cancel: bool) {
     }
 }
 
-/// Keeps the hook, the safety timer and the indicator in line with the orchestrator.
-fn carry_sync(main: HWND, o: &Orch) {
+/// Starts the layers for the running carry (plan 12.13): `full` = the overlay method (background,
+/// acrylic, stand-in, row), else only the row of previews. False = they cannot be drawn.
+fn overlay_begin(o: &Orch, full: bool) -> bool {
+    use desktops::DesktopBackend;
+    let Some((list, start)) = o.carry_desktops() else { return false };
+    let target = o.carry_target().map_or(start, |t| t.1);
+    let b = o.backend();
+    let desk_of = |h: HWND| b.window_desktop(h);
+    let t0 = std::time::Instant::now();
+    let res = overlay_ui::begin(overlay_ui::Begin {
+        carried: o.carried(),
+        desktops: list,
+        start,
+        target,
+        create_new: o.settings.carry_create_new,
+        full,
+        hidden: false,
+        desk_of: &desk_of,
+        word: i18n::t(i18n::Key::DesktopWord),
+    });
+    match res {
+        Ok(()) => {
+            log_line(&format!("carry: layers ready in {} ms ({})", t0.elapsed().as_millis(), if full { "overlay" } else { "row only" }));
+            true
+        }
+        Err(e) => {
+            log_line(&format!("carry: layers cannot be drawn ({}): {e}", if full { "overlay" } else { "row only" }));
+            false
+        }
+    }
+}
+
+/// Keeps the hook, the safety timer and the layers (the row of previews is the only indicator,
+/// for every method) in line with the orchestrator.
+fn carry_sync(main: HWND, o: &mut Orch) {
+    use desktops::DesktopBackend;
     if o.carrying() {
-        if let Some(osd) = o.carry_osd() {
-            unsafe { KillTimer(main, TIMER_OSD_HIDE) };
-            carry_ui::osd_show(&osd, o.carried(), "");
+        // From a preview: the carry goes on with its layers when they show the carried window.
+        if PREVIEW.swap(false, Relaxed) {
+            chord().reset_preview();
+            unsafe { KillTimer(main, TIMER_PREVIEW) };
+            let full = o.carry_style() == Some(core::settings::CarryStyle::Overlay);
+            if !full || overlay_ui::carried() != Some(o.carried()) {
+                overlay_ui::destroy();
+            } else {
+                overlay_ui::reveal(); // an arrow before the delay was over
+            }
         }
-    } else if carry_ui::hook_installed() {
+        // A carry started while the last one's layers still fade: new layers.
+        if overlay_ui::closing() {
+            overlay_ui::destroy();
+        }
+        if overlay_ui::active() {
+            if let (Some((_, target)), Some((list, _))) = (o.carry_target(), o.carry_desktops()) {
+                overlay_ui::set_target(target, &list, i18n::t(i18n::Key::DesktopWord));
+            }
+            return;
+        }
+        let full = o.carry_style() == Some(core::settings::CarryStyle::Overlay);
+        if overlay_begin(o, full) || !full {
+            return;
+        }
+        // The overlay could not be drawn: this carry goes on with the next method (the next
+        // carry tries the overlay again), with the row only.
+        overlay_ui::destroy();
+        let sch = o.carry_overlay_failed();
+        for l in o.drain_log() {
+            log_line(&l);
+        }
+        flush_state(o);
+        if let Some(s) = sch {
+            schedule(main, s);
+        }
+        if o.carrying() {
+            overlay_begin(o, false);
+        }
+        return;
+    }
+    if overlay_ui::active() && !overlay_ui::closing() && !PREVIEW.load(Relaxed) {
+        // The drop's switch (if any) is done: the layers show the desktop now in view and fade.
+        let shown = o.backend().current().ok().and_then(|c| o.backend().desktops().ok()?.iter().position(|d| *d == c));
+        overlay_ui::finish(shown);
+    }
+    if carry_ui::hook_installed() {
         carry_ui::hook_off();
-        unsafe {
-            KillTimer(main, TIMER_CARRY_WATCH);
-            SetTimer(main, TIMER_OSD_HIDE, core::carry::OSD_LINGER_MS, None);
-        }
+        unsafe { KillTimer(main, TIMER_CARRY_WATCH) };
     }
 }
 
@@ -665,26 +873,12 @@ fn carry_shutdown(main: HWND) {
     }
     carry_ui::hook_off();
     carry_ui::unregister(main);
-    carry_ui::osd_hide();
+    carry_ui::hint_hide();
+    carry_ui::raw_off();
+    PREVIEW.store(false, Relaxed);
+    unsafe { KillTimer(main, TIMER_PREVIEW) };
+    overlay_ui::destroy();
 }
-
-/// Debug builds only: `AUTOSPACES_SHOW_CARRY_OSD=<count>:<target>[:new]` or `=nomove` shows the
-/// indicator for 10 s without carrying anything (screenshots).
-#[cfg(debug_assertions)]
-fn debug_carry_osd(main: HWND) {
-    let Ok(v) = std::env::var("AUTOSPACES_SHOW_CARRY_OSD") else { return };
-    if v == "nomove" {
-        carry_ui::osd_show(&core::carry::Osd::cannot_move(), std::ptr::null_mut(), i18n::t(i18n::Key::CarryCannotMove));
-    } else {
-        let mut it = v.split(':');
-        let count = it.next().and_then(|s| s.parse().ok()).unwrap_or(4);
-        let target: usize = it.next().and_then(|s| s.parse().ok()).unwrap_or(2);
-        let new = it.next() == Some("new");
-        carry_ui::osd_show(&core::carry::Osd::new(count, target.saturating_sub(1), new), std::ptr::null_mut(), "");
-    }
-    unsafe { SetTimer(main, TIMER_OSD_HIDE, 10_000, None) };
-}
-
 fn schedule(main: HWND, s: Schedule) {
     unsafe {
         let timers = &mut *std::ptr::addr_of_mut!(TIMERS);
@@ -720,18 +914,31 @@ fn on_timer(main: HWND, id: usize) {
             return;
         }
         if id == TIMER_CARRY_WATCH {
+            let idle = windows_sys::Win32::System::SystemInformation::GetTickCount64().saturating_sub(CARRY_LAST_KEY.load(Relaxed));
             if !orch().is_some_and(|o| o.carrying()) {
                 KillTimer(main, id);
+            } else if idle > CARRY_TIMEOUT_MS {
+                // Safety: no key for this long (the hook may have missed the release): the
+                // window goes back and the layers go away.
+                log_line("carry: no key for 30 s; cancelled");
+                on_carry_drop(main, true);
             } else if !carry_ui::modifiers_held() {
                 on_carry_drop(main, false);
             }
             return;
         }
-        if id == TIMER_OSD_HIDE {
+        #[cfg(debug_assertions)]
+        if (90..=92).contains(&id) {
+            debug_preview_step(main, id);
+            return;
+        }
+        if id == TIMER_PREVIEW {
+            on_preview_timer(main);
+            return;
+        }
+        if id == TIMER_HINT_HIDE {
             KillTimer(main, id);
-            if !orch().is_some_and(|o| o.carrying()) {
-                carry_ui::osd_hide();
-            }
+            carry_ui::hint_hide();
             return;
         }
         KillTimer(main, id);
@@ -802,6 +1009,10 @@ fn load_state() -> core::state::Stored {
 
 /// Gives every managed window back, levels the desktops and closes the hidden window (ends the loop).
 unsafe fn exit_clean(hwnd: HWND) {
+    #[cfg(debug_assertions)]
+    if let Ok(f) = std::env::var("AUTOSPACES_RAW_PROBE") {
+        let _ = std::fs::write(f, format!("key events seen: {}, raw input messages (keyboard + mouse): {}\n", RAW_EVENTS.load(Relaxed), RAW_MESSAGES.load(Relaxed)));
+    }
     carry_shutdown(hwnd);
     if let Some(o) = orch() {
         o.give_back_all();
@@ -879,6 +1090,11 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             on_hotkey(hwnd, wp as i32);
             0
         }
+        windows_sys::Win32::UI::WindowsAndMessaging::WM_INPUT => {
+            on_raw_input(hwnd, lp);
+            // The system cleans the raw input up.
+            DefWindowProcW(hwnd, msg, wp, lp)
+        }
         carry_ui::WM_CARRY_DROP => {
             on_carry_drop(hwnd, wp != 0);
             0
@@ -946,6 +1162,157 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
     }
 }
 
+/// Debug builds only: `AUTOSPACES_OVERLAY_DEMO=<folder>` draws the carry overlay over the current
+/// desktop for about 4 s with the foreground window as the "carried" one, moves the highlight
+/// (right, right, right, wrap, left) and fades out (AUTOSPACES_OVERLAY_DEMO_ROW=1: only the row,
+/// as with the other methods); then shows the hint "cannot be moved" for a moment. Nothing is carried, switched or moved, no hotkey or hook; no other instance is
+/// touched. Screenshots (BMP) and `demo.txt` (timing) go into the folder.
+#[cfg(debug_assertions)]
+fn overlay_demo(dir: &std::path::Path) -> i32 {
+    use desktops::DesktopBackend;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{DispatchMessageW, GetForegroundWindow, PeekMessageW, MSG, PM_REMOVE};
+    let _ = std::fs::create_dir_all(dir);
+    let apartment = desktops::Apartment::init();
+    let mut out = Vec::new();
+    let code = match init_backend() {
+        Err(_) => {
+            out.push("no backend".to_string());
+            1
+        }
+        Ok(b) => {
+            let list = b.desktops().unwrap_or_default();
+            let cur = b.current().ok().and_then(|c| list.iter().position(|d| *d == c)).unwrap_or(0);
+            // `AUTOSPACES_OVERLAY_DEMO_SAMPLE=1`: a sample window of the demo itself is "carried"
+            // (so that the blur around it is seen even when the foreground window is maximized).
+            let sample = std::env::var_os("AUTOSPACES_OVERLAY_DEMO_SAMPLE").map(|_| unsafe { demo_sample_window() });
+            let carried = sample.unwrap_or_else(|| unsafe { GetForegroundWindow() });
+            out.push(format!("desktops {}, current {}, overlay available {}", list.len(), cur + 1, overlay_ui::available()));
+            let desk_of = |h: HWND| b.window_desktop(h);
+            let shots = std::env::var_os("AUTOSPACES_OVERLAY_DEMO_NOSHOTS").is_none().then_some(dir);
+            let full = std::env::var_os("AUTOSPACES_OVERLAY_DEMO_ROW").is_none();
+            out.push(overlay_ui::demo(carried, list.clone(), cur, full, &desk_of, shots));
+            carry_ui::hint_show(i18n::t(i18n::Key::CarryCannotMove));
+            let t = std::time::Instant::now();
+            let mut msg: MSG = unsafe { std::mem::zeroed() };
+            while t.elapsed().as_millis() < 500 {
+                unsafe {
+                    while PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+                        DispatchMessageW(&msg);
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            if shots.is_some() {
+                overlay_ui::capture(&dir.join("overlay-6-hint-cannot-move.bmp"));
+            }
+            carry_ui::hint_hide();
+            // A quiet moment after the layers are gone (memory can be read from outside).
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+            if let Some(h) = sample {
+                unsafe { windows_sys::Win32::UI::WindowsAndMessaging::DestroyWindow(h) };
+            }
+            0
+        }
+    };
+    drop(apartment);
+    let _ = std::fs::write(dir.join("demo.txt"), out.join("\n") + "\n");
+    code
+}
+
+/// Debug builds: a plain captioned window of the demo (not activated, not on the taskbar).
+#[cfg(debug_assertions)]
+unsafe fn demo_sample_window() -> HWND {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        ShowWindow, SW_SHOWNOACTIVATE, WS_EX_TOOLWINDOW, WS_OVERLAPPEDWINDOW,
+    };
+    use windows_sys::Win32::Graphics::Gdi::{UpdateWindow, COLOR_WINDOW};
+    let hinst = GetModuleHandleW(std::ptr::null());
+    let class = tray::wide("AutoSpacesDemoSample");
+    let mut wc: WNDCLASSW = std::mem::zeroed();
+    wc.lpfnWndProc = Some(demo_sample_proc);
+    wc.hInstance = hinst;
+    wc.hbrBackground = (COLOR_WINDOW + 1) as usize as _;
+    wc.lpszClassName = class.as_ptr();
+    RegisterClassW(&wc);
+    let title = tray::wide("AutoSpaces – ukázkové okno (demo)");
+    let h = CreateWindowExW(WS_EX_TOOLWINDOW, class.as_ptr(), title.as_ptr(), WS_OVERLAPPEDWINDOW, 700, 300, 1160, 620, std::ptr::null_mut(), std::ptr::null_mut(), hinst, std::ptr::null());
+    ShowWindow(h, SW_SHOWNOACTIVATE);
+    UpdateWindow(h);
+    h
+}
+
+/// Debug builds: the sample window shows fine detail (1 px lines, small text) for the sharpness check.
+#[cfg(debug_assertions)]
+unsafe extern "system" fn demo_sample_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    use windows_sys::Win32::Graphics::Gdi::{BeginPaint, EndPaint, LineTo, MoveToEx, SetBkMode, TextOutW, PAINTSTRUCT, TRANSPARENT};
+    if msg == windows_sys::Win32::UI::WindowsAndMessaging::WM_PAINT {
+        let mut ps: PAINTSTRUCT = std::mem::zeroed();
+        let dc = BeginPaint(h, &mut ps);
+        for i in 0..120 {
+            let x = 20 + i * 3;
+            MoveToEx(dc, x, 20, std::ptr::null_mut());
+            LineTo(dc, x, 200);
+        }
+        SetBkMode(dc, TRANSPARENT as i32);
+        for row in 0..14 {
+            let t = tray::wide("Ostrost 1:1 – AutoSpaces přenášení okna, malé písmo 0123456789 ilI1| ~~~");
+            TextOutW(dc, 400, 20 + row * 18, t.as_ptr(), t.len() as i32 - 1);
+        }
+        EndPaint(h, &ps);
+        return 0;
+    }
+    DefWindowProcW(h, msg, wp, lp)
+}
+/// Debug builds only. `AUTOSPACES_RAW_PROBE=<file>`: keyboard Raw Input is registered at start (also
+/// with `AUTOSPACES_NO_HOTKEY`); at exit the number of key events seen goes to the file (only
+/// the count). `AUTOSPACES_PREVIEW_DEMO=<folder>`: 3 s after start the Win+Ctrl+Shift preview is
+/// shown for the foreground window exactly as when the keys are held (no keys are sent), a
+/// screenshot is taken, it fades away and the app exits.
+#[cfg(debug_assertions)]
+fn debug_preview_start(main: HWND) {
+    if std::env::var_os("AUTOSPACES_RAW_PROBE").is_some() {
+        log_line(&format!("debug: raw input {}", carry_ui::raw_on(main)));
+        unsafe {
+            use windows_sys::Win32::UI::Input::{RegisterRawInputDevices, RAWINPUTDEVICE, RIDEV_INPUTSINK};
+            let devs = [
+                RAWINPUTDEVICE { usUsagePage: 1, usUsage: 6, dwFlags: RIDEV_INPUTSINK, hwndTarget: main },
+                RAWINPUTDEVICE { usUsagePage: 1, usUsage: 2, dwFlags: RIDEV_INPUTSINK, hwndTarget: main },
+            ];
+            RegisterRawInputDevices(devs.as_ptr(), 2, std::mem::size_of::<RAWINPUTDEVICE>() as u32);
+        }
+        // Exits after AUTOSPACES_RAW_PROBE_SECS (20) s; the count is written on the way out.
+        let secs = std::env::var("AUTOSPACES_RAW_PROBE_SECS").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(20);
+        unsafe { SetTimer(main, 92, secs * 1000, None) };
+    }
+    if std::env::var_os("AUTOSPACES_PREVIEW_DEMO").is_some() {
+        unsafe { SetTimer(main, 90, 3000, None) };
+    }
+}
+
+#[cfg(debug_assertions)]
+fn debug_preview_step(main: HWND, id: usize) {
+    unsafe { KillTimer(main, id) };
+    let dir = std::env::var("AUTOSPACES_PREVIEW_DEMO").unwrap_or_default();
+    let dir = std::path::Path::new(&dir);
+    match id {
+        90 => {
+            let t = std::time::Instant::now();
+            let shown = preview_prepare();
+            overlay_ui::reveal();
+            let _ = std::fs::write(dir.join("preview.txt"), format!("preview shown {shown} in {} ms\n", t.elapsed().as_millis()));
+            unsafe { SetTimer(main, 91, 700, None) };
+        }
+        91 => {
+            overlay_ui::capture(&dir.join("preview.bmp"));
+            preview_hide(false);
+            unsafe { SetTimer(main, 92, 600, None) };
+        }
+        _ => unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(main, WM_CLOSE, 0, 0);
+        },
+    }
+}
+
 /// Single-instance mutex (the installer's `AppMutex` is the same name) and the hidden window's class.
 const SINGLE_INSTANCE: &str = r"Local\AutoSpaces_SingleInstance";
 const WINDOW_CLASS: &str = "AutoSpacesHiddenWindow";
@@ -979,6 +1346,10 @@ fn main() {
             std::process::exit(2);
         }
         std::process::exit(restore_cli());
+    }
+    #[cfg(debug_assertions)]
+    if let Ok(dir) = std::env::var("AUTOSPACES_OVERLAY_DEMO") {
+        std::process::exit(overlay_demo(std::path::Path::new(&dir)));
     }
     unsafe {
         let mutex = CreateMutexW(std::ptr::null(), 0, tray::wide(&instance_mutex_name()).as_ptr());
@@ -1045,8 +1416,6 @@ fn main() {
 
         tray::add(hwnd);
         update_hotkey(hwnd);
-        #[cfg(debug_assertions)]
-        debug_carry_osd(hwnd);
         if let Some(why) = no_backend {
             enter_no_backend(hwnd, &why);
         }
@@ -1067,6 +1436,8 @@ fn main() {
         if std::env::var_os("AUTOSPACES_OPEN_SETTINGS").is_some() {
             windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(hwnd, windows_sys::Win32::UI::WindowsAndMessaging::WM_APP + 9, 0, 0);
         }
+        #[cfg(debug_assertions)]
+        debug_preview_start(hwnd);
         init_reg_notify();
         *std::ptr::addr_of_mut!(WATCHER) = Some(watcher::Watcher::start(hwnd));
 
@@ -1075,7 +1446,10 @@ fn main() {
             let ev = *std::ptr::addr_of!(REG_EVENT);
             let handles = [ev];
             let n = if ev.is_null() { 0 } else { 1 };
-            let r = MsgWaitForMultipleObjectsEx(n, handles.as_ptr(), u32::MAX, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+            // While the carry overlay moves or fades, frames are paced by DwmFlush (vsync) in
+            // `overlay_ui::frame`; otherwise the loop sleeps until something happens.
+            let wait = if overlay_ui::animating() { 0 } else { u32::MAX };
+            let r = MsgWaitForMultipleObjectsEx(n, handles.as_ptr(), wait, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
             if n == 1 && r == WAIT_OBJECT_0 {
                 arm_reg_notify();
                 if let Some(o) = orch() {
@@ -1093,6 +1467,11 @@ fn main() {
                 }
                 TranslateMessage(&msg);
                 DispatchMessageW(&msg);
+            }
+            if overlay_ui::animating() {
+                if let Some(line) = overlay_ui::frame() {
+                    log_line(&line);
+                }
             }
         }
         // Release COM proxies before the apartment is torn down.

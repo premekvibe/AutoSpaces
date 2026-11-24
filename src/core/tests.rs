@@ -78,6 +78,8 @@ struct World {
     pin_calls: RefCell<Vec<(usize, bool)>>,
     pin_probes: Cell<u32>,
     move_switches: RefCell<Vec<u32>>,
+    /// The animated flag of each switch.
+    switch_animated: RefCell<Vec<bool>>,
     /// Windows of an elevated process.
     elevated: RefCell<Vec<usize>>,
     /// state.json texts written through `set_persist`, with the pinned list at that moment.
@@ -170,10 +172,11 @@ impl DesktopBackend for FB {
         }
         Ok(())
     }
-    fn switch(&self, desk: Guid, _animated: bool) -> BResult<()> {
+    fn switch(&self, desk: Guid, animated: bool) -> BResult<()> {
         if self.0.fail_switch.get() {
             return Err(PERMANENT);
         }
+        self.0.switch_animated.borrow_mut().push(animated);
         self.0.switches.borrow_mut().push(desk.d1);
         self.0.current.set(desk);
         Ok(())
@@ -2585,7 +2588,6 @@ fn settings_log_key_default_off_tolerant_and_kept() {
 
 // ---------------------------------------------------------------- carrying a window (plan 12.13)
 
-use super::carry::Edge;
 use super::orchestrator::{carry_token, CarryOutcome};
 use super::settings::CarryStyle;
 
@@ -2613,14 +2615,14 @@ fn carry_rotates_both_ways_and_drops_where_the_view_is() {
     assert_eq!((w.desk_of(1).d1, w.current.get().d1), (2, 2));
     step(&mut o, true);
     assert_eq!((w.desk_of(1).d1, w.current.get().d1), (3, 3));
-    assert_eq!(o.carry_osd().unwrap().right, Edge::Wrap);
+    assert_eq!(o.carry_target(), Some((3, 2)));
     step(&mut o, true); // right from the last: desktop 1
     assert_eq!((w.desk_of(1).d1, w.current.get().d1), (1, 1));
-    assert_eq!(o.carry_osd().unwrap().left, Edge::Wrap);
+    assert_eq!(o.carry_target(), Some((3, 0)));
     step(&mut o, false); // left from desktop 1: the last
     assert_eq!((w.desk_of(1).d1, w.current.get().d1), (3, 3));
     assert_eq!(o.carry_drop(false), None);
-    assert!(!o.carrying() && o.carry_osd().is_none());
+    assert!(!o.carrying() && o.carry_target().is_none());
     assert_eq!((w.desk_of(1).d1, w.current.get().d1, list(&w)), (3, 3, vec![1, 2, 3]));
     assert_eq!(w.creates.get(), 0);
 }
@@ -2631,7 +2633,7 @@ fn carry_create_new_desktop_and_stop_at_desktop_one() {
     o.settings.carry_create_new = true;
     step(&mut o, true);
     step(&mut o, true);
-    assert_eq!(o.carry_osd().unwrap().right, Edge::New);
+    assert_eq!(o.carry_target(), Some((3, 2)));
     step(&mut o, true); // behind the last: a new desktop
     assert_eq!((w.count(), w.desk_of(1).d1, w.current.get().d1), (4, 4, 4));
     for _ in 0..3 {
@@ -2665,10 +2667,10 @@ fn fast_steps_are_merged_while_the_animation_runs() {
     assert_eq!(*w.switches.borrow(), vec![2]);
     let sch = sch.expect("timer for the end of the animation");
     assert_eq!((sch.hwnd, sch.delay_ms), (carry_token(), 440));
-    // Two more presses during the animation: the target (and the indicator) move at once ...
+    // Two more presses during the animation: the target (and the previews) move at once ...
     o.carry_step(true);
     o.carry_step(true);
-    assert_eq!(o.carry_osd().unwrap().target, 3);
+    assert_eq!(o.carry_target().unwrap().1, 3);
     assert_eq!(*w.switches.borrow(), vec![2], "no switch per press");
     // ... and when the animation ends, one switch goes straight there.
     w.tick(440);
@@ -2976,4 +2978,206 @@ fn carry_style_setting_is_honoured_within_what_is_available() {
     w.fg.set(902);
     step(&mut o, true);
     assert_eq!((w.desk_of(1).d1, w.move_switches.borrow().len()), (3, 1));
+}
+
+/// A world where the host can draw the overlay (and pinning / moveSwitch exist too).
+fn overlay_world(n: u32) -> (Rc<World>, Orch) {
+    let (w, mut o) = pin_world(n);
+    w.has_move_switch.set(true);
+    w.animates.set(true);
+    o.set_overlay_available(true);
+    (w, o)
+}
+
+#[test]
+fn overlay_moves_only_the_highlight_and_switches_once_without_animation_on_the_drop() {
+    let (w, mut o) = overlay_world(4);
+    assert_eq!(step(&mut o, true), CarryOutcome::Carrying);
+    assert_eq!(o.carry_style(), Some(CarryStyle::Overlay));
+    assert_eq!(o.carry_desktops().map(|(l, i)| (l.len(), i)), Some((4, 0)));
+    step(&mut o, true);
+    step(&mut o, true);
+    assert_eq!(o.carry_target().unwrap().1, 3);
+    // Nothing happened to the window or the view while carrying: no pin, no switch, no move.
+    assert!(w.switches.borrow().is_empty() && w.move_switches.borrow().is_empty());
+    assert!(w.pin_calls.borrow().is_empty() && w.pin_probes.get() == 0);
+    assert_eq!((w.desk_of(1).d1, w.current.get().d1), (1, 1));
+    // The drop: the window moves, then one switch without animation; no timer is needed.
+    assert_eq!(o.carry_drop(false), None);
+    assert!(!o.carrying());
+    assert_eq!((w.desk_of(1).d1, w.current.get().d1), (4, 4));
+    assert_eq!((w.switches.borrow().clone(), w.switch_animated.borrow().clone()), (vec![4], vec![false]));
+    assert!(!o.is_managed(h(1)));
+}
+
+#[test]
+fn overlay_esc_switches_nothing() {
+    let (w, mut o) = overlay_world(3);
+    step(&mut o, true);
+    step(&mut o, false);
+    step(&mut o, false); // rotation: desktop 3
+    assert_eq!(o.carry_target().unwrap().1, 2);
+    o.carry_drop(true);
+    assert!(!o.carrying());
+    assert!(w.switches.borrow().is_empty());
+    assert_eq!((w.desk_of(1).d1, w.current.get().d1, list(&w)), (1, 1, vec![1, 2, 3]));
+    // Dropped where it started: still managed as before (nothing moved).
+    assert!(o.pinned_by_carry().is_empty());
+}
+
+#[test]
+fn overlay_drop_on_the_start_desktop_changes_nothing() {
+    let (w, mut o) = overlay_world(3);
+    step(&mut o, true);
+    step(&mut o, false);
+    o.carry_drop(false);
+    assert!(w.switches.borrow().is_empty() && w.desk_of(1).d1 == 1);
+}
+
+#[test]
+fn overlay_with_new_desktop_creates_it_at_once_and_drops_there() {
+    let (w, mut o) = overlay_world(2);
+    o.settings.carry_create_new = true;
+    step(&mut o, true);
+    step(&mut o, true); // behind the last: created now (the row gets a new preview)
+    assert_eq!(w.count(), 3);
+    assert_eq!(o.carry_target().unwrap().1, 2);
+    o.carry_drop(false);
+    assert_eq!((w.desk_of(1).d1, w.current.get().d1), (3, 3));
+}
+
+#[test]
+fn overlay_that_cannot_be_drawn_falls_back_and_catches_up() {
+    let (w, mut o) = overlay_world(3);
+    step(&mut o, true);
+    // The host could not create the layers: the next best method (pinning, checked first).
+    o.carry_overlay_failed();
+    assert_eq!(o.carry_style(), Some(CarryStyle::Pin));
+    assert_eq!(*w.pin_calls.borrow(), vec![(1, true)]);
+    assert_eq!(w.current.get().d1, 2, "the view caught up with the target");
+    o.carry_drop(false);
+    w.tick(440); // the animated switch ends
+    o.on_event(carry_token(), Event::Recheck);
+    assert!(w.pinned.borrow().is_empty());
+    assert_eq!(w.desk_of(1).d1, 2);
+    // The next carry tries the overlay again.
+    step(&mut o, true);
+    assert_eq!(o.carry_style(), Some(CarryStyle::Overlay));
+    o.carry_drop(false);
+    w.tick(440);
+    o.on_event(carry_token(), Event::Recheck);
+    assert!(!o.carrying());
+}
+
+#[test]
+fn overlay_carry_ends_cleanly_on_exit_and_when_the_window_closes() {
+    let (w, mut o) = overlay_world(3);
+    step(&mut o, true);
+    o.give_back_all(); // exit: no switch, the window stays where it is
+    assert!(!o.carrying());
+    assert!(w.switches.borrow().is_empty() && w.desk_of(1).d1 == 1);
+    let (w, mut o) = overlay_world(3);
+    step(&mut o, true);
+    w.set_state(1, State::Destroyed);
+    o.on_event(h(1), Event::Destroy);
+    o.carry_drop(false);
+    assert!(!o.carrying());
+    assert!(w.switches.borrow().is_empty(), "closed window: the view stays");
+}
+
+#[test]
+fn overlay_not_used_unless_the_host_can_draw_it_or_another_method_is_chosen() {
+    let (w, mut o) = pin_world(3);
+    step(&mut o, true);
+    assert_eq!(o.carry_style(), Some(CarryStyle::Pin));
+    o.carry_drop(false);
+    let (w2, mut o2) = overlay_world(3);
+    o2.settings.carry_style = CarryStyle::SwitchMove;
+    step(&mut o2, true);
+    assert_eq!((o2.carry_style(), w2.desk_of(1).d1), (Some(CarryStyle::SwitchMove), 2));
+    drop(w);
+}
+
+#[test]
+fn preview_only_for_a_window_the_overlay_would_carry_and_without_side_effects() {
+    let (w, mut o) = overlay_world(3);
+    assert_eq!(o.carry_preview(), Some(h(1)));
+    assert!(w.switches.borrow().is_empty() && w.pin_calls.borrow().is_empty() && w.pin_probes.get() == 0);
+    assert!(o.drain_log().iter().all(|l| !l.contains("carry")), "nothing logged");
+    // A full-screen app (game, video) in front: no preview.
+    w.set_state(1, State::Fullscreen);
+    assert_eq!(o.carry_preview(), None);
+    w.set_state(1, State::Normal);
+    // A window that cannot be moved, the desktop / AutoSpaces / no window in front: none.
+    w.wins.borrow_mut().get_mut(&1).unwrap().can_move = false;
+    assert_eq!(o.carry_preview(), None);
+    w.wins.borrow_mut().get_mut(&1).unwrap().can_move = true;
+    w.fg.set(0);
+    assert_eq!(o.carry_preview(), None);
+    w.fg.set(1);
+    // Carrying off, or a carry already running: none.
+    o.settings.carry_enabled = false;
+    assert_eq!(o.carry_preview(), None);
+    o.settings.carry_enabled = true;
+    step(&mut o, true);
+    assert_eq!(o.carry_preview(), None);
+    o.carry_drop(true);
+    assert_eq!(o.carry_preview(), Some(h(1)));
+    // Another method chosen, or the overlay not available (remote session): none.
+    o.settings.carry_style = CarryStyle::Pin;
+    assert_eq!(o.carry_preview(), None);
+    let (_, o2) = pin_world(3);
+    assert_eq!(o2.carry_preview(), None);
+}
+
+use super::orchestrator::focus_token;
+
+#[test]
+fn dropped_window_is_brought_to_the_front_again_for_every_method_and_after_esc() {
+    for style in [CarryStyle::Overlay, CarryStyle::Pin, CarryStyle::MoveSwitch, CarryStyle::SwitchMove] {
+        for esc in [false, true] {
+            let (w, mut o) = overlay_world(3);
+            o.settings.carry_style = style;
+            w.set_state(902, State::Maximized); // a maximized window waits on desktop 2
+            step(&mut o, true);
+            o.carry_drop(esc);
+            // Animated switches (pin, switchMove) finish after the animation.
+            for _ in 0..3 {
+                w.tick(440);
+                o.on_event(carry_token(), Event::Recheck);
+            }
+            assert!(!o.carrying(), "{style:?}");
+            assert_eq!(w.fg.get(), 1, "{style:?}: active right after the drop");
+            let sch = o.drain_schedules();
+            assert_eq!(sch.iter().map(|s| (s.hwnd, s.delay_ms)).collect::<Vec<_>>(), vec![(focus_token(), 150)], "{style:?}");
+            // The shell activates the target desktop's own window a moment later ...
+            if !esc {
+                w.fg.set(902);
+            }
+            w.tick(150);
+            let next = o.on_event(focus_token(), Event::Recheck);
+            // ... and the dropped window comes back to the front; a second look follows.
+            assert_eq!(w.fg.get(), 1, "{style:?} esc {esc}");
+            assert_eq!(next.map(|s| (s.hwnd, s.delay_ms)), Some((focus_token(), 350)));
+            w.fg.set(902);
+            w.tick(350);
+            assert_eq!(o.on_event(focus_token(), Event::Recheck), None, "two looks only");
+            assert_eq!(w.fg.get(), 1, "{style:?} esc {esc}: in front again");
+        }
+    }
+}
+
+#[test]
+fn focus_follow_up_leaves_a_window_moved_to_another_desktop_alone() {
+    let (w, mut o) = overlay_world(3);
+    step(&mut o, true);
+    o.carry_drop(false);
+    assert_eq!(o.drain_schedules().len(), 1);
+    // Moved elsewhere by the rules (another desktop than the one in view): not activated here.
+    w.wins.borrow_mut().get_mut(&1).unwrap().desktop = g(3);
+    w.fg.set(902);
+    let before = w.activated.borrow().len();
+    w.tick(150);
+    o.on_event(focus_token(), Event::Recheck);
+    assert_eq!((w.fg.get(), w.activated.borrow().len()), (902, before));
 }

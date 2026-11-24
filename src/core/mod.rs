@@ -4,6 +4,7 @@ pub mod carry;
 pub mod learned;
 pub mod model;
 pub mod orchestrator;
+pub mod overlay;
 pub mod settings;
 pub mod state;
 pub mod support;

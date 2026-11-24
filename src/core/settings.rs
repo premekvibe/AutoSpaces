@@ -332,8 +332,11 @@ pub struct Settings {
 /// Value of the hidden `"carryStyle"` key: the visual method of carrying a window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CarryStyle {
-    /// The best one available: pin, else moveSwitch, else switchMove.
+    /// The best one available: overlay, else pin, else moveSwitch, else switchMove.
     Auto,
+    /// Own layers in the style of Task View: the screen is blurred, the window stays sharp in
+    /// place, a row of desktop previews shows the target; the desktop switches once, on the drop.
+    Overlay,
     /// The window is pinned to all desktops while the desktops slide under it.
     Pin,
     /// `SwitchDesktopAndMoveForegroundView` (one call per step).
@@ -346,6 +349,7 @@ impl CarryStyle {
     /// Unknown values keep the default (`auto`).
     pub fn from_code(s: &str) -> CarryStyle {
         match s.trim().to_ascii_lowercase().as_str() {
+            "overlay" => CarryStyle::Overlay,
             "pin" => CarryStyle::Pin,
             "moveswitch" => CarryStyle::MoveSwitch,
             "switchmove" => CarryStyle::SwitchMove,
@@ -356,6 +360,7 @@ impl CarryStyle {
     pub fn code(self) -> &'static str {
         match self {
             CarryStyle::Auto => "auto",
+            CarryStyle::Overlay => "overlay",
             CarryStyle::Pin => "pin",
             CarryStyle::MoveSwitch => "moveSwitch",
             CarryStyle::SwitchMove => "switchMove",
@@ -654,6 +659,7 @@ mod tests {
         assert!(!s.carry_enabled && s.carry_create_new && s.carry_style == CarryStyle::Pin);
         for (code, want) in [
             ("pin", CarryStyle::Pin),
+            ("Overlay", CarryStyle::Overlay),
             ("moveSwitch", CarryStyle::MoveSwitch),
             ("switchmove", CarryStyle::SwitchMove),
             ("auto", CarryStyle::Auto),

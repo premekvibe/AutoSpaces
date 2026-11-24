@@ -1,19 +1,18 @@
 //! Carrying a window (plan 12.13), the Win32 side: the shortcut (RegisterHotKey), the low-level
-//! keyboard hook that exists only while a window is carried, and the indicator (OSD).
+//! keyboard hook that exists only while a window is carried, and the hint for a window that cannot\n//! be moved (the row of desktop previews in overlay_ui is the carry's indicator).
 //!
 //! The hook records and logs nothing: it only looks at the three modifiers (released = drop) and
 //! Esc (swallowed, = take the window back); every other key passes untouched.
 
-use crate::core::carry::{Edge, Osd};
 use crate::tray::wide;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
 use windows_sys::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, CreateFontW, CreateRoundRectRgn, CreateSolidBrush, DeleteObject, DrawTextW, Ellipse, EndPaint,
-    FillRect, GetMonitorInfoW, GetStockObject, InvalidateRect, MonitorFromWindow, SelectObject, SetBkMode,
-    SetTextColor, SetWindowRgn, CLEARTYPE_QUALITY, DEFAULT_CHARSET, DT_CENTER, DT_NOPREFIX, DT_SINGLELINE,
-    DT_VCENTER, FW_NORMAL, FW_SEMIBOLD, HFONT, MONITORINFO, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY,
-    NULL_PEN, OUT_DEFAULT_PRECIS, PAINTSTRUCT, TRANSPARENT, CLIP_DEFAULT_PRECIS, DEFAULT_PITCH, CreatePen, PS_SOLID,
+    BeginPaint, CreateFontW, CreateRoundRectRgn, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect,
+    GetMonitorInfoW, InvalidateRect, MonitorFromWindow, SelectObject, SetBkMode, SetTextColor, SetWindowRgn,
+    CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_PITCH, DT_CENTER, DT_NOPREFIX, DT_SINGLELINE,
+    DT_VCENTER, FW_SEMIBOLD, MONITORINFO, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, OUT_DEFAULT_PRECIS,
+    PAINTSTRUCT, TRANSPARENT,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
@@ -164,22 +163,89 @@ pub fn hook_installed() -> bool {
     HOOK.load(Relaxed) != 0
 }
 
-// ---------------------------------------------------------------- indicator
+// ---------------------------------------------------------------- Win+Ctrl+Shift held (Raw Input)
 
-const OSD_CLASS: &str = "AutoSpacesCarryOsd";
-static OSD: AtomicUsize = AtomicUsize::new(0);
-static mut OSD_STATE: Option<Paint> = None;
+// The preview (plan 12.13) needs to know when Win, Ctrl and Shift are held alone. Raw Input
+// (RIDEV_INPUTSINK on the hidden window) delivers a copy of every key event asynchronously, also
+// when another app is in front: nothing waits for us (unlike a low-level hook, which every key
+// would pass through) and nothing can be blocked or changed – other Win+Ctrl+Shift shortcuts work
+// as before. Only the kind of key and up/down are looked at; nothing is stored or logged.
+
+static RAW: AtomicBool = AtomicBool::new(false);
+
+/// Starts receiving keyboard Raw Input on `main` (false = refused).
+pub fn raw_on(main: HWND) -> bool {
+    use windows_sys::Win32::UI::Input::{RegisterRawInputDevices, RAWINPUTDEVICE, RIDEV_INPUTSINK};
+    if RAW.load(Relaxed) {
+        return true;
+    }
+    let dev = RAWINPUTDEVICE { usUsagePage: 1, usUsage: 6, dwFlags: RIDEV_INPUTSINK, hwndTarget: main };
+    let ok = unsafe { RegisterRawInputDevices(&dev, 1, std::mem::size_of::<RAWINPUTDEVICE>() as u32) } != 0;
+    RAW.store(ok, Relaxed);
+    ok
+}
+
+pub fn raw_off() {
+    use windows_sys::Win32::UI::Input::{RegisterRawInputDevices, RAWINPUTDEVICE, RIDEV_REMOVE};
+    if RAW.swap(false, Relaxed) {
+        let dev = RAWINPUTDEVICE { usUsagePage: 1, usUsage: 6, dwFlags: RIDEV_REMOVE, hwndTarget: std::ptr::null_mut() };
+        unsafe { RegisterRawInputDevices(&dev, 1, std::mem::size_of::<RAWINPUTDEVICE>() as u32) };
+    }
+}
+
+/// The key of a `WM_INPUT` message (`lParam`) as the preview sees it, and whether it went down.
+/// None = not a keyboard event, the key this app injects, or a fake Shift of the keyboard driver.
+pub fn raw_key(lp: LPARAM) -> Option<(crate::core::carry::ChordKey, bool)> {
+    use crate::core::carry::ChordKey;
+    use windows_sys::Win32::UI::Input::{GetRawInputData, RAWINPUT, RAWINPUTHEADER, RID_INPUT, RIM_TYPEKEYBOARD};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{RI_KEY_BREAK, RI_KEY_E0};
+    let mut raw: RAWINPUT = unsafe { std::mem::zeroed() };
+    let mut size = std::mem::size_of::<RAWINPUT>() as u32;
+    let n = unsafe {
+        GetRawInputData(lp as _, RID_INPUT, (&mut raw as *mut RAWINPUT).cast(), &mut size, std::mem::size_of::<RAWINPUTHEADER>() as u32)
+    };
+    if n == u32::MAX || raw.header.dwType != RIM_TYPEKEYBOARD {
+        return None;
+    }
+    let k = unsafe { raw.data.keyboard };
+    if k.ExtraInformation as usize == MARK || k.VKey == VK_DUMMY || k.VKey == 0xFF {
+        return None;
+    }
+    let flags = k.Flags as u32;
+    let down = flags & RI_KEY_BREAK == 0;
+    let e0 = flags & RI_KEY_E0 != 0;
+    let key = match k.VKey {
+        VK_LWIN => ChordKey::Win { right: false },
+        VK_RWIN => ChordKey::Win { right: true },
+        VK_CONTROL | VK_LCONTROL | VK_RCONTROL => ChordKey::Ctrl { right: e0 || k.VKey == VK_RCONTROL },
+        // Shift with E0 is the fake Shift some keys send (Num Lock, Print Screen): not a key.
+        VK_SHIFT | VK_LSHIFT | VK_RSHIFT if e0 => return None,
+        VK_SHIFT | VK_LSHIFT | VK_RSHIFT => ChordKey::Shift { right: k.MakeCode == 0x36 || k.VKey == VK_RSHIFT },
+        VK_LEFT | VK_RIGHT => ChordKey::Arrow,
+        _ => ChordKey::Other,
+    };
+    Some((key, down))
+}
+
+// ---------------------------------------------------------------- hint
+
+// The row of desktop previews (`overlay_ui`) is the only indicator of a carry, for every method.
+// This short hint only says that the foreground window cannot be moved: a rounded label at the
+// bottom of the work area, where the row would be.
+
+const HINT_CLASS: &str = "AutoSpacesCarryHint";
+static HINT: AtomicUsize = AtomicUsize::new(0);
+static mut HINT_STATE: Option<Hint> = None;
 
 #[derive(Clone)]
-struct Paint {
-    osd: Osd,
+struct Hint {
     scale: f32,
     dark: bool,
     text: String,
 }
 
 /// Windows uses the dark theme for the system (taskbar, Start, flyouts).
-fn system_dark() -> bool {
+pub(crate) fn system_dark() -> bool {
     // Debug builds: `AUTOSPACES_OSD_THEME=dark|light` (screenshots of both looks).
     #[cfg(debug_assertions)]
     if let Ok(t) = std::env::var("AUTOSPACES_OSD_THEME") {
@@ -199,139 +265,43 @@ fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
     r as u32 | (g as u32) << 8 | (b as u32) << 16
 }
 
-struct Colors {
-    back: COLORREF,
-    text: COLORREF,
-    dim: COLORREF,
-    accent: COLORREF,
-    on_accent: COLORREF,
-}
-
-fn colors(dark: bool) -> Colors {
-    if dark {
-        Colors { back: rgb(43, 43, 43), text: rgb(240, 240, 240), dim: rgb(110, 110, 110), accent: rgb(76, 194, 255), on_accent: rgb(0, 0, 0) }
-    } else {
-        Colors { back: rgb(249, 249, 249), text: rgb(26, 26, 26), dim: rgb(160, 160, 160), accent: rgb(0, 95, 184), on_accent: rgb(255, 255, 255) }
-    }
-}
-
 /// Size in device-independent pixels (scaled by DPI when drawn).
-const DOT: f32 = 30.0;
-const GAP: f32 = 10.0;
 const PAD: f32 = 18.0;
-const MARK_W: f32 = 22.0;
-/// More desktops than this are shown as "k / n".
-const MAX_DOTS: usize = 16;
+const LINE: f32 = 30.0;
+/// Gap between the hint and the bottom of the work area (the taskbar).
+const MARGIN: f32 = 40.0;
 
-fn content_size(p: &Paint) -> (i32, i32) {
-    let s = p.scale;
-    if p.osd.cannot_move {
-        let w = (p.text.chars().count() as f32 * 8.6 + 2.0 * PAD).max(200.0);
-        return ((w * s) as i32, ((DOT + 2.0 * PAD) * s) as i32);
-    }
-    let n = if p.osd.count > MAX_DOTS { 3 } else { p.osd.count.max(1) };
-    let marks = (p.osd.left != Edge::None) as usize + (p.osd.right != Edge::None) as usize;
-    let w = 2.0 * PAD + n as f32 * DOT + (n.saturating_sub(1) + marks) as f32 * GAP + marks as f32 * MARK_W;
-    ((w * s) as i32, ((DOT + 2.0 * PAD) * s) as i32)
-}
-
-unsafe fn font(px: i32, weight: u32, face: &str) -> HFONT {
-    CreateFontW(
-        -px, 0, 0, 0, weight as i32, 0, 0, 0, DEFAULT_CHARSET as u32, OUT_DEFAULT_PRECIS as u32, CLIP_DEFAULT_PRECIS as u32,
-        CLEARTYPE_QUALITY as u32, DEFAULT_PITCH as u32, wide(face).as_ptr(),
-    )
-}
-
-unsafe fn text_in(dc: windows_sys::Win32::Graphics::Gdi::HDC, s: &str, r: &RECT) {
-    let w = wide(s);
-    let mut r = *r;
-    DrawTextW(dc, w.as_ptr(), w.len() as i32 - 1, &mut r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+fn content_size(p: &Hint) -> (i32, i32) {
+    let w = (p.text.chars().count() as f32 * 8.6 + 2.0 * PAD).max(200.0);
+    ((w * p.scale) as i32, ((LINE + 2.0 * PAD) * p.scale) as i32)
 }
 
 unsafe fn paint(hwnd: HWND) {
     let mut ps: PAINTSTRUCT = std::mem::zeroed();
     let dc = BeginPaint(hwnd, &mut ps);
-    let Some(p) = (*std::ptr::addr_of!(OSD_STATE)).clone() else {
-        EndPaint(hwnd, &ps);
-        return;
-    };
-    let c = colors(p.dark);
-    let s = p.scale;
-    let (w, h) = content_size(&p);
-    let back = CreateSolidBrush(c.back);
-    FillRect(dc, &RECT { left: 0, top: 0, right: w, bottom: h }, back);
-    DeleteObject(back);
-    SetBkMode(dc, TRANSPARENT as i32);
-    let num_font = font((14.0 * s) as i32, FW_SEMIBOLD, "Segoe UI");
-    let sym_font = font((18.0 * s) as i32, FW_NORMAL, "Segoe UI Symbol");
-    let old_font = SelectObject(dc, num_font);
-    if p.osd.cannot_move {
-        SetTextColor(dc, c.text);
-        text_in(dc, &p.text, &RECT { left: 0, top: 0, right: w, bottom: h });
-    } else {
-        let px = |v: f32| (v * s) as i32;
-        let top = px(PAD);
-        let bottom = top + px(DOT);
-        let mut x = PAD;
-        let mark = |dc: windows_sys::Win32::Graphics::Gdi::HDC, x: &mut f32, e: Edge, left: bool| {
-            if e == Edge::None {
-                return;
-            }
-            let glyph = match (e, left) {
-                (Edge::New, _) => "+",
-                (_, true) => "\u{21BA}",
-                _ => "\u{21BB}",
-            };
-            SelectObject(dc, sym_font);
-            SetTextColor(dc, c.dim);
-            text_in(dc, glyph, &RECT { left: px(*x), top, right: px(*x + MARK_W), bottom });
-            *x += MARK_W + GAP;
-        };
-        mark(dc, &mut x, p.osd.left, true);
-        if p.osd.count > MAX_DOTS {
-            SelectObject(dc, num_font);
-            SetTextColor(dc, c.accent);
-            let t = format!("{} / {}", p.osd.target + 1, p.osd.count);
-            text_in(dc, &t, &RECT { left: px(x), top, right: px(x + 3.0 * DOT + 2.0 * GAP), bottom });
-            x += 3.0 * DOT + 3.0 * GAP;
-        } else {
-            let pen_dim = CreatePen(PS_SOLID, ((1.5 * s) as i32).max(1), c.dim);
-            for i in 0..p.osd.count.max(1) {
-                let r = RECT { left: px(x), top, right: px(x + DOT), bottom };
-                let current = i == p.osd.target;
-                if current {
-                    let b = CreateSolidBrush(c.accent);
-                    let ob = SelectObject(dc, b);
-                    let op = SelectObject(dc, GetStockObject(NULL_PEN));
-                    Ellipse(dc, r.left, r.top, r.right + 1, r.bottom + 1);
-                    SelectObject(dc, op);
-                    SelectObject(dc, ob);
-                    DeleteObject(b);
-                } else {
-                    let b = CreateSolidBrush(c.back);
-                    let ob = SelectObject(dc, b);
-                    let op = SelectObject(dc, pen_dim);
-                    Ellipse(dc, r.left, r.top, r.right, r.bottom);
-                    SelectObject(dc, op);
-                    SelectObject(dc, ob);
-                    DeleteObject(b);
-                }
-                SelectObject(dc, num_font);
-                SetTextColor(dc, if current { c.on_accent } else { c.text });
-                text_in(dc, &(i + 1).to_string(), &r);
-                x += DOT + GAP;
-            }
-            DeleteObject(pen_dim);
-        }
-        mark(dc, &mut x, p.osd.right, false);
+    if let Some(p) = (*std::ptr::addr_of!(HINT_STATE)).clone() {
+        let (back, text) = if p.dark { (rgb(43, 43, 43), rgb(240, 240, 240)) } else { (rgb(249, 249, 249), rgb(26, 26, 26)) };
+        let (w, h) = content_size(&p);
+        let b = CreateSolidBrush(back);
+        FillRect(dc, &RECT { left: 0, top: 0, right: w, bottom: h }, b);
+        DeleteObject(b);
+        SetBkMode(dc, TRANSPARENT as i32);
+        let font = CreateFontW(
+            -((14.0 * p.scale) as i32), 0, 0, 0, FW_SEMIBOLD as i32, 0, 0, 0, DEFAULT_CHARSET as u32, OUT_DEFAULT_PRECIS as u32,
+            CLIP_DEFAULT_PRECIS as u32, CLEARTYPE_QUALITY as u32, DEFAULT_PITCH as u32, wide("Segoe UI").as_ptr(),
+        );
+        let old = SelectObject(dc, font);
+        SetTextColor(dc, text);
+        let s = wide(&p.text);
+        let mut r = RECT { left: 0, top: 0, right: w, bottom: h };
+        DrawTextW(dc, s.as_ptr(), s.len() as i32 - 1, &mut r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        SelectObject(dc, old);
+        DeleteObject(font);
     }
-    SelectObject(dc, old_font);
-    DeleteObject(num_font);
-    DeleteObject(sym_font);
     EndPaint(hwnd, &ps);
 }
 
-unsafe extern "system" fn osd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+unsafe extern "system" fn hint_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
         WM_PAINT => {
             paint(hwnd);
@@ -343,22 +313,20 @@ unsafe extern "system" fn osd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
     }
 }
 
-unsafe fn osd_window() -> HWND {
-    let h = OSD.load(Relaxed) as HWND;
+unsafe fn hint_window() -> HWND {
+    let h = HINT.load(Relaxed) as HWND;
     if !h.is_null() {
         return h;
     }
     let hinst = GetModuleHandleW(std::ptr::null());
-    let class = wide(OSD_CLASS);
+    let class = wide(HINT_CLASS);
     let mut wc: WNDCLASSW = std::mem::zeroed();
-    wc.lpfnWndProc = Some(osd_proc);
+    wc.lpfnWndProc = Some(hint_proc);
     wc.hInstance = hinst;
     wc.lpszClassName = class.as_ptr();
     RegisterClassW(&wc); // fails harmlessly when already registered
-    // A tool window has no application view: it is never cloaked by a desktop switch, so it stays
-    // visible on every desktop while the desktops slide (no pinning needed); never in Alt+Tab or
-    // on the taskbar, never activated, transparent for the mouse. Our own process: the window
-    // watcher skips it, so it is never a candidate.
+    // Tool window of our own process: no taskbar / Alt+Tab, never activated, transparent for the
+    // mouse, never a candidate (the watcher skips our process).
     let h = CreateWindowExW(
         WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT | WS_EX_LAYERED,
         class.as_ptr(),
@@ -377,15 +345,15 @@ unsafe fn osd_window() -> HWND {
         // Opaque: layered only so that WS_EX_TRANSPARENT lets clicks through reliably.
         SetLayeredWindowAttributes(h, 0, 255, LWA_ALPHA);
     }
-    OSD.store(h as usize, Relaxed);
+    HINT.store(h as usize, Relaxed);
     h
 }
 
-/// Shows (or updates) the indicator in the middle of the monitor of `near` (the carried window;
-/// the foreground window or the primary monitor when null).
-pub fn osd_show(osd: &Osd, near: HWND, cannot_move_text: &str) {
+/// Shows `text` at the bottom of the work area of the monitor of the foreground window (or the
+/// primary one), above the taskbar.
+pub fn hint_show(text: &str) {
     unsafe {
-        let near = if near.is_null() { GetForegroundWindow() } else { near };
+        let near = GetForegroundWindow();
         let mon = if near.is_null() {
             MonitorFromWindow(std::ptr::null_mut(), MONITOR_DEFAULTTOPRIMARY)
         } else {
@@ -400,16 +368,16 @@ pub fn osd_show(osd: &Osd, near: HWND, cannot_move_text: &str) {
         if GetDpiForMonitor(mon, MDT_EFFECTIVE_DPI, &mut dx, &mut dy) != 0 || dx == 0 {
             dx = 96;
         }
-        let p = Paint { osd: osd.clone(), scale: dx as f32 / 96.0, dark: system_dark(), text: cannot_move_text.to_string() };
+        let p = Hint { scale: dx as f32 / 96.0, dark: system_dark(), text: text.to_string() };
         let (w, h) = content_size(&p);
-        *std::ptr::addr_of_mut!(OSD_STATE) = Some(p);
-        let hwnd = osd_window();
+        *std::ptr::addr_of_mut!(HINT_STATE) = Some(p);
+        let hwnd = hint_window();
         if hwnd.is_null() {
             return;
         }
         let wk = mi.rcWork;
-        let x = wk.left + ((wk.right - wk.left) - w) / 2;
-        let y = wk.top + ((wk.bottom - wk.top) - h) / 2;
+        let work = crate::core::overlay::Rect::new(wk.left, wk.top, wk.right, wk.bottom);
+        let (x, y) = crate::core::overlay::hint_pos(&work, w, h, (MARGIN * dx as f32 / 96.0) as i32);
         let radius = (16.0 * dx as f32 / 96.0) as i32;
         SetWindowRgn(hwnd, CreateRoundRectRgn(0, 0, w + 1, h + 1, radius, radius), 1);
         SetWindowPos(hwnd, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
@@ -418,11 +386,11 @@ pub fn osd_show(osd: &Osd, near: HWND, cannot_move_text: &str) {
     }
 }
 
-/// Removes the indicator (destroyed, so nothing of it stays in memory while idle).
-pub fn osd_hide() {
-    let h = OSD.swap(0, Relaxed) as HWND;
+/// Removes the hint (destroyed, so nothing of it stays in memory while idle).
+pub fn hint_hide() {
+    let h = HINT.swap(0, Relaxed) as HWND;
     if !h.is_null() {
         unsafe { DestroyWindow(h) };
     }
-    unsafe { *std::ptr::addr_of_mut!(OSD_STATE) = None };
+    unsafe { *std::ptr::addr_of_mut!(HINT_STATE) = None };
 }

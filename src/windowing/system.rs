@@ -276,6 +276,9 @@ impl WindowSystem for Win32Windows {
     fn activate(&self, hwnd: HWND) {
         unsafe {
             if SetForegroundWindow(hwnd) != 0 {
+                // On top of its z-order band too (a maximized window activated a moment before
+                // must not stay over it).
+                windows_sys::Win32::UI::WindowsAndMessaging::BringWindowToTop(hwnd);
                 return;
             }
             // Windows refuses focus changes from background processes; borrow the
@@ -285,6 +288,7 @@ impl WindowSystem for Win32Windows {
             let me = GetCurrentThreadId();
             if fg_tid != 0 && fg_tid != me && AttachThreadInput(me, fg_tid, 1) != 0 {
                 SetForegroundWindow(hwnd);
+                windows_sys::Win32::UI::WindowsAndMessaging::BringWindowToTop(hwnd);
                 AttachThreadInput(me, fg_tid, 0);
             }
         }

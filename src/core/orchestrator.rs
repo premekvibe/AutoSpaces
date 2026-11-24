@@ -2,7 +2,7 @@
 //! maximized / fullscreen, returns it to its origin desktop when the state ends, and keeps the
 //! global number of desktops tidy ("compaction": no gaps, never below the baseline B).
 
-use super::carry::{self, Next, Osd, Step};
+use super::carry::{self, Next, Step};
 use super::learned::{FailReason, Learned, NoLearned};
 use super::model::{Event, ManagedSpace, Schedule, State, WindowSystem};
 use super::settings::{is_system_window, launch_label, never_learn, CarryStyle, LayoutRule, Settings, SYSTEM_HOSTS};
@@ -59,6 +59,13 @@ pub fn startup_token() -> HWND {
 pub fn carry_token() -> HWND {
     (usize::MAX - 3) as HWND
 }
+/// Timer after a carry: the carried window is brought to the front again (plan 12.13).
+pub fn focus_token() -> HWND {
+    (usize::MAX - 4) as HWND
+}
+/// The focus follow-up after a drop: first and second look (ms).
+const FOCUS_FIRST_MS: u32 = 150;
+const FOCUS_AGAIN_MS: u32 = 350;
 
 /// A window being carried between desktops (plan 12.13).
 struct CarryRun {
@@ -70,7 +77,7 @@ struct CarryRun {
     start: Guid,
     /// The desktop the view was last switched to (the window is there or pinned).
     view: Guid,
-    /// Where the window goes (the indicator's highlight); the view catches up with it.
+    /// Where the window goes (the highlighted preview); the view catches up with it.
     target: Guid,
     /// An animated switch runs until then (`WindowSystem::now`).
     busy_until: u64,
@@ -78,14 +85,17 @@ struct CarryRun {
     dropping: bool,
     /// Window events that arrived meanwhile, looked at again after the drop.
     deferred: Vec<HWND>,
+    /// The desktops at the start (plus one created by the carry): no call into Explorer per
+    /// step or per window event while the overlay animates.
+    desks: Vec<Guid>,
 }
 
 /// Result of a carry key press.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CarryOutcome {
-    /// The window is being carried (the host installs the keyboard hook and shows the indicator).
+    /// The window is being carried (the host installs the keyboard hook and shows the previews).
     Carrying,
-    /// The foreground window cannot be moved: the indicator says so briefly.
+    /// The foreground window cannot be moved: a short hint says so.
     CannotMove,
     /// Nothing to do (no foreground window, carrying off, the startup sequence or profile runs).
     Ignored,
@@ -197,6 +207,12 @@ pub struct Orchestrator<B: DesktopBackend, W: WindowSystem> {
     /// Windows pinned to all desktops by a carry, recorded in `state.json` before pinning.
     carry_pinned: Vec<(HWND, u32)>,
     pin_check: PinCheck,
+    /// After a drop: (window, pid, attempts left) to bring to the front again.
+    focus: Option<(HWND, u32, u8)>,
+    /// Timers beside the one an event returns (taken by the host).
+    extra: Vec<Schedule>,
+    /// The host can draw the overlay layers (DWM thumbnails; not in a remote session).
+    overlay_ok: bool,
     /// Writes `state.json` at once (the host's file writer); None in tests that do not care.
     persist: Option<Box<dyn FnMut(String)>>,
 }
@@ -238,6 +254,9 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
             carry: None,
             carry_pinned: Vec::new(),
             pin_check: PinCheck::Unknown,
+            focus: None,
+            extra: Vec::new(),
+            overlay_ok: false,
             persist: None,
         }
     }
@@ -385,6 +404,9 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
     pub fn on_event(&mut self, hwnd: HWND, ev: Event) -> Option<Schedule> {
         if hwnd == carry_token() {
             return self.carry_tick();
+        }
+        if hwnd == focus_token() {
+            return self.focus_tick();
         }
         // While a window is carried nothing moves on its own (plan 12.13): events wait for the drop.
         if let Some(run) = self.carry.as_mut() {
@@ -1801,12 +1823,59 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
         self.carry.as_ref().map_or(std::ptr::null_mut(), |r| r.hwnd)
     }
 
-    /// What the indicator shows while a window is carried.
-    pub fn carry_osd(&self) -> Option<Osd> {
+    /// Number of desktops and the target (0-based) while a window is carried.
+    pub fn carry_target(&self) -> Option<(usize, usize)> {
         let run = self.carry.as_ref()?;
-        let list = self.backend.desktops().ok()?;
-        let i = list.iter().position(|d| *d == run.target).unwrap_or(0);
-        Some(Osd::new(list.len(), i, self.settings.carry_create_new))
+        let i = run.desks.iter().position(|d| *d == run.target).unwrap_or(0);
+        Some((run.desks.len(), i))
+    }
+
+    /// The host can draw the overlay (plan 12.13); off = the other methods.
+    pub fn set_overlay_available(&mut self, on: bool) {
+        self.overlay_ok = on;
+    }
+
+    /// The method of the running carry.
+    pub fn carry_style(&self) -> Option<CarryStyle> {
+        self.carry.as_ref().map(|r| r.style)
+    }
+
+    /// The desktops (in order) and the index of the carry's starting desktop, for the overlay.
+    pub fn carry_desktops(&self) -> Option<(Vec<Guid>, usize)> {
+        let run = self.carry.as_ref()?;
+        let i = run.desks.iter().position(|d| *d == run.start)?;
+        Some((run.desks.clone(), i))
+    }
+
+    /// The overlay could not be drawn: this carry goes on with the next best method (pinning only
+    /// when its check passes). The next carry tries the overlay again (one failure used to switch
+    /// it off for the whole run – the old dotted indicator then appeared "now and then").
+    pub fn carry_overlay_failed(&mut self) -> Option<Schedule> {
+        let run = self.carry.as_ref()?;
+        if run.style != CarryStyle::Overlay {
+            return None;
+        }
+        let (w, pid) = (run.hwnd, run.pid);
+        let overlay = std::mem::replace(&mut self.overlay_ok, false);
+        let mut style = self.carry_style_for(w);
+        self.overlay_ok = overlay;
+        if style == CarryStyle::Pin {
+            self.carry_pinned.push((w, pid));
+            self.persist_now();
+            if let Err(e) = self.backend.set_pinned(w, true) {
+                let _ = self.backend.set_pinned(w, false);
+                self.carry_pinned.retain(|p| p.0 != w);
+                self.persist_now();
+                self.pin_check = PinCheck::Failed;
+                self.note(format!("carry: PinView failed ({e}); pinning off for this run"));
+                style = carry::choose_style(self.settings.carry_style, false, false, self.backend.has_move_switch());
+            }
+        }
+        self.note(format!("carry: overlay not available; method {} instead", style.code()));
+        if let Some(run) = self.carry.as_mut() {
+            run.style = style;
+        }
+        self.carry_advance()
     }
 
     /// Windows pinned by the carry right now (for the tests and the report).
@@ -1825,10 +1894,11 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
             }
         }
         let create_new = self.settings.carry_create_new;
-        let Some(list) = self.backend.desktops().ok() else {
-            return (CarryOutcome::Carrying, self.carry_advance());
-        };
         let Some(run) = self.carry.as_mut() else { return (CarryOutcome::Ignored, None) };
+        let list = run.desks.clone();
+        if list.is_empty() {
+            return (CarryOutcome::Carrying, self.carry_advance());
+        }
         // Pressed again right after the keys were released: the window is still carried.
         run.dropping = false;
         let i = list.iter().position(|d| *d == run.target).unwrap_or(0);
@@ -1840,6 +1910,7 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
                     self.note(format!("carry: created {d} behind the last desktop"));
                     if let Some(run) = self.carry.as_mut() {
                         run.target = d;
+                        run.desks.push(d);
                     }
                 }
                 Err(e) => self.note(format!("carry: cannot create a desktop: {e}")),
@@ -1891,6 +1962,55 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
         self.dirty = true;
     }
 
+    /// Can window `w` be carried now? Ok = its desktop (the one in view); Err(Some) = it cannot be
+    /// moved (why); Err(None) = no desktop information. Reads only (no notes, no pin check).
+    fn carry_check(&self, w: HWND) -> Result<Guid, Option<String>> {
+        let (process, _) = self.ws.process(w);
+        let class = self.ws.class(w);
+        if is_system_window(&process, &class) || process == "autospaces.exe" || !self.ws.is_candidate(w) {
+            return Err(Some("system or no app window".into()));
+        }
+        if self.ws.is_elevated(w) {
+            return Err(Some("runs at a higher integrity level".into()));
+        }
+        // Learned exceptions are only read: nothing is recorded for a carried window.
+        if self.settings.learning && self.learned.blocked(&process, &class) {
+            return Err(Some("on the learned list".into()));
+        }
+        match self.backend.can_move(w) {
+            Ok(true) => {}
+            Ok(false) => return Err(Some("CanViewMoveDesktops = false".into())),
+            Err(e) => return Err(Some(format!("CanViewMoveDesktops: {e}"))),
+        }
+        let Ok(cur) = self.backend.current() else { return Err(None) };
+        match self.backend.window_desktop(w) {
+            Some(g) if g == cur => Ok(cur),
+            Some(g) if g.is_zero() => Err(Some("pinned to all desktops".into())),
+            _ => Err(Some("not on the desktop being viewed".into())),
+        }
+    }
+
+    /// Win+Ctrl+Shift held (plan 12.13): the foreground window to preview the overlay with, when
+    /// a carry now would use the overlay and the window can be moved; not for a full-screen app
+    /// (game, video), during the startup sequence or the profile, or with carrying off.
+    pub fn carry_preview(&self) -> Option<HWND> {
+        if self.carry.is_some() || !self.settings.carry_enabled || self.reinit || self.baseline == 0 {
+            return None;
+        }
+        if self.layout.is_some() || self.startup_pending {
+            return None;
+        }
+        let style = carry::choose_style(self.settings.carry_style, self.overlay_ok, self.backend.has_pin(), self.backend.has_move_switch());
+        if style != CarryStyle::Overlay {
+            return None;
+        }
+        let w = self.ws.foreground();
+        if w.is_null() || self.ws.state(w) == State::Fullscreen {
+            return None;
+        }
+        self.carry_check(w).ok().map(|_| w)
+    }
+
     /// Checks the foreground window and picks the method; Carrying = `self.carry` is set.
     fn carry_begin(&mut self) -> CarryOutcome {
         if !self.settings.carry_enabled || self.reinit || self.baseline == 0 {
@@ -1904,34 +2024,16 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
         if w.is_null() {
             return CarryOutcome::Ignored;
         }
-        let (process, pid) = self.ws.process(w);
-        let class = self.ws.class(w);
+        let pid = self.ws.process(w).1;
         let label = self.window_label(w);
-        let refuse = |o: &mut Self, why: &str| {
-            o.note(format!("carry: {label} cannot be moved ({why})"));
-            CarryOutcome::CannotMove
+        let cur = match self.carry_check(w) {
+            Ok(cur) => cur,
+            Err(None) => return CarryOutcome::Ignored,
+            Err(Some(why)) => {
+                self.note(format!("carry: {label} cannot be moved ({why})"));
+                return CarryOutcome::CannotMove;
+            }
         };
-        if is_system_window(&process, &class) || process == "autospaces.exe" || !self.ws.is_candidate(w) {
-            return refuse(self, "system or no app window");
-        }
-        if self.ws.is_elevated(w) {
-            return refuse(self, "runs at a higher integrity level");
-        }
-        // Learned exceptions are only read: nothing is recorded for a carried window.
-        if self.settings.learning && self.learned.blocked(&process, &class) {
-            return refuse(self, "on the learned list");
-        }
-        match self.backend.can_move(w) {
-            Ok(true) => {}
-            Ok(false) => return refuse(self, "CanViewMoveDesktops = false"),
-            Err(e) => return refuse(self, &format!("CanViewMoveDesktops: {e}")),
-        }
-        let Ok(cur) = self.backend.current() else { return CarryOutcome::Ignored };
-        match self.backend.window_desktop(w) {
-            Some(g) if g == cur => {}
-            Some(g) if g.is_zero() => return refuse(self, "pinned to all desktops"),
-            _ => return refuse(self, "not on the desktop being viewed"),
-        }
         let style = self.carry_style_for(w);
         if style == CarryStyle::Pin {
             // Recorded first: a crash between these two lines leaves a note, never a lost pin.
@@ -1943,7 +2045,7 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
                 self.persist_now();
                 self.pin_check = PinCheck::Failed;
                 self.note(format!("carry: PinView failed ({e}); pinning off for this run"));
-                let style = carry::choose_style(self.settings.carry_style, false, self.backend.has_move_switch());
+                let style = carry::choose_style(self.settings.carry_style, self.overlay_ok, false, self.backend.has_move_switch());
                 return self.carry_start(w, pid, cur, style, &label);
             }
         }
@@ -1963,6 +2065,7 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
             busy_until: 0,
             dropping: false,
             deferred: Vec::new(),
+            desks: self.backend.desktops().unwrap_or_default(),
         });
         CarryOutcome::Carrying
     }
@@ -1972,7 +2075,7 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
     /// about to be carried: the public API places it on a desktop, so it must not be pinned).
     fn carry_style_for(&mut self, w: HWND) -> CarryStyle {
         let move_switch = self.backend.has_move_switch();
-        let wants_pin = carry::choose_style(self.settings.carry_style, self.backend.has_pin(), move_switch) == CarryStyle::Pin;
+        let wants_pin = carry::choose_style(self.settings.carry_style, self.overlay_ok, self.backend.has_pin(), move_switch) == CarryStyle::Pin;
         if wants_pin && self.pin_check == PinCheck::Unknown {
             match self.backend.pin_probe(w) {
                 Ok(()) => {
@@ -1985,7 +2088,7 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
                 }
             }
         }
-        carry::choose_style(self.settings.carry_style, self.backend.has_pin() && self.pin_check == PinCheck::Passed, move_switch)
+        carry::choose_style(self.settings.carry_style, self.overlay_ok, self.backend.has_pin() && self.pin_check == PinCheck::Passed, move_switch)
     }
 
     /// Lets the view catch up with the target, finishing a dropped carry. Returns the timer for
@@ -1994,7 +2097,9 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
         for _ in 0..4 {
             let run = self.carry.as_ref()?;
             let now = self.ws.now();
-            match carry::next_action(run.view == run.target, now, run.busy_until, run.dropping) {
+            // Overlay: the view stays where it is until the drop, then switches once.
+            let at_target = run.view == run.target || (run.style == CarryStyle::Overlay && !run.dropping);
+            match carry::next_action(at_target, now, run.busy_until, run.dropping) {
                 Next::Wait(ms) => return Some(Schedule { hwnd: carry_token(), delay_ms: ms.max(10) }),
                 Next::Idle => return None,
                 Next::Finish => return self.carry_finish(),
@@ -2028,6 +2133,9 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
         }
         let res = match style {
             CarryStyle::Pin => self.backend.switch(target, true),
+            // Under the overlay's layers: the window first (its stand-in stays visible while it is
+            // cloaked), then the desktop, without animation.
+            CarryStyle::Overlay => self.backend.move_window(w, target).and_then(|()| self.backend.switch(target, false)),
             CarryStyle::MoveSwitch if self.ws.foreground() == w => self.backend.move_switch(target),
             // switchMove, and moveSwitch when the carried window lost the foreground meanwhile.
             _ => self.backend.move_window(w, target).and_then(|()| self.backend.switch(target, true)),
@@ -2036,7 +2144,7 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
             self.note(format!("carry: switch ({}) failed: {e}", style.code()));
             return false;
         }
-        let busy = if self.backend.animates() { carry::ANIMATION_MS } else { 0 };
+        let busy = if self.backend.animates() && style != CarryStyle::Overlay { carry::ANIMATION_MS } else { 0 };
         let now = self.ws.now();
         if let Some(run) = self.carry.as_mut() {
             run.view = target;
@@ -2049,8 +2157,34 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
         true
     }
 
-    /// The drop (plan 12.13): the window is unpinned and stays on the desktop being viewed. Moved
-    /// away from where it was, it is the user's decision: no longer managed, not moved or maximized
+    /// Timers to set beside the ones events return (the focus follow-up of a drop).
+    pub fn drain_schedules(&mut self) -> Vec<Schedule> {
+        std::mem::take(&mut self.extra)
+    }
+
+    /// The window dropped a moment ago is brought to the front again if something else took it
+    /// (only while it is on the desktop in view; moved elsewhere by the rules, it is left there).
+    fn focus_tick(&mut self) -> Option<Schedule> {
+        let (w, pid, left) = self.focus.take()?;
+        if self.carry.is_some() || !self.ws.is_alive(w, pid) {
+            return None;
+        }
+        let here = match (self.backend.window_desktop(w), self.backend.current()) {
+            (Some(d), Ok(c)) => d == c || d.is_zero(),
+            _ => false,
+        };
+        if here && self.ws.foreground() != w {
+            self.note(format!("carry: {:#x} brought to the front again after the drop", w as usize));
+            self.ws.activate(w);
+        }
+        if left > 1 {
+            self.focus = Some((w, pid, left - 1));
+            return Some(Schedule { hwnd: focus_token(), delay_ms: FOCUS_AGAIN_MS });
+        }
+        None
+    }
+
+    /// The drop (plan 12.13): the window is unpinned and stays on the desktop being viewed. Moved    /// away from where it was, it is the user's decision: no longer managed, not moved or maximized
     /// by the drop itself; a maximized one stays until restored (then the ordinary rules apply).
     /// Compaction and the events that waited run once, now.
     fn carry_finish(&mut self) -> Option<Schedule> {
@@ -2086,8 +2220,15 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
                 self.rejected.remove(&w);
             }
         }
-        if alive && self.ws.foreground() != w {
-            self.ws.activate(w);
+        if alive {
+            if self.ws.foreground() != w {
+                self.ws.activate(w);
+            }
+            // After a desktop switch the shell activates that desktop's own last window a moment
+            // later (a maximized one covered the dropped window): it is brought to the front
+            // again shortly after, twice.
+            self.focus = Some((w, pid, 2));
+            self.extra.push(Schedule { hwnd: focus_token(), delay_ms: FOCUS_FIRST_MS });
         }
         let (from, to) = (self.desk_label(run.start), self.desk_label(fin));
         self.note(format!("carry: dropped {:#x} ({}) {from} -> {to}", w as usize, run.style.code()));
