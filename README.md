@@ -23,11 +23,14 @@ Windows has virtual desktops, but you have to create them, move windows onto the
 - **Arrange at startup:** windows that are already maximized when AutoSpaces starts are spread over separate desktops, as long as all your windows are on a single desktop.
 - **Desktop layout:** choose apps that should open on their own desktops when AutoSpaces starts (desktop 2 – mail, desktop 3 – charts, …). Apps that are already running are moved and maximized instead of being started again. They are launched in the background, without switching your desktop.
 - **Carry a window:** hold **Win+Ctrl+Shift** and the screen behind the active window turns to frosted glass, with a strip of live desktop previews at the bottom. Press **←/→** to take the window to the previous or next desktop: it stays sharp and still while the desktops, wallpapers included, slide beneath it. Release the keys to drop it there (it stays in front and keeps the focus), press **Esc** to take it back. Past the last desktop it goes round to desktop 1, or (an option in *Settings → Keys*) a new desktop is created. The same rules as for maximizing apply: a maximized window carried onto a desktop that already has one moves on to a free desktop.
+- **Automatic updates:** 10 minutes after start and then once a day, AutoSpaces asks GitHub whether a newer version has been released. If it has, a notification offers it. *Install* downloads the installer, checks it against the SHA-256 checksum published with the release and installs it in the background: AutoSpaces gives the windows and desktops back, updates itself and starts again. *Check for updates* in the tray menu does the same on request, and a version can be skipped.
 - **Start with Windows.**
 - **Czech and English,** chosen by the Windows display language, with a manual override in Settings.
 - **Light on resources:** a single executable under 1 MB, about 3 MB of private memory, event-driven with no polling.
 
 Settings live in `%APPDATA%\AutoSpaces\settings.json`; learned exceptions and state are in `%LOCALAPPDATA%\AutoSpaces`.
+
+**Network:** AutoSpaces connects only to GitHub, and only to check for updates (and, when you choose *Install*, to download the installer). The request carries nothing but the app name and version; no data about you or your computer is sent. Automatic checks can be switched off in *Settings → General → Check for updates*.
 
 ## Supported Windows versions
 
@@ -43,7 +46,7 @@ Windows offers no public API for moving another app's window between virtual des
 
 Run `AutoSpaces-Setup-<version>.exe`. By default it installs for the current user without administrator rights; installing for all users is optional. The installer is not code-signed yet, so Windows SmartScreen shows a warning: choose *More info → Run anyway*.
 
-After installation AutoSpaces sits in the notification area. Right-click the icon for *Enabled*, *Settings…*, *Learned exceptions*, *About…* and *Quit*.
+After installation AutoSpaces sits in the notification area. Right-click the icon for *Enabled*, *Settings…*, *Learned exceptions*, *Check for updates*, *About…* and *Quit*.
 
 **Tip:** to make a click on a running app's taskbar icon take you to its desktop, open Windows *Settings > System > Multitasking > Desktops* and set *On the taskbar, show all the open windows* to *On all desktops*. Shift + click then starts a new instance.
 

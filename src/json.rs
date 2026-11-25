@@ -132,6 +132,13 @@ impl Parser<'_> {
             }
         }
     }
+    /// Four hex digits of a `\u` escape (advances past them).
+    fn hex4(&mut self) -> Option<u32> {
+        let h = self.s.get(self.i..self.i + 4)?;
+        let code = std::str::from_utf8(h).ok().filter(|h| h.bytes().all(|b| b.is_ascii_hexdigit()))?;
+        self.i += 4;
+        u32::from_str_radix(code, 16).ok()
+    }
     fn string(&mut self) -> Result<String, String> {
         if self.s.get(self.i) != Some(&b'"') {
             return self.err("expected string");
@@ -160,13 +167,25 @@ impl Parser<'_> {
                         b'r' => '\r',
                         b't' => '\t',
                         b'u' => {
-                            let hex = self.s.get(self.i..self.i + 4).and_then(|h| std::str::from_utf8(h).ok());
-                            let code = hex.and_then(|h| u32::from_str_radix(h, 16).ok());
-                            self.i += 4;
-                            match code.and_then(char::from_u32) {
-                                Some(ch) => ch,
-                                None => return self.err("bad \\u escape"),
-                            }
+                            let Some(code) = self.hex4() else {
+                                return self.err("bad \\u escape");
+                            };
+                            // A UTF-16 surrogate pair (emoji in a GitHub release text) is one character;
+                            // a lone surrogate becomes U+FFFD instead of failing the whole document.
+                            let code = if (0xD800..0xDC00).contains(&code) && self.s.get(self.i..self.i + 2) == Some(b"\\u") {
+                                let save = self.i;
+                                self.i += 2;
+                                match self.hex4() {
+                                    Some(lo) if (0xDC00..0xE000).contains(&lo) => 0x10000 + ((code - 0xD800) << 10) + (lo - 0xDC00),
+                                    _ => {
+                                        self.i = save;
+                                        0xFFFD
+                                    }
+                                }
+                            } else {
+                                code
+                            };
+                            char::from_u32(code).unwrap_or('\u{FFFD}')
                         }
                         _ => return self.err("bad escape"),
                     };
@@ -230,5 +249,15 @@ mod tests {
         assert!(parse_json("[1.5]").is_err());
         assert!(parse_json("\"abc").is_err());
         assert_eq!(parse_json("\u{feff}[]"), Ok(Json::Arr(vec![])));
+    }
+
+    #[test]
+    fn surrogate_pairs_and_lone_surrogates() {
+        assert_eq!(parse_json(r#""a😀b""#), Ok(Json::Str("a\u{1F600}b".into())));
+        assert_eq!(parse_json(r#""\ud83dx""#), Ok(Json::Str("\u{FFFD}x".into())));
+        assert_eq!(parse_json(r#""\ud83dA""#), Ok(Json::Str("\u{FFFD}A".into())));
+        assert_eq!(parse_json(r#""\ude00""#), Ok(Json::Str("\u{FFFD}".into())));
+        assert!(parse_json(r#""\u12""#).is_err());
+        assert!(parse_json(r#""\u12g4""#).is_err());
     }
 }

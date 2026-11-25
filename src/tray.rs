@@ -5,14 +5,14 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
 use windows_sys::Win32::Foundation::{HWND, POINT};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Shell::{
-    Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_WARNING, NIM_ADD, NIM_DELETE, NIM_MODIFY,
-    NOTIFYICONDATAW,
+    Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_LARGE_ICON, NIIF_USER, NIIF_WARNING, NIM_ADD, NIM_DELETE,
+    NIM_MODIFY, NOTIFYICONDATAW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, DestroyIcon, DestroyMenu, GetCursorPos, GetSystemMetrics,
     LoadIconW, LoadImageW, PostMessageW, SetForegroundWindow, TrackPopupMenu, HICON,
-    IDI_APPLICATION, IMAGE_ICON, LR_DEFAULTCOLOR, MF_CHECKED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, SM_CXSMICON,
-    SM_CYSMICON, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_NULL,
+    IDI_APPLICATION, IMAGE_ICON, LR_DEFAULTCOLOR, LR_SHARED, MF_CHECKED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, SM_CXICON,
+    SM_CXSMICON, SM_CYICON, SM_CYSMICON, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_NULL,
 };
 
 pub const WM_TRAY: u32 = WM_APP + 1;
@@ -29,6 +29,8 @@ pub static ENABLED: AtomicBool = AtomicBool::new(true);
 
 /// Opens the "Report a problem" dialog (plan 12.12).
 pub const CMD_REPORT: usize = 6;
+/// Checks for a new version now (plan 12.15).
+pub const CMD_CHECK_UPDATES: usize = 7;
 
 /// Backend state shown by the icon: 0 = normal, 1 = unsupported Windows, 2 = switched off in settings.
 pub const MODE_NORMAL: usize = 0;
@@ -69,6 +71,29 @@ pub fn notify(hwnd: HWND, text: &str) {
     let mut nid = data(hwnd);
     nid.uFlags = NIF_INFO;
     nid.dwInfoFlags = NIIF_WARNING;
+    copy_into(&mut nid.szInfoTitle, t(Key::AppName));
+    copy_into(&mut nid.szInfo, text);
+    unsafe { Shell_NotifyIconW(NIM_MODIFY, &nid) };
+}
+
+/// Informational notification with the app's own icon (a new version, plan 12.15). In Windows 10/11
+/// it is a system notification that also stays in the notification centre; a click on it arrives as
+/// `NIN_BALLOONUSERCLICK` through `WM_TRAY`.
+pub fn notify_info(hwnd: HWND, text: &str) {
+    let mut nid = data(hwnd);
+    nid.uFlags = NIF_INFO;
+    nid.dwInfoFlags = NIIF_USER | NIIF_LARGE_ICON;
+    // Shared handle (LR_SHARED): owned by the system, nothing to free.
+    nid.hBalloonIcon = unsafe {
+        LoadImageW(
+            GetModuleHandleW(std::ptr::null()),
+            std::ptr::without_provenance::<u16>(1),
+            IMAGE_ICON,
+            GetSystemMetrics(SM_CXICON),
+            GetSystemMetrics(SM_CYICON),
+            LR_SHARED,
+        ) as HICON
+    };
     copy_into(&mut nid.szInfoTitle, t(Key::AppName));
     copy_into(&mut nid.szInfo, text);
     unsafe { Shell_NotifyIconW(NIM_MODIFY, &nid) };
@@ -155,6 +180,7 @@ pub fn show_menu(hwnd: HWND, learned: &[String]) -> usize {
         AppendMenuW(menu, MF_POPUP, sub as usize, wide(t(Key::MenuLearned)).as_ptr());
         AppendMenuW(menu, MF_STRING, CMD_SETTINGS, wide(t(Key::MenuSettings)).as_ptr());
         AppendMenuW(menu, MF_STRING, CMD_REPORT, wide(t(Key::MenuReport)).as_ptr());
+        AppendMenuW(menu, MF_STRING, CMD_CHECK_UPDATES, wide(t(Key::MenuCheckUpdates)).as_ptr());
         AppendMenuW(menu, MF_STRING, CMD_ABOUT, wide(t(Key::MenuAbout)).as_ptr());
         AppendMenuW(menu, MF_STRING, CMD_EXIT, wide(t(Key::MenuExit)).as_ptr());
         let mut pt = POINT { x: 0, y: 0 };

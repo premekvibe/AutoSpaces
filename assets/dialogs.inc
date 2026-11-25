@@ -3,20 +3,20 @@
 // Dialog templates, included once per language from autospaces.rc (texts: strings-<lang>.inc).
 // Dialog and control IDs must match src/settings_dlg.rs. RC cuts control texts at 256 characters, so the two long
 // paragraphs (ids 142 and 173) are set at run time from the string table in src/i18n.rs.
-101 DIALOGEX 0, 0, 304, 198
+101 DIALOGEX 0, 0, 304, 230
 STYLE DS_SHELLFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
 CAPTION T(SET_CAPTION)
 FONT 9, "MS Shell Dlg", 400, 0, 1
 BEGIN
-    CONTROL         "", 300, "SysTabControl32", WS_TABSTOP | WS_CLIPSIBLINGS, 6, 6, 292, 166
-    DEFPUSHBUTTON   T(BTN_OK), 1, 190, 180, 50, 14
-    PUSHBUTTON      T(BTN_CANCEL), 2, 246, 180, 50, 14
+    CONTROL         "", 300, "SysTabControl32", WS_TABSTOP | WS_CLIPSIBLINGS, 6, 6, 292, 198
+    DEFPUSHBUTTON   T(BTN_OK), 1, 190, 212, 50, 14
+    PUSHBUTTON      T(BTN_CANCEL), 2, 246, 212, 50, 14
 END
 
 // The three tab pages of the settings dialog: child dialogs (DS_CONTROL, WS_EX_CONTROLPARENT) that src/settings_dlg.rs
 // creates inside the tab control (src/i18n.rs has the tab captions). Only the size is a guess: the code fits them to the
 // display area of the tab control.
-106 DIALOGEX 0, 0, 284, 150
+106 DIALOGEX 0, 0, 284, 178
 STYLE DS_SHELLFONT | DS_CONTROL | WS_CHILD
 EXSTYLE WS_EX_CONTROLPARENT
 FONT 9, "MS Shell Dlg", 400, 0, 1
@@ -32,6 +32,9 @@ BEGIN
     LTEXT           T(SET_LANG_LABEL), 145, 12, 111, 76, 10
     COMBOBOX        144, 92, 108, 100, 60, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
     LTEXT           T(SET_LANG_NOTE), 146, 12, 126, 262, 10
+
+    GROUPBOX        T(SET_GRP_UPDATES), -1, 4, 146, 276, 28
+    AUTOCHECKBOX    T(SET_CHECK_UPDATES), 149, 12, 159, 262, 10, WS_TABSTOP
 END
 
 107 DIALOGEX 0, 0, 284, 154
@@ -161,4 +164,22 @@ BEGIN
     LTEXT           "", 233, 6, 130, 288, 20
     PUSHBUTTON      T(REP_GITHUB), 234, 6, 156, 150, 14, WS_TABSTOP
     PUSHBUTTON      T(REP_CLOSE), 2, 244, 156, 50, 14, WS_TABSTOP
+END
+
+// "Update" (src/update_dlg.rs, plan 12.15): the head line (250), the link to the release page (251) and the note /
+// status (253) are set at run time; the progress bar (254) is shown only while the installer downloads. For a copy that
+// is not installed, the code renames button 1 to "Open release page".
+110 DIALOGEX 0, 0, 270, 150
+STYLE DS_SHELLFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION T(UPD_CAPTION)
+FONT 9, "MS Shell Dlg", 400, 0, 1
+BEGIN
+    LTEXT           "", 250, 8, 8, 254, 18
+    CONTROL         "", 251, "SysLink", WS_TABSTOP, 8, 28, 254, 10
+    LTEXT           "", 253, 8, 44, 254, 40
+    CONTROL         "", 254, "msctls_progress32", 0, 8, 86, 254, 10
+    AUTOCHECKBOX    T(UPD_CHECK), 252, 8, 104, 254, 10, WS_TABSTOP
+    DEFPUSHBUTTON   T(UPD_INSTALL), 1, 8, 128, 96, 14, WS_TABSTOP
+    PUSHBUTTON      T(UPD_SKIP), 255, 110, 128, 92, 14, WS_TABSTOP
+    PUSHBUTTON      T(UPD_LATER), 2, 208, 128, 54, 14, WS_TABSTOP
 END

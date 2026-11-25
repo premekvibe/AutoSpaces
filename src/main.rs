@@ -14,6 +14,8 @@ mod selftest;
 mod settings_dlg;
 mod sysopts;
 mod tray;
+mod update;
+mod update_dlg;
 mod windowing;
 
 use crate::core::{Event, Orchestrator, Schedule, Settings};
@@ -62,6 +64,8 @@ const CARRY_WATCH_MS: u32 = 250;
 const HINT_MS: u32 = 1200;
 /// Win+Ctrl+Shift held alone: the preview's delay (only while the three are held).
 const TIMER_PREVIEW: usize = 5;
+/// One-shot timer of the update check (plan 12.15), re-armed after every check (at most an hour).
+const TIMER_UPDATE: usize = 6;
 /// Retry delay when the user is busy (full-screen app, layout profile, another dialog).
 const SUPPORT_RETRY_SECS: u64 = 5 * 60;
 /// Tick count at start (uptime of this run) and whether the reminder was shown in this run.
@@ -172,6 +176,7 @@ fn enter_no_backend(main: HWND, why: &NoBackend) {
         NOTICE_SHOWN.store(true, Relaxed);
     }
     if !NOTICE_SHOWN.swap(true, Relaxed) {
+        BALLOON_UPDATE.store(false, Relaxed);
         tray::notify(main, &text);
     }
 }
@@ -241,6 +246,192 @@ fn support_busy() -> bool {
         || about_dlg::is_open()
         || settings_dlg::is_open()
         || report_dlg::is_open()
+        || update_dlg::is_open()
+}
+
+// ---------------------------------------------------------------- updates (plan 12.15)
+
+/// When the next automatic check is due, the versions announced / skipped, the release found last.
+static mut UPDATE_TIMING: core::update::Timing = core::update::Timing::new();
+static mut UPDATE_NOTICES: Option<core::update::Notices> = None;
+static mut UPDATE_FOUND: Option<core::update::Release> = None;
+/// The last notification of the icon was about a new version (a click on it opens the dialog).
+static BALLOON_UPDATE: AtomicBool = AtomicBool::new(false);
+/// "Check for updates" was chosen while an automatic check was running: its result counts as manual.
+static UPDATE_MANUAL_PENDING: AtomicBool = AtomicBool::new(false);
+
+fn update_timing() -> &'static mut core::update::Timing {
+    unsafe { &mut *std::ptr::addr_of_mut!(UPDATE_TIMING) }
+}
+
+fn update_notices() -> &'static mut core::update::Notices {
+    unsafe { (*std::ptr::addr_of_mut!(UPDATE_NOTICES)).get_or_insert_with(|| update::load_notices(app_dir().as_deref())) }
+}
+
+fn update_found() -> &'static mut Option<core::update::Release> {
+    unsafe { &mut *std::ptr::addr_of_mut!(UPDATE_FOUND) }
+}
+
+/// `"checkUpdates"` of the running settings (or of settings.json when there is no orchestrator).
+fn check_updates_on() -> bool {
+    orch().map(|o| o.settings.check_updates).or_else(|| settings_path().map(|p| Settings::load(&p).check_updates)).unwrap_or(true)
+}
+
+/// Saves `"checkUpdates"` (the box in the update dialog).
+fn set_check_updates(on: bool) {
+    let settings = match orch() {
+        Some(o) => {
+            o.settings.check_updates = on;
+            o.settings.clone()
+        }
+        None => {
+            let mut s = settings_path().map_or_else(Settings::default, |p| Settings::load(&p));
+            s.check_updates = on;
+            s
+        }
+    };
+    if let Some(p) = settings_path() {
+        if let Err(e) = settings.save(&p) {
+            log_line(&format!("settings.json not saved: {e}"));
+        }
+    }
+    log_line(&format!("update: automatic checks {}", if on { "on" } else { "off" }));
+}
+
+/// Uptime as the update timer sees it (debug builds: `AUTOSPACES_UPDATE_NOW=1` skips the 10 minutes).
+fn update_uptime() -> u64 {
+    #[cfg(debug_assertions)]
+    if std::env::var_os("AUTOSPACES_UPDATE_NOW").is_some() {
+        return uptime_secs() + core::update::FIRST_CHECK_SECS;
+    }
+    uptime_secs()
+}
+
+/// Arms the update timer for the next due check (at most an hour ahead, so sleep is noticed).
+fn update_arm(main: HWND) {
+    let wait = update_timing().wait_secs(update_uptime(), now_secs());
+    let wait = if wait == 0 { core::update::MAX_TIMER_SECS } else { wait };
+    unsafe { SetTimer(main, TIMER_UPDATE, core::update::Timing::timer_ms(wait), None) };
+}
+
+fn on_update_timer(main: HWND) {
+    unsafe { KillTimer(main, TIMER_UPDATE) };
+    if update_timing().wait_secs(update_uptime(), now_secs()) == 0 && check_updates_on() {
+        // What an earlier update left in %TEMP% (the installer has long finished by now).
+        update::cleanup();
+        if update::start_check(main, false) {
+            log_line("update: checking GitHub for a new version");
+            return; // re-armed when the result arrives
+        }
+    }
+    update_arm(main);
+}
+
+/// "Check for updates" in the tray menu.
+fn check_updates_now(main: HWND) {
+    if update_dlg::bring_forward() {
+        return;
+    }
+    if update::start_check(main, true) {
+        log_line("update: checking GitHub for a new version (on request)");
+    } else {
+        UPDATE_MANUAL_PENDING.store(true, Relaxed);
+    }
+}
+
+fn info_box(text: &str) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONINFORMATION, MB_OK, MB_SETFOREGROUND};
+    let title = tray::wide(i18n::t(i18n::Key::AppName));
+    unsafe { MessageBoxW(std::ptr::null_mut(), tray::wide(text).as_ptr(), title.as_ptr(), MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND) };
+}
+
+/// The check thread is done.
+fn on_update_checked(main: HWND, lp: LPARAM) {
+    use core::update::{InstallKind, Verdict, Version};
+    let checked = unsafe { update::take(lp) };
+    let manual = checked.manual || UPDATE_MANUAL_PENDING.swap(false, Relaxed);
+    let now = now_secs();
+    match checked.result {
+        Err(e) => {
+            log_line(&format!("update: check failed: {e}"));
+            update_timing().done(now, false);
+            if manual {
+                info_box(i18n::t(i18n::Key::UpdateCheckFailed));
+            }
+        }
+        Ok(found) => {
+            update_timing().done(now, true);
+            let current = Version::current();
+            let latest = found.as_ref().map(|r| r.version);
+            log_line(&format!(
+                "update: latest release {}, this is {current}",
+                latest.map_or_else(|| "none usable".to_string(), |v| v.to_string())
+            ));
+            if let Some(r) = found.filter(|r| r.version > current) {
+                *update_found() = Some(r);
+            }
+            match update_notices().verdict(current, latest, manual) {
+                Verdict::Nothing => {}
+                Verdict::UpToDate => info_box(&i18n::tf(i18n::Key::UpdateUpToDate, &[&current.to_string()])),
+                Verdict::Notify => {
+                    if let Some(r) = update_found().as_ref() {
+                        let key = if r.installable() && update::install_kind() != InstallKind::Portable {
+                            i18n::Key::NoticeUpdate
+                        } else {
+                            i18n::Key::NoticeUpdatePage
+                        };
+                        BALLOON_UPDATE.store(true, Relaxed);
+                        tray::notify_info(main, &i18n::tf(key, &[&r.version.to_string()]));
+                        log_line(&format!("update: {} announced", r.version));
+                    }
+                }
+                Verdict::Dialog => open_update(main),
+            }
+        }
+    }
+    update_arm(main);
+}
+
+/// The update dialog for the release found last; then skip, or download + start the installer.
+fn open_update(main: HWND) {
+    use core::update::InstallKind;
+    use update_dlg::Choice;
+    let Some(release) = update_found().clone() else { return };
+    let kind = update::install_kind();
+    let check = check_updates_on();
+    let Some(out) = update_dlg::show(&release, kind, check) else { return };
+    for l in &out.log {
+        log_line(l);
+    }
+    if out.check_updates != check {
+        set_check_updates(out.check_updates);
+    }
+    match out.choice {
+        Choice::Later => {}
+        Choice::Skip => {
+            update_notices().skip(release.version);
+            update::save_notices(app_dir().as_deref(), update_notices());
+            log_line(&format!("update: version {} skipped", release.version));
+        }
+        Choice::Install(verified) => match update::launch_installer(&verified, kind) {
+            Ok(()) => {
+                drop(verified);
+                if kind == InstallKind::PerUser {
+                    log_line(&format!("update: installer of {} started (current user); exiting", release.version));
+                    // The same clean exit as "Exit": windows and desktops are given back first.
+                    unsafe { exit_clean(main) };
+                } else {
+                    // All users: the installer asks for elevation itself and, once allowed, closes
+                    // AutoSpaces with WM_CLOSE (the same clean exit). Refused = nothing happens.
+                    log_line(&format!("update: installer of {} started (all users); it closes AutoSpaces after elevation", release.version));
+                }
+            }
+            Err(e) => {
+                log_line(&format!("update: installer not started: {e}"));
+                info_box(i18n::t(i18n::Key::UpdateLaunchFailed));
+            }
+        },
+    }
 }
 
 /// The support timer fired: show the reminder when due and the moment is calm, else try again.
@@ -913,6 +1104,10 @@ fn on_timer(main: HWND, id: usize) {
             on_support_timer(main);
             return;
         }
+        if id == TIMER_UPDATE {
+            on_update_timer(main);
+            return;
+        }
         if id == TIMER_CARRY_WATCH {
             let idle = windows_sys::Win32::System::SystemInformation::GetTickCount64().saturating_sub(CARRY_LAST_KEY.load(Relaxed));
             if !orch().is_some_and(|o| o.carrying()) {
@@ -1099,7 +1294,14 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             on_carry_drop(hwnd, wp != 0);
             0
         }
+        update::WM_UPDATE_CHECKED => {
+            on_update_checked(hwnd, lp);
+            0
+        }
         tray::WM_TRAY => {
+            if lp as u32 == windows_sys::Win32::UI::Shell::NIN_BALLOONUSERCLICK && BALLOON_UPDATE.load(Relaxed) {
+                open_update(hwnd);
+            }
             if lp as u32 == WM_RBUTTONUP {
                 let named = orch().map(|o| o.learned_mut().list_named()).unwrap_or_default();
                 let names: Vec<String> = named.iter().map(|(p, _)| p.clone()).collect();
@@ -1118,6 +1320,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                         open_about();
                     }
                     tray::CMD_REPORT => open_report(),
+                    tray::CMD_CHECK_UPDATES => check_updates_now(hwnd),
                     tray::CMD_FORGET_ALL => {
                         if let Some(o) = orch() {
                             o.forget_learned(None);
@@ -1420,6 +1623,8 @@ fn main() {
             enter_no_backend(hwnd, &why);
         }
         support_init(hwnd);
+        // First update check 10 minutes after start (plan 12.15), then daily.
+        update_arm(hwnd);
         #[cfg(debug_assertions)]
         if std::env::var_os("AUTOSPACES_SHOW_SUPPORT").is_some() {
             windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(hwnd, windows_sys::Win32::UI::WindowsAndMessaging::WM_APP + 11, 0, 0);

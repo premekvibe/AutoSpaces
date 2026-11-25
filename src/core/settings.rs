@@ -327,6 +327,8 @@ pub struct Settings {
     pub carry_create_new: bool,
     /// Hidden key `"carryStyle"` (no UI): how the carried window stays in view (plan 12.13).
     pub carry_style: CarryStyle,
+    /// Look for a new version on GitHub (plan 12.15): 10 minutes after start, then daily.
+    pub check_updates: bool,
 }
 
 /// Value of the hidden `"carryStyle"` key: the visual method of carrying a window.
@@ -420,6 +422,7 @@ impl Default for Settings {
             carry_enabled: true,
             carry_create_new: false,
             carry_style: CarryStyle::Auto,
+            check_updates: true,
         }
     }
 }
@@ -498,6 +501,7 @@ impl Settings {
         flag("switchAnimation", &mut s.switch_animation);
         flag("carryEnabled", &mut s.carry_enabled);
         flag("carryCreateNew", &mut s.carry_create_new);
+        flag("checkUpdates", &mut s.check_updates);
         if let Some(code) = j.get("carryStyle").and_then(Json::as_str) {
             s.carry_style = CarryStyle::from_code(code);
         }
@@ -546,6 +550,7 @@ impl Settings {
   \"switchAnimation\": {},
   \"carryEnabled\": {},
   \"carryCreateNew\": {},
+  \"checkUpdates\": {},
   \"language\": {},{}{}{}
   \"layout\": {}
 }}
@@ -559,6 +564,7 @@ impl Settings {
             self.switch_animation,
             self.carry_enabled,
             self.carry_create_new,
+            self.check_updates,
             quote(self.language.code()),
             // Hidden key, written only when not "auto".
             match self.carry_style {
@@ -647,6 +653,18 @@ mod tests {
             s.language = p;
             assert_eq!(Settings::from_json(&s.to_json()).unwrap().language, p);
         }
+    }
+
+    #[test]
+    fn check_updates_defaults_on_and_roundtrips() {
+        assert!(Settings::default().check_updates);
+        assert!(Settings::from_json("{}").unwrap().check_updates);
+        assert!(Settings::from_json(r#"{"checkUpdates":"no"}"#).unwrap().check_updates);
+        assert!(!Settings::from_json(r#"{"checkUpdates":false}"#).unwrap().check_updates);
+        let mut s = Settings::default();
+        s.check_updates = false;
+        assert!(s.to_json().contains("\"checkUpdates\": false"));
+        assert!(!Settings::from_json(&s.to_json()).unwrap().check_updates);
     }
 
     #[test]

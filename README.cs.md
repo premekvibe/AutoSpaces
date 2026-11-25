@@ -23,11 +23,14 @@ Windows virtuální plochy mají, ale vytvářet je, přesouvat na ně okna a uk
 - **Rozmístění při startu:** okna, která jsou při spuštění AutoSpaces už maximalizovaná, se rozdělí na samostatné plochy, pokud máte všechna okna na jediné ploše.
 - **Rozložení ploch:** zvolíte aplikace, které se mají při startu AutoSpaces otevřít na vlastních plochách (plocha 2 – pošta, plocha 3 – grafy, …). Aplikace, která už běží, se nespouští znovu, jen se přesune a maximalizuje. Spouštění probíhá na pozadí, bez přepnutí vaší plochy.
 - **Přenášení okna:** podržte **Win+Ctrl+Shift** a pozadí za aktivním oknem se změní v matné sklo, dole se objeví pás živých náhledů ploch. Šipkou **←/→** přenesete okno na předchozí nebo další plochu: zůstává ostré a na místě, zatímco plochy i s tapetami pod ním ujíždějí. Puštěním kláves okno na ploše necháte (zůstane v popředí a s fokusem), klávesou **Esc** ho vrátíte zpět. Za poslední plochou se pokračuje plochou 1, nebo (volba v *Nastavení → Klávesy*) vznikne nová plocha. Platí stejná pravidla jako při maximalizaci: maximalizované okno přenesené na plochu, kde už jedno maximalizované je, se přesune na volnou plochu.
+- **Automatické aktualizace:** 10 minut po spuštění a pak jednou denně se AutoSpaces zeptá GitHubu, zda nevyšla novější verze. Pokud ano, nabídne ji oznámením. *Nainstalovat* stáhne instalátor, ověří ho podle kontrolního součtu SHA-256 zveřejněného u vydání a nainstaluje ho na pozadí: AutoSpaces vrátí okna a plochy, aktualizuje se a znovu spustí. *Zkontrolovat aktualizace* v nabídce ikony udělá totéž na požádání; verzi lze také přeskočit.
 - **Spouštění po startu Windows.**
 - **Čeština a angličtina** podle jazyka Windows, s možností ručního přepnutí v nastavení.
 - **Nenáročnost:** jediný soubor pod 1 MB, asi 3 MB vlastní paměti, reaguje na události a na nic se nedotazuje ve smyčce.
 
 Nastavení je v `%APPDATA%\AutoSpaces\settings.json`; naučené výjimky a stav v `%LOCALAPPDATA%\AutoSpaces`.
+
+**Síť:** AutoSpaces se připojuje jen ke GitHubu, a to jen kvůli kontrole aktualizací (a po volbě *Nainstalovat* kvůli stažení instalátoru). Dotaz obsahuje jen název a verzi aplikace; žádné údaje o vás ani o počítači se neodesílají. Automatickou kontrolu lze vypnout v *Nastavení → Obecné → Kontrolovat aktualizace*.
 
 ## Podporované verze Windows
 
@@ -43,7 +46,7 @@ Windows nenabízejí veřejné rozhraní pro přesun okna cizí aplikace mezi vi
 
 Spusťte `AutoSpaces-Setup-<verze>.exe`. Ve výchozím nastavení se instaluje pro aktuálního uživatele bez práv správce; instalace pro všechny uživatele je volitelná. Instalátor zatím není podepsaný, takže Windows SmartScreen zobrazí varování: zvolte *Další informace → Přesto spustit*.
 
-Po instalaci najdete AutoSpaces v oznamovací oblasti. Pravým tlačítkem na ikonu otevřete nabídku: *Zapnuto*, *Nastavení…*, *Naučené výjimky*, *O aplikaci…* a *Ukončit*.
+Po instalaci najdete AutoSpaces v oznamovací oblasti. Pravým tlačítkem na ikonu otevřete nabídku: *Zapnuto*, *Nastavení…*, *Naučené výjimky*, *Zkontrolovat aktualizace*, *O aplikaci…* a *Ukončit*.
 
 **Tip:** aby vás klik na ikonu běžící aplikace na hlavním panelu přenesl na její plochu, otevřete ve Windows *Nastavení > Systém > Multitasking > Plochy* a volbu *Na hlavním panelu zobrazovat všechna otevřená okna* nastavte na *Na všech plochách*. Shift + klik pak spustí novou instanci.
 

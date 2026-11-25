@@ -82,10 +82,29 @@ Root: HKCU; Subkey: "{#RunKey}"; ValueType: string; ValueName: "{#AppName}"; Val
 
 [Run]
 Filename: "{app}\{#AppExe}"; Description: "{cm:LaunchApp}"; Flags: nowait postinstall skipifsilent runasoriginaluser
+; Update from the app (plan 12.15): it runs this installer with /SILENT ... /UPDATE and has exited (or is closed by
+; CloseRunningApp below); start it again as the original, non-elevated user. For all users the installer elevates
+; itself (the app does not use "runas"), so the original user is known here.
+Filename: "{app}\{#AppExe}"; Flags: nowait runasoriginaluser; Check: IsAppUpdate
 
 [Code]
 const
   WM_CLOSE = $0010;
+
+{ Started by AutoSpaces' own update (silent, with /UPDATE on the command line). }
+function IsAppUpdate: Boolean;
+var
+  I: Integer;
+begin
+  Result := False;
+  if not WizardSilent then Exit;
+  for I := 1 to ParamCount do
+    if CompareText(ParamStr(I), '/UPDATE') = 0 then
+    begin
+      Result := True;
+      Exit;
+    end;
+end;
 
 function IsAppRunning: Boolean;
 begin

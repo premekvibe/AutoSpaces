@@ -262,6 +262,59 @@ strings! {
         "Líbí se vám AutoSpaces? Podpořte prosím autora zasláním jakékoli částky jednou z možností níže.",
         "Enjoying AutoSpaces? Please support the author by sending any amount using one of the options below."
     ],
+    // Updates (plan 12.15)
+    MenuCheckUpdates => ["Zkontrolovat aktualizace", "Check for updates"],
+    NoticeUpdate => [
+        "Je k dispozici AutoSpaces {0}. Klikněte pro instalaci.",
+        "AutoSpaces {0} is available. Click to install."
+    ],
+    NoticeUpdatePage => [
+        "Je k dispozici AutoSpaces {0}. Klikněte pro podrobnosti.",
+        "AutoSpaces {0} is available. Click for details."
+    ],
+    UpdateAvailable => [
+        "Je k dispozici AutoSpaces {0}. Nainstalovaná verze je {1}.",
+        "AutoSpaces {0} is available. Your version is {1}."
+    ],
+    UpdateWhatsNew => ["<a>Co je nového ve verzi {0}</a>", "<a>What's new in version {0}</a>"],
+    UpdateInstallNote => [
+        "Instalace proběhne na pozadí: AutoSpaces se ukončí (vrátí okna a plochy), nainstaluje se nová verze a AutoSpaces se znovu spustí. Nastavení zůstane zachováno.",
+        "The update installs in the background: AutoSpaces exits (giving windows and desktops back), the new version is installed and AutoSpaces starts again. Your settings are kept."
+    ],
+    UpdateAdminNote => [
+        "AutoSpaces je nainstalovaný pro všechny uživatele, Windows proto požádá o oprávnění správce.",
+        "AutoSpaces is installed for all users, so Windows will ask for administrator permission."
+    ],
+    UpdatePortableNote => [
+        "Tato kopie AutoSpaces nebyla nainstalována instalátorem, proto se nemůže aktualizovat sama. Novou verzi stáhněte ze stránky vydání.",
+        "This copy of AutoSpaces was not installed by the installer, so it cannot update itself. Download the new version from the release page."
+    ],
+    UpdateNoHash => [
+        "U vydání chybí instalátor nebo jeho kontrolní součet SHA-256, aktualizaci proto nelze ověřit a nainstalovat automaticky. Novou verzi najdete na stránce vydání.",
+        "The release lacks the installer or its SHA-256 checksum, so the update cannot be verified and installed automatically. You can find the new version on the release page."
+    ],
+    UpdateOpenPage => ["Otevřít stránku vydání", "Open release page"],
+    UpdateDownloading => ["Stahuji instalátor… {0}", "Downloading the installer… {0}"],
+    UpdateStarting => ["Spouštím instalátor…", "Starting the installer…"],
+    UpdateCancel => ["Zrušit", "Cancel"],
+    UpdateLater => ["Později", "Later"],
+    UpdateDownloadFailed => [
+        "Stažení se nezdařilo. Zkuste to znovu později, nebo novou verzi stáhněte ze stránky vydání.",
+        "The download failed. Try again later, or download the new version from the release page."
+    ],
+    UpdateHashMismatch => [
+        "Stažený soubor neodpovídá kontrolnímu součtu SHA-256 uvedenému u vydání. Nebyl spuštěn a byl smazán.",
+        "The downloaded file does not match the SHA-256 checksum given with the release. It was not started and has been deleted."
+    ],
+    UpdateLaunchFailed => [
+        "Instalátor se nepodařilo spustit. AutoSpaces běží dál beze změny.",
+        "The installer could not be started. AutoSpaces keeps running unchanged."
+    ],
+    UpdateUpToDate => ["Máte nejnovější verzi AutoSpaces ({0}).", "You have the latest version of AutoSpaces ({0})."],
+    UpdateCheckFailed => [
+        "Kontrola aktualizací se nezdařila. Zkontrolujte připojení k internetu a zkuste to později.",
+        "Checking for updates failed. Check your internet connection and try again later."
+    ],
 }
 
 /// Text of `key` in `lang`.

@@ -8,6 +8,7 @@ pub mod overlay;
 pub mod settings;
 pub mod state;
 pub mod support;
+pub mod update;
 
 pub use model::{Event, Schedule, State, WindowSystem};
 pub use orchestrator::Orchestrator;

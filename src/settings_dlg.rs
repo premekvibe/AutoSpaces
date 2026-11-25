@@ -48,6 +48,8 @@ const ID_OPEN_LAYOUT: i32 = 143;
 const ID_LANGUAGE: i32 = 144;
 const ID_HINT: i32 = 142;
 const ID_LOG: i32 = 147;
+/// "Check for updates" on the General page (plan 12.15).
+const ID_CHECK_UPDATES: i32 = 149;
 const IDD_LAYOUT: u16 = 103;
 const ID_LAY_ENABLED: i32 = 160;
 const ID_LAY_COUNT: i32 = 161;
@@ -397,6 +399,7 @@ unsafe fn init(dlg: HWND, d: &Dlg) {
     CheckDlgButton(pg(dlg, ID_LEARNING), ID_LEARNING, check(d.settings.learning));
     CheckDlgButton(pg(dlg, ID_ARRANGE), ID_ARRANGE, check(d.settings.arrange_at_start));
     CheckDlgButton(pg(dlg, ID_LOG), ID_LOG, check(d.settings.log));
+    CheckDlgButton(pg(dlg, ID_CHECK_UPDATES), ID_CHECK_UPDATES, check(d.settings.check_updates));
     CheckDlgButton(pg(dlg, ID_CARRY), ID_CARRY, check(d.settings.carry_enabled));
     CheckDlgButton(pg(dlg, ID_CARRY_NEW), ID_CARRY_NEW, check(d.settings.carry_create_new));
     SetDlgItemTextW(pg(dlg, ID_CARRY_STATUS), ID_CARRY_STATUS, wide(d.carry_status.as_deref().unwrap_or("")).as_ptr());
@@ -433,6 +436,7 @@ unsafe fn collect(dlg: HWND, d: &mut Dlg) {
     s.arrange_at_start = checked(dlg, ID_ARRANGE);
     s.autostart = checked(dlg, ID_AUTOSTART);
     s.log = checked(dlg, ID_LOG);
+    s.check_updates = checked(dlg, ID_CHECK_UPDATES);
     s.carry_enabled = checked(dlg, ID_CARRY);
     s.carry_create_new = checked(dlg, ID_CARRY_NEW);
     let sel = SendDlgItemMessageW(pg(dlg, ID_LANGUAGE), ID_LANGUAGE, CB_GETCURSEL, 0, 0);
