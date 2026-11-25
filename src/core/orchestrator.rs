@@ -179,8 +179,9 @@ pub struct Orchestrator<B: DesktopBackend, W: WindowSystem> {
     dirty: bool,
     /// Backend is being re-initialised (Explorer restart): nothing is learned meanwhile.
     reinit: bool,
-    /// Desktops of the layout profile that compaction must keep (plan 12.7), counted among
-    /// the desktops that are not helper desktops of managed windows; 0 = no profile applied.
+    /// Desktops of the layout profile (plan 12.7), counted among the desktops that are not helper
+    /// desktops of managed windows; 0 = no profile applied. Reserved (kept empty, not used for
+    /// maximized windows) only while the startup sequence / profile run goes on (`is_pinned`).
     pinned: usize,
     layout: Option<LayoutRun>,
     /// Windows the profile placed: they keep their desktop when maximized.
@@ -989,9 +990,11 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
         }
     }
 
-    /// The first empty desktop (never #1, not the origin, not a profile desktop, not held by another
-    /// managed space), in order.
-    /// Empty desktops only exist at the end (plan 12.1); None means "create one".
+    /// The first (lowest) empty desktop: never #1, not the origin, not held by another managed
+    /// space, not a profile desktop while the profile is still being applied (afterwards an empty
+    /// profile desktop is used like any other, plan 12.14). None means "create one at the end".
+    /// This is the only place that picks a desktop for a maximized window (the startup
+    /// arrangement goes through it too); carrying moves to the desktop the user steps to.
     fn find_empty(&mut self, origin: Guid) -> Option<Guid> {
         let list = self.sync_list()?;
         if list.len() < 2 {
@@ -1115,6 +1118,12 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
 
     /// Invariants 1-5 of plan 12.1. `hint` = (desktop, where to go) for the case that the
     /// desktop the user is viewing is removed because a managed window just left it.
+    ///
+    /// B is only a minimum count (plan 12.14): no particular desktop is kept for it, the empty
+    /// ones that stay are always the last ones. The one exception is the desktop being viewed: an
+    /// empty desktop the user looks at stays until they leave it (switching would surprise them),
+    /// unless a managed window just left it (`hint`: the view goes back with it to its origin).
+    /// Leaving it changes the desktop registry key, so the next `poll` compacts again.
     fn compact(&mut self, hint: Option<(Guid, Guid)>) {
         if self.hold || self.layout.is_some() || self.carry.is_some() {
             // Paused while the startup sequence, the profile or a carry runs (plan 12.7 / 12.11 /
@@ -1126,23 +1135,40 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
         let Some(mut list) = self.sync_list() else { return };
         let mut cur = self.backend.current().ok();
         let occ = self.occupancy(None);
+        // The user is on this (empty) desktop and no managed window takes them away from it. An
+        // empty helper desktop of a managed window (closed without us seeing it) is not kept: its
+        // window is gone, and the view goes back to the window's origin (`remove_at`).
+        let helpers: HashSet<Guid> = self.spaces.keys().copied().collect();
+        let viewed_kept =
+            |d: Guid, cur: Option<Guid>| cur == Some(d) && !helpers.contains(&d) && hint.is_none_or(|(hd, _)| hd != d);
+        let mut kept = false;
         // Pass 1: empty desktops followed by an occupied one (#1 is never removed).
         let mut i = 1;
         while i < list.len() {
             if !self.is_pinned(&list, i) && !occ.contains(&list[i]) && list[i + 1..].iter().any(|x| occ.contains(x)) {
-                if !self.remove_at(&mut list, i, hint, &mut cur) {
+                if viewed_kept(list[i], cur) {
+                    kept = true;
+                    i += 1;
+                } else if !self.remove_at(&mut list, i, hint, &mut cur) {
                     break;
                 }
             } else {
                 i += 1;
             }
         }
-        // Pass 2: trailing empty desktops above B.
-        while list.len() > self.baseline.max(1) && list.last().is_some_and(|d| !occ.contains(d)) {
-            let last = list.len() - 1;
-            if !self.remove_at(&mut list, last, hint, &mut cur) {
+        // Pass 2: trailing empty desktops above B, from the end (the viewed one is skipped).
+        while list.len() > self.baseline.max(1) {
+            let trailing: Vec<usize> = (1..list.len()).rev().take_while(|&k| !occ.contains(&list[k])).collect();
+            let Some(&k) = trailing.iter().find(|&&k| !viewed_kept(list[k], cur) && !self.is_pinned(&list, k)) else {
+                kept |= trailing.iter().any(|&k| viewed_kept(list[k], cur));
+                break;
+            };
+            if !self.remove_at(&mut list, k, hint, &mut cur) {
                 break;
             }
+        }
+        if kept {
+            self.need_compact = true; // again once the user leaves it (next poll)
         }
         // Pass 3: never fewer than B.
         while list.len() < self.baseline {
@@ -1156,17 +1182,26 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
         }
     }
 
-    /// Desktop `i` belongs to the layout profile and must stay even when empty.
+    /// Desktop `i` is reserved for the layout profile and must stay even when empty. Only while
+    /// the startup sequence or the profile run is going on (its apps are still being placed or
+    /// awaited); afterwards the profile's count is just the minimum B (plan 12.14), so an empty
+    /// profile desktop is reused for a maximized window and closed like any other.
     fn is_pinned(&self, list: &[Guid], i: usize) -> bool {
+        if !(self.hold || self.startup_pending || self.layout.is_some()) {
+            return false;
+        }
         let helper = |d: &Guid| self.spaces.contains_key(d);
         !helper(&list[i]) && list[..i].iter().filter(|d| !helper(d)).count() < self.pinned
     }
 
-    /// Removes `list[k]` (k >= 1). A viewed desktop goes to the hint's target, else the previous one.
+    /// Removes `list[k]` (k >= 1). A viewed desktop goes to the hint's target, else (a helper
+    /// desktop whose window is gone) to that window's origin, else the previous one.
     fn remove_at(&mut self, list: &mut Vec<Guid>, k: usize, hint: Option<(Guid, Guid)>, cur: &mut Option<Guid>) -> bool {
         let d = list[k];
+        let origin = self.spaces.get(&d).map(|sp| self.resolve_origin(sp.origin, list)).filter(|o| *o != d);
         let target = match hint {
             Some((hd, ht)) if hd == d && *cur == Some(d) && list.contains(&ht) && ht != d => ht,
+            _ if *cur == Some(d) => origin.unwrap_or(list[k - 1]),
             _ => list[k - 1],
         };
         if self.do_remove(d, target).is_err() {

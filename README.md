@@ -12,7 +12,7 @@ Windows has virtual desktops, but you have to create them, move windows onto the
 
 - **One maximized window per desktop.** A window that is the only maximized one on its desktop stays put. When you maximize another window on the same desktop, that window moves to a desktop of its own and you follow it.
 - **It cleans up after itself.** When the window is restored, minimized or closed, you return to the desktop it came from and its desktop is removed.
-- **Your desktops stay yours.** The number of desktops you had when AutoSpaces started is kept as a baseline. Desktop 1 is never removed, and empty desktops between occupied ones are closed so there are no gaps.
+- **Your desktops stay yours.** The number of desktops you had when AutoSpaces started (or the number set in the desktop layout) is kept as a minimum count. Desktop 1 is never removed. An empty desktop between occupied ones is closed and the following ones move up, so there are no gaps; empty desktops kept for the minimum are always the last ones, and a newly maximized window uses them before a new desktop is created. A desktop you are looking at is not closed until you leave it.
 - **Quitting puts everything back.** *Quit* in the tray menu returns moved windows to their original desktops and removes the desktops AutoSpaces added.
 
 ## Features

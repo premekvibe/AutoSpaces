@@ -898,7 +898,7 @@ fn several_trailing_empties_above_baseline_are_all_removed() {
 }
 
 #[test]
-fn viewed_desktop_removal_goes_to_origin_for_managed_exit_else_previous() {
+fn viewed_desktop_removal_goes_to_origin_for_managed_exit_else_waits_until_left() {
     // Managed exit: origin d2, helper d4 (B = 2, so it is doomed); user views d4.
     let w = World::new(2);
     put(&w, 9, 1);
@@ -912,7 +912,8 @@ fn viewed_desktop_removal_goes_to_origin_for_managed_exit_else_previous() {
     w.set_state(1, State::Normal);
     ev(&w, &mut o, 1, Loc);
     assert_eq!((list(&w), w.desk_of(1).d1, w.current.get().d1), (vec![1, 2], 2, 2));
-    // Non-managed: user views a middle desktop that empties -> previous desktop.
+    // Non-managed (plan 12.14): the user views a middle desktop that empties -> it stays, the
+    // view is not switched away under them.
     let w = World::new(3);
     put(&w, 1, 1);
     put(&w, 2, 2);
@@ -920,9 +921,16 @@ fn viewed_desktop_removal_goes_to_origin_for_managed_exit_else_previous() {
     let mut o = started(&w);
     w.current.set(g(2));
     vanish(&w, &mut o, 2);
-    assert_eq!((list(&w), w.current.get().d1), (vec![1, 3, 4], 1));
-    // The same for the managed window being minimized while its origin is gone: previous desktop.
-    assert_eq!(w.desk_of(3).d1, 3);
+    assert_eq!((list(&w), w.current.get().d1), (vec![1, 2, 3], 2));
+    assert!(w.switches.borrow().is_empty());
+    // The user goes to desktop 1 (the registry key changes -> poll): now the gap goes, B = 3
+    // holds, so an empty desktop is added at the end.
+    w.current.set(g(1));
+    o.poll();
+    assert_eq!((list(&w), w.current.get().d1, w.desk_of(3).d1), (vec![1, 3, 4], 1, 3));
+    // Nothing more happens at the next poll.
+    o.poll();
+    assert_eq!(list(&w), vec![1, 3, 4]);
 }
 
 #[test]
@@ -1085,6 +1093,172 @@ fn compaction_never_counts_the_moved_window_twice_or_not_at_all() {
     ev(&w, &mut o, 1, Loc);
     assert_eq!((list(&w), w.desk_of(1).d1, o.is_managed(h(1)), o.is_rejected(h(1))), (vec![1, 2], 2, false, true));
     let _ = o;
+}
+
+// ---------------------------------------------------------------- minimum count, not reserved desktops (plan 12.14)
+
+/// Minimum 3 from the layout profile (no rules: nothing to wait for), windows on desktops 1-3 and
+/// two maximized windows (41, 51) on new desktops 4 and 5. The user is on desktop 1.
+fn five_desktops_minimum_three() -> (Rc<World>, Orch) {
+    let w = World::new(1);
+    put(&w, 10, 1);
+    let mut o = started(&w);
+    o.apply_settings(profile(3, &[]));
+    assert!(o.start_layout().is_none());
+    assert_eq!((o.baseline(), list(&w)), (3, vec![1, 2, 3]));
+    put(&w, 20, 2);
+    put(&w, 30, 3);
+    for id in [41, 51] {
+        w.current.set(g(1));
+        put(&w, id, 1);
+        w.set_state(id, State::Maximized);
+        ev(&w, &mut o, id, Loc);
+    }
+    w.current.set(g(1));
+    assert_eq!((list(&w), w.desk_of(41).d1, w.desk_of(51).d1), (vec![1, 2, 3, 4, 5], 4, 5));
+    (w, o)
+}
+
+#[test]
+fn minimum_three_freed_middle_desktop_is_closed_and_later_ones_shift() {
+    let (w, mut o) = five_desktops_minimum_three();
+    // The windows on desktop 3 close: it is closed, 4 -> 3 and 5 -> 4 (same GUIDs, new positions).
+    vanish(&w, &mut o, 30);
+    assert_eq!(list(&w), vec![1, 2, 4, 5]);
+    assert_eq!((w.desk_of(41), w.desk_of(51)), (g(4), g(5)));
+    assert_eq!(w.current.get(), g(1), "no view switch");
+}
+
+#[test]
+fn minimum_three_two_freed_desktops_close_only_down_to_the_minimum_and_stay_at_the_end() {
+    let (w, mut o) = five_desktops_minimum_three();
+    vanish(&w, &mut o, 30);
+    assert_eq!(list(&w), vec![1, 2, 4, 5]);
+    // Now the windows on desktops 4 and 3 close: desktop 4 goes, desktop 3 stays empty (minimum 3).
+    w.set_state(51, State::Destroyed);
+    ev(&w, &mut o, 51, Event::Destroy);
+    w.set_state(41, State::Destroyed);
+    ev(&w, &mut o, 41, Event::Destroy);
+    assert_eq!(list(&w), vec![1, 2, 4]);
+    // The other order (desktop 3 first, then 4) ends the same way: the empty one is the last one.
+    let (w, mut o) = five_desktops_minimum_three();
+    vanish(&w, &mut o, 30);
+    w.set_state(41, State::Destroyed);
+    ev(&w, &mut o, 41, Event::Destroy);
+    assert_eq!(list(&w), vec![1, 2, 5], "above the minimum: closed at once, 4 -> 3");
+    w.set_state(51, State::Destroyed);
+    ev(&w, &mut o, 51, Event::Destroy);
+    assert_eq!(list(&w), vec![1, 2, 5], "at the minimum: kept empty at the end");
+    // And with nothing left on desktop 2 either, the two empty desktops are the last two.
+    vanish(&w, &mut o, 20);
+    assert_eq!(list(&w), vec![1, 2, 5]);
+    assert_eq!(w.desk_of(10), g(1));
+}
+
+#[test]
+fn maximized_window_takes_the_empty_desktop_kept_for_the_minimum_not_a_new_one() {
+    let (w, mut o) = five_desktops_minimum_three();
+    vanish(&w, &mut o, 30);
+    w.set_state(51, State::Destroyed);
+    ev(&w, &mut o, 51, Event::Destroy);
+    w.set_state(41, State::Destroyed);
+    ev(&w, &mut o, 41, Event::Destroy);
+    assert_eq!(list(&w), vec![1, 2, 4]);
+    let creates = w.creates.get();
+    w.current.set(g(1));
+    put(&w, 60, 1);
+    w.set_state(60, State::Maximized);
+    ev(&w, &mut o, 60, Loc);
+    assert_eq!((w.desk_of(60), list(&w), w.creates.get()), (g(4), vec![1, 2, 4], creates), "desktop 3 reused");
+}
+
+#[test]
+fn profile_desktop_freed_after_the_run_is_reused_and_a_freed_middle_one_is_closed() {
+    // The reported case: profile 2 = mail.exe, 3 = trade.exe, minimum 3.
+    let (w, mut o) = layout_world();
+    o.start_layout();
+    w.open(2, State::Normal);
+    proc_of(&w, 2, "trade.exe");
+    ev(&w, &mut o, 2, Event::Show);
+    settle(&w, &mut o);
+    assert_eq!((list(&w), w.desk_of(1), w.desk_of(2)), (vec![1, 2, 3], g(2), g(3)));
+    // trade.exe closes: desktop 3 is the last one and within the minimum -> it stays empty...
+    vanish(&w, &mut o, 2);
+    assert_eq!(list(&w), vec![1, 2, 3]);
+    // ... and a window maximized on desktop 1 goes there instead of to a new desktop 4.
+    let creates = w.creates.get();
+    w.current.set(g(1));
+    put(&w, 5, 1);
+    put(&w, 6, 1);
+    w.set_state(5, State::Maximized);
+    ev(&w, &mut o, 5, Loc);
+    assert_eq!((w.desk_of(5), list(&w), w.creates.get()), (g(3), vec![1, 2, 3], creates));
+    assert_eq!(w.current.get(), g(3));
+    // mail.exe closes while the user is on desktop 3: desktop 2 is a gap and goes (3 -> 2), an
+    // empty one is added at the end for the minimum.
+    vanish(&w, &mut o, 1);
+    assert_eq!(list(&w), vec![1, 3, 4]);
+    assert_eq!((w.desk_of(5), w.current.get()), (g(3), g(3)));
+    // A second maximized window takes that last empty desktop, a third one a new desktop.
+    w.current.set(g(1));
+    w.set_state(6, State::Maximized);
+    ev(&w, &mut o, 6, Loc);
+    assert_eq!((w.desk_of(6), list(&w)), (g(4), vec![1, 3, 4]));
+    w.current.set(g(1));
+    put(&w, 7, 1);
+    w.set_state(7, State::Maximized);
+    ev(&w, &mut o, 7, Loc);
+    assert_eq!((w.desk_of(7), list(&w)), (g(5), vec![1, 3, 4, 5]));
+}
+
+#[test]
+fn return_to_the_origin_survives_the_renumbering_of_desktops() {
+    let w = World::new(3);
+    put(&w, 10, 1);
+    put(&w, 20, 2);
+    put(&w, 30, 3);
+    put(&w, 31, 3); // stays on desktop 3 (the origin is not emptied)
+    let mut o = started(&w);
+    w.current.set(g(3));
+    w.set_state(30, State::Maximized);
+    ev(&w, &mut o, 30, Loc);
+    assert_eq!((list(&w), w.desk_of(30), w.current.get()), (vec![1, 2, 3, 4], g(4), g(4)));
+    // Desktop 2 empties: it goes, the origin moves from position 3 to position 2.
+    vanish(&w, &mut o, 20);
+    assert_eq!(list(&w), vec![1, 3, 4]);
+    // Restored: back to the origin by its GUID (now desktop 2), the view goes with it.
+    w.set_state(30, State::Normal);
+    ev(&w, &mut o, 30, Loc);
+    assert_eq!((w.desk_of(30), w.current.get()), (g(3), g(3)));
+    assert_eq!(list(&w), vec![1, 3, 4], "the emptied helper is the last one, within the minimum");
+}
+
+#[test]
+fn startup_with_a_profile_keeps_its_reserved_desktops_until_the_run_ends() {
+    // Outlook and TradingView are both launched; desktops 2 and 3 stay empty for a while.
+    let w = user_world(false, 1);
+    let (mut o, _) = boot(&w, user_profile());
+    let during = w.desktops.borrow().clone();
+    assert_eq!(during.len(), 4, "1, two reserved profile desktops, Edge behind them");
+    assert_eq!((w.desk_of(2), w.desk_of(1)), (during[0], during[3]));
+    // Unrelated windows close (grace compaction) while the apps start: nothing is removed.
+    delay_noise(&w, &mut o);
+    o.poll();
+    assert_eq!(*w.desktops.borrow(), during);
+    // A window the user maximizes meanwhile does not take a reserved desktop.
+    let here = w.current.get();
+    open_as(&w, 60, State::Maximized, "notes.exe");
+    w.wins.borrow_mut().get_mut(&60).unwrap().desktop = here;
+    ev(&w, &mut o, 60, Loc);
+    let l = w.desktops.borrow().clone();
+    assert_eq!((l.len(), w.desk_of(60)), (5, l[4]));
+    // The apps arrive: they go to the reserved desktops; the end of the run leaves no gap.
+    outlook_starts(&w, &mut o);
+    tradingview_starts(&w, &mut o);
+    settle(&w, &mut o);
+    let l = w.desktops.borrow().clone();
+    assert_eq!(l.len(), 5, "{:?}", list(&w));
+    assert_eq!((w.desk_of(30), w.desk_of(21), w.desk_of(1), w.desk_of(60)), (l[1], l[2], l[3], l[4]));
 }
 
 // ---------------------------------------------------------------- learned list
@@ -1582,7 +1756,7 @@ impl World {
 }
 
 #[test]
-fn layout_desktops_are_kept_when_empty_or_in_the_middle() {
+fn layout_desktops_are_kept_while_the_profile_runs_and_compacted_at_its_end() {
     let (w, mut o) = layout_world();
     o.start_layout();
     w.open(2, State::Normal);
@@ -1604,6 +1778,12 @@ fn layout_desktops_are_kept_when_empty_or_in_the_middle() {
     w.set_state(5, State::Normal);
     ev(&w, &mut o, 5, Loc);
     assert_eq!(list(&w), vec![1, 2, 3]);
+    // The run ends (plan 12.14): one compaction; the empty desktop 2 is a gap before trade.exe
+    // and goes, B = 3 adds an empty desktop at the end.
+    assert!(o.layout_running());
+    settle(&w, &mut o);
+    assert_eq!(list(&w), vec![1, 3, 5]);
+    assert_eq!(w.desk_of(2), g(3));
 }
 
 #[test]
@@ -1671,12 +1851,15 @@ fn layout_main_window_after_splash_follows_it_no_extra_desktop() {
     assert_eq!(list(&w), vec![1, 2, 3], "no helper desktop, no gap between profile desktops");
     assert_eq!(w.current.get(), g(1));
     settle(&w, &mut o);
+    // The run is over: desktop 2 (no rule, empty) is a gap and goes; B = 3 adds one at the end
+    // (plan 12.14: the profile's count is a minimum, not a reservation).
+    assert_eq!(list(&w), vec![1, 3, 4]);
     // Later the user restores and maximizes it again: it stays on its desktop (plan 12.7).
     w.set_state(3, State::Normal);
     ev(&w, &mut o, 3, Loc);
     w.set_state(3, State::Maximized);
     ev(&w, &mut o, 3, Loc);
-    assert_eq!((w.desk_of(3), list(&w)), (g(3), vec![1, 2, 3]));
+    assert_eq!((w.desk_of(3), list(&w)), (g(3), vec![1, 3, 4]));
 }
 
 #[test]
@@ -2494,10 +2677,15 @@ fn startup_nothing_moves_or_compacts_before_the_sequence_and_late_maximized_wind
 }
 
 #[test]
-fn startup_profile_app_that_never_starts_keeps_its_desktop_and_nothing_else_moves() {
+fn startup_profile_app_that_never_starts_its_desktop_is_kept_during_the_run_and_closed_after() {
     let w = user_world(true, 1);
     let (mut o, _) = boot(&w, user_profile());
     let edge = w.desk_of(1);
+    let during = w.desktops.borrow().clone();
+    assert_eq!(during.len(), 4, "during the run desktop 3 is reserved for TradingView, Edge behind it");
+    assert_eq!((w.desk_of(3), w.desk_of(2), w.desk_of(1)), (during[1], during[0], during[3]));
+    delay_noise(&w, &mut o);
+    assert_eq!(*w.desktops.borrow(), during, "nothing compacted while the run goes on");
     for _ in 0..80 {
         w.tick(500);
         if o.on_event(layout_tick_token(), Event::Recheck).is_none() {
@@ -2506,11 +2694,12 @@ fn startup_profile_app_that_never_starts_keeps_its_desktop_and_nothing_else_move
     }
     assert!(!o.layout_running());
     assert!(logged(&mut o, "gave up waiting for a window of tradingview.exe"));
+    // The end of the run compacts once (plan 12.14): the empty profile desktop 3 is a gap before
+    // Edge's desktop and goes; 3 desktops = B remain, no empty one.
     let l = w.desktops.borrow().clone();
-    assert_eq!(l.len(), 4, "desktop 3 stays the profile's (part of B), helpers behind it");
-    assert_eq!((w.desk_of(3), w.desk_of(2), w.desk_of(1)), (l[1], l[0], l[3]));
+    assert_eq!(l.len(), 3, "{:?}", list(&w));
+    assert_eq!((w.desk_of(3), w.desk_of(2), w.desk_of(1)), (l[1], l[0], l[2]));
     assert_eq!(w.current.get(), edge);
-    // The end of the run compacts once; the profile desktop is kept even when empty.
     delay_noise(&w, &mut o);
     assert_eq!(*w.desktops.borrow(), l);
     // TradingView started by hand later goes to its desktop like any profile app window.

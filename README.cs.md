@@ -12,7 +12,7 @@ Windows virtuální plochy mají, ale vytvářet je, přesouvat na ně okna a uk
 
 - **Jedno maximalizované okno na plochu.** Okno, které je na své ploše jediné maximalizované, zůstává na místě. Když na téže ploše maximalizujete další okno, přesune se na vlastní plochu a vy s ním.
 - **Uklízí po sobě.** Po zmenšení, minimalizaci nebo zavření okna se vrátíte na plochu, ze které přišlo, a jeho plocha se odstraní.
-- **Vaše plochy zůstávají vaše.** Počet ploch, které jste měli při spuštění AutoSpaces, se drží jako základ. Plocha 1 se nikdy neodstraní a prázdné plochy mezi obsazenými se zavírají, aby nevznikaly mezery.
+- **Vaše plochy zůstávají vaše.** Počet ploch, které jste měli při spuštění AutoSpaces (nebo který je nastavený v rozložení ploch), se drží jako minimální počet. Plocha 1 se nikdy neodstraní. Prázdná plocha mezi obsazenými se zavře a následující se posunou, aby nevznikaly mezery; prázdné plochy ponechané kvůli minimu jsou vždy na konci a nově maximalizované okno je použije dřív, než vznikne nová plocha. Plocha, na kterou se právě díváte, se nezavře, dokud ji neopustíte.
 - **Ukončení vše vrátí.** *Ukončit* v nabídce ikony vrátí přesunutá okna na původní plochy a odstraní plochy, které AutoSpaces přidal.
 
 ## Funkce
