@@ -77,18 +77,10 @@ const PAGES: usize = 5;
 /// Page "Wallpapers" (dialog 111, plan 12.17).
 const ID_WALL_OFF: i32 = 186;
 const ID_WALL_SAME: i32 = 187;
-const ID_WALL_RANDOM: i32 = 188;
 const ID_WALL_IMAGE: i32 = 189;
 const ID_WALL_IMAGE_BROWSE: i32 = 190;
-const ID_WALL_FOLDER: i32 = 191;
-const ID_WALL_FOLDER_BROWSE: i32 = 192;
-const ID_WALL_SUBDIRS: i32 = 193;
-const ID_WALL_NEW: i32 = 194;
-const ID_WALL_SHUFFLE: i32 = 195;
-const ID_WALL_DONE: i32 = 196;
 const ID_WALL_NOTE: i32 = 197;
 const ID_WALL_IMAGE_LABEL: i32 = 198;
-const ID_WALL_FOLDER_LABEL: i32 = 199;
 const WALL_PAGE: usize = 4;
 /// Layout dialog: window state of the selected app (plan 12.16).
 const ID_LAY_SHOW: i32 = 174;
@@ -131,10 +123,8 @@ struct Dlg {
     capture: fn() -> (usize, Vec<LayoutRule>),
     /// Why carrying is not available (shortcut taken, unsupported Windows); None = fine.
     carry_status: Option<String>,
-    /// What the wallpaper options do on this Windows (plan 12.17).
+    /// What the wallpaper option does on this Windows (plan 12.17).
     wall_note: String,
-    /// "Shuffle now": hands the choice to the main window.
-    shuffle: fn(Wallpapers),
 }
 
 const EXPLORER: &str = "explorer.exe";
@@ -160,7 +150,6 @@ pub fn show(
     capture: fn() -> (usize, Vec<LayoutRule>),
     carry_status: Option<String>,
     wall_note: String,
-    shuffle: fn(Wallpapers),
 ) -> Option<Outcome> {
     let prev = OPEN.load(Relaxed);
     if prev != 0 {
@@ -177,7 +166,6 @@ pub fn show(
         capture,
         carry_status,
         wall_note,
-        shuffle,
     };
     unsafe {
         InitCommonControlsEx(&INITCOMMONCONTROLSEX { dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32, dwICC: ICC_TAB_CLASSES });
@@ -462,64 +450,39 @@ unsafe fn get_text(dlg: HWND, id: i32) -> String {
 
 unsafe fn wall_init(dlg: HWND, d: &Dlg) {
     let w = &d.settings.wallpapers;
-    let radio = match w.mode {
-        WallMode::Off => ID_WALL_OFF,
-        WallMode::Same => ID_WALL_SAME,
-        WallMode::Random => ID_WALL_RANDOM,
-    };
-    CheckRadioButton(pg(dlg, ID_WALL_OFF), ID_WALL_OFF, ID_WALL_RANDOM, radio);
+    let radio = if w.mode == WallMode::Same { ID_WALL_SAME } else { ID_WALL_OFF };
+    CheckRadioButton(pg(dlg, ID_WALL_OFF), ID_WALL_OFF, ID_WALL_SAME, radio);
     set_text(dlg, ID_WALL_IMAGE, &w.image);
-    set_text(dlg, ID_WALL_FOLDER, &w.folder);
-    CheckDlgButton(pg(dlg, ID_WALL_SUBDIRS), ID_WALL_SUBDIRS, check(w.subfolders));
-    CheckDlgButton(pg(dlg, ID_WALL_NEW), ID_WALL_NEW, check(w.new_desktops));
     set_text(dlg, ID_WALL_NOTE, &d.wall_note);
     wall_enable(dlg);
 }
 
-/// The fields of the chosen option are enabled, the others greyed.
+/// The picture field only matters for "the same picture on all desktops".
 unsafe fn wall_enable(dlg: HWND) {
     let same = checked(dlg, ID_WALL_SAME);
-    let random = checked(dlg, ID_WALL_RANDOM);
     for id in [ID_WALL_IMAGE_LABEL, ID_WALL_IMAGE, ID_WALL_IMAGE_BROWSE] {
         EnableWindow(GetDlgItem(pg(dlg, id), id), same as i32);
-    }
-    for id in [ID_WALL_FOLDER_LABEL, ID_WALL_FOLDER, ID_WALL_FOLDER_BROWSE, ID_WALL_SUBDIRS, ID_WALL_NEW, ID_WALL_SHUFFLE] {
-        EnableWindow(GetDlgItem(pg(dlg, id), id), random as i32);
     }
 }
 
 unsafe fn wall_read(dlg: HWND) -> Wallpapers {
-    let mode = if checked(dlg, ID_WALL_SAME) {
-        WallMode::Same
-    } else if checked(dlg, ID_WALL_RANDOM) {
-        WallMode::Random
-    } else {
-        WallMode::Off
-    };
-    Wallpapers {
-        mode,
-        image: get_text(dlg, ID_WALL_IMAGE),
-        folder: get_text(dlg, ID_WALL_FOLDER),
-        subfolders: checked(dlg, ID_WALL_SUBDIRS),
-        new_desktops: checked(dlg, ID_WALL_NEW),
-    }
+    let mode = if checked(dlg, ID_WALL_SAME) { WallMode::Same } else { WallMode::Off };
+    Wallpapers { mode, image: get_text(dlg, ID_WALL_IMAGE) }
 }
 
-/// The choice can be applied: a picture for "same", a folder with pictures for "random". Otherwise
-/// a message, the page is shown and the field gets the focus.
+/// The choice can be applied: "same" needs an existing picture. Otherwise a message, the page is
+/// shown and the field gets the focus.
 unsafe fn wall_valid(dlg: HWND, w: &Wallpapers) -> bool {
-    use crate::core::wallpaper::{is_image, list_images};
-    let (ok, key, field) = match w.mode {
-        WallMode::Off => (true, Key::WallNeedImage, ID_WALL_IMAGE),
+    use crate::core::wallpaper::is_image;
+    let ok = match w.mode {
+        WallMode::Off => true,
         WallMode::Same => {
             let p = std::path::Path::new(&w.image);
             let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            (p.is_file() && is_image(&name), Key::WallNeedImage, ID_WALL_IMAGE)
-        }
-        WallMode::Random => {
-            (!list_images(std::path::Path::new(&w.folder), w.subfolders).is_empty(), Key::WallNeedFolder, ID_WALL_FOLDER)
+            p.is_file() && is_image(&name)
         }
     };
+    let (key, field) = (Key::WallNeedImage, ID_WALL_IMAGE);
     if !ok {
         let tab = GetDlgItem(dlg, ID_TAB);
         SendMessageW(tab, TCM_SETCURSEL, WALL_PAGE, 0);
@@ -557,30 +520,6 @@ unsafe fn choose_image(parent: HWND, current: &str) -> Option<String> {
     let n = file.iter().position(|&c| c == 0).unwrap_or(file.len());
     Some(String::from_utf16_lossy(&file[..n]))
 }
-
-/// Folder picker of the shell.
-unsafe fn choose_folder(parent: HWND) -> Option<String> {
-    use windows_sys::Win32::System::Com::CoTaskMemFree;
-    use windows_sys::Win32::UI::Shell::{SHBrowseForFolderW, SHGetPathFromIDListW, BIF_NEWDIALOGSTYLE, BIF_RETURNONLYFSDIRS, BROWSEINFOW};
-    let title = wide(t(Key::WallChooseFolder));
-    let mut bi: BROWSEINFOW = std::mem::zeroed();
-    bi.hwndOwner = parent;
-    bi.lpszTitle = title.as_ptr();
-    bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
-    let pidl = SHBrowseForFolderW(&bi);
-    if pidl.is_null() {
-        return None;
-    }
-    let mut buf = [0u16; 1040];
-    let ok = SHGetPathFromIDListW(pidl, buf.as_mut_ptr()) != 0;
-    CoTaskMemFree(pidl as *const core::ffi::c_void);
-    if !ok {
-        return None;
-    }
-    let n = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-    Some(String::from_utf16_lossy(&buf[..n]))
-}
-
 
 /// Checked state of a button of any page.
 unsafe fn checked(dlg: HWND, id: i32) -> bool {
@@ -647,22 +586,10 @@ unsafe extern "system" fn proc(dlg: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> i
                     collect(dlg, d);
                     EndDialog(dlg, IDOK as isize);
                 }
-                ID_WALL_OFF | ID_WALL_SAME | ID_WALL_RANDOM => wall_enable(dlg),
+                ID_WALL_OFF | ID_WALL_SAME => wall_enable(dlg),
                 ID_WALL_IMAGE_BROWSE => {
                     if let Some(p) = choose_image(dlg, &get_text(dlg, ID_WALL_IMAGE)) {
                         set_text(dlg, ID_WALL_IMAGE, &p);
-                    }
-                }
-                ID_WALL_FOLDER_BROWSE => {
-                    if let Some(p) = choose_folder(dlg) {
-                        set_text(dlg, ID_WALL_FOLDER, &p);
-                    }
-                }
-                ID_WALL_SHUFFLE => {
-                    let w = Wallpapers { mode: WallMode::Random, ..wall_read(dlg) };
-                    if wall_valid(dlg, &w) {
-                        (d.shuffle)(w);
-                        set_text(dlg, ID_WALL_DONE, t(Key::WallShuffled));
                     }
                 }
                 x if x == IDCANCEL => {

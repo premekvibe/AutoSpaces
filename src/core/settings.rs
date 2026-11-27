@@ -345,15 +345,14 @@ pub enum WallMode {
     Off,
     /// One picture on every desktop.
     Same,
-    /// A random picture of a folder per desktop (Windows 10: one random picture for all).
-    Random,
 }
 
 impl WallMode {
+    /// Unknown values are "do not change". `"random"` (random pictures of a folder, written by a
+    /// 0.2.2 test build) is not offered any more and also reads as "do not change": nothing is set.
     pub fn from_code(s: &str) -> WallMode {
         match s.trim().to_ascii_lowercase().as_str() {
             "same" => WallMode::Same,
-            "random" => WallMode::Random,
             _ => WallMode::Off,
         }
     }
@@ -362,42 +361,25 @@ impl WallMode {
         match self {
             WallMode::Off => "off",
             WallMode::Same => "same",
-            WallMode::Random => "random",
         }
     }
 }
 
-/// Key `"wallpapers"` of `settings.json` (plan 12.17).
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Key `"wallpapers"` of `settings.json` (plan 12.17). Other keys (`folder`, `subfolders`,
+/// `newDesktops` of the test build) are ignored and not written again.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Wallpapers {
     pub mode: WallMode,
     /// The picture of `Same`.
     pub image: String,
-    /// The folder of `Random`.
-    pub folder: String,
-    /// `Random` also takes pictures from subfolders.
-    pub subfolders: bool,
-    /// `Random`: a desktop created later (by AutoSpaces or by hand) gets a random picture too.
-    pub new_desktops: bool,
-}
-
-impl Default for Wallpapers {
-    fn default() -> Self {
-        Wallpapers { mode: WallMode::Off, image: String::new(), folder: String::new(), subfolders: false, new_desktops: true }
-    }
 }
 
 impl Wallpapers {
-    /// The choice that decides which pictures the desktops get changed (applied again on OK);
-    /// only `new_desktops` changed = nothing to apply now.
+    /// The choice changed in a way that must be applied on OK.
     pub fn changed_from(&self, old: &Wallpapers) -> bool {
-        if self.mode != old.mode {
-            return true;
-        }
         match self.mode {
             WallMode::Off => false,
-            WallMode::Same => self.image != old.image,
-            WallMode::Random => self.folder != old.folder || self.subfolders != old.subfolders,
+            WallMode::Same => old.mode != WallMode::Same || self.image != old.image,
         }
     }
 
@@ -409,27 +391,11 @@ impl Wallpapers {
         if let Some(t) = j.get("image").and_then(Json::as_str) {
             w.image = t.trim().to_string();
         }
-        if let Some(t) = j.get("folder").and_then(Json::as_str) {
-            w.folder = t.trim().to_string();
-        }
-        if let Some(Json::Bool(b)) = j.get("subfolders") {
-            w.subfolders = *b;
-        }
-        if let Some(Json::Bool(b)) = j.get("newDesktops") {
-            w.new_desktops = *b;
-        }
         w
     }
 
     fn to_json(&self) -> String {
-        format!(
-            "{{\"mode\": {}, \"image\": {}, \"folder\": {}, \"subfolders\": {}, \"newDesktops\": {}}}",
-            quote(self.mode.code()),
-            quote(&self.image),
-            quote(&self.folder),
-            self.subfolders,
-            self.new_desktops
-        )
+        format!("{{\"mode\": {}, \"image\": {}}}", quote(self.mode.code()), quote(&self.image))
     }
 }
 
@@ -1113,47 +1079,43 @@ mod tests {
     fn wallpapers_default_off_tolerant_and_roundtrip() {
         let d = Settings::from_json("{}").unwrap().wallpapers;
         assert_eq!(d, Wallpapers::default());
-        assert!(d.mode == WallMode::Off && d.new_desktops && !d.subfolders);
-        let s = Settings::from_json(
-            r#"{"wallpapers":{"mode":"RANDOM","folder":" C:\\Pics ","subfolders":true,"newDesktops":false,"image":5}}"#,
-        )
-        .unwrap()
-        .wallpapers;
-        assert_eq!(
-            (s.mode, s.folder.as_str(), s.subfolders, s.new_desktops, s.image.as_str()),
-            (WallMode::Random, r"C:\Pics", true, false, "")
-        );
-        assert_eq!(Settings::from_json(r#"{"wallpapers":{"mode":"tiles"}}"#).unwrap().wallpapers.mode, WallMode::Off);
+        assert_eq!(d.mode, WallMode::Off);
+        let s = Settings::from_json(r#"{"wallpapers":{"mode":"SAME","image":" C:\\Pics\\a.jpg "}}"#).unwrap().wallpapers;
+        assert_eq!((s.mode, s.image.as_str()), (WallMode::Same, r"C:\Pics\a.jpg"));
+        assert_eq!(Settings::from_json(r#"{"wallpapers":{"mode":"tiles","image":5}}"#).unwrap().wallpapers, Wallpapers::default());
         assert_eq!(Settings::from_json(r#"{"wallpapers":[1]}"#).unwrap().wallpapers, Wallpapers::default());
         let mut all = Settings::default();
-        all.wallpapers = Wallpapers {
-            mode: WallMode::Same,
-            image: r#"C:\a "b".jpg"#.into(),
-            folder: r"D:\x".into(),
-            subfolders: true,
-            new_desktops: false,
-        };
+        all.wallpapers = Wallpapers { mode: WallMode::Same, image: r#"C:\a "b".jpg"#.into() };
         let text = all.to_json();
         assert!(text.contains(r#""wallpapers": {"mode": "same""#));
         assert_eq!(Settings::from_json(&text).unwrap(), all);
-        for m in [WallMode::Off, WallMode::Same, WallMode::Random] {
+        for m in [WallMode::Off, WallMode::Same] {
             assert_eq!(WallMode::from_code(m.code()), m);
         }
     }
 
     #[test]
+    fn random_wallpapers_of_the_test_build_read_as_do_not_change() {
+        // 0.2.2 test build: random pictures of a folder (removed). Safe: nothing is set.
+        let text = r#"{"wallpapers":{"mode":"random","image":"","folder":"D:\\Pics","subfolders":true,"newDesktops":true}}"#;
+        let s = Settings::from_json(text).unwrap();
+        assert_eq!(s.wallpapers, Wallpapers::default());
+        // A picture chosen earlier stays remembered, but "random" does not turn into "same".
+        let s = Settings::from_json(r#"{"wallpapers":{"mode":"random","image":"C:\\a.jpg"}}"#).unwrap();
+        assert_eq!((s.wallpapers.mode, s.wallpapers.image.as_str()), (WallMode::Off, r"C:\a.jpg"));
+        // The other keys are not written again.
+        let out = s.to_json();
+        assert!(!out.contains("folder") && !out.contains("random") && !out.contains("newDesktops"));
+    }
+
+    #[test]
     fn wallpaper_changes_that_need_applying() {
-        let base = Wallpapers { mode: WallMode::Random, folder: "a".into(), ..Wallpapers::default() };
-        assert!(!base.changed_from(&base));
-        assert!(!Wallpapers { new_desktops: false, ..base.clone() }.changed_from(&base), "only the option for new desktops");
-        assert!(!Wallpapers { image: "x.jpg".into(), ..base.clone() }.changed_from(&base), "the picture of another mode");
-        assert!(Wallpapers { folder: "b".into(), ..base.clone() }.changed_from(&base));
-        assert!(Wallpapers { subfolders: true, ..base.clone() }.changed_from(&base));
-        assert!(Wallpapers { mode: WallMode::Off, ..base.clone() }.changed_from(&base));
-        let same = Wallpapers { mode: WallMode::Same, image: "x.jpg".into(), ..Wallpapers::default() };
-        assert!(Wallpapers { image: "y.jpg".into(), ..same.clone() }.changed_from(&same));
-        assert!(!Wallpapers { folder: "z".into(), ..same.clone() }.changed_from(&same));
+        let same = Wallpapers { mode: WallMode::Same, image: "x.jpg".into() };
         let off = Wallpapers::default();
-        assert!(!Wallpapers { image: "y.jpg".into(), ..off.clone() }.changed_from(&off), "off touches nothing");
+        assert!(!same.changed_from(&same));
+        assert!(Wallpapers { image: "y.jpg".into(), ..same.clone() }.changed_from(&same));
+        assert!(same.changed_from(&off), "switched on");
+        assert!(!off.changed_from(&same), "off touches nothing");
+        assert!(!Wallpapers { image: "y.jpg".into(), ..off.clone() }.changed_from(&off));
     }
 }

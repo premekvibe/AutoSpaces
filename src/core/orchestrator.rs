@@ -1385,12 +1385,6 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
         list.into_iter().filter(|d| !self.spaces.contains_key(d)).nth(k.max(1) as usize - 1)
     }
 
-    /// The desktop list as this app last saw it (no call into Explorer): desktops it created or
-    /// that the user added appear here after the event / registry change that brought them.
-    pub fn known_desktops(&self) -> &[Guid] {
-        &self.last_list
-    }
-
     /// True while the startup sequence is pending or launched profile applications are still
     /// awaited or settling.
     pub fn layout_running(&self) -> bool {

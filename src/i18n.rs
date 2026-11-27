@@ -325,33 +325,27 @@ strings! {
     // Wallpapers (plan 12.17)
     TabWallpapers => ["Tapety", "Wallpapers"],
     WallPerDesktop => [
-        "Tato verze Windows 11 má tapetu pro každou plochu: náhodný výběr dá každé ploše jiný obrázek (sousední plochy různé, pokud je ze složky z čeho vybírat).",
-        "This version of Windows 11 has a wallpaper per desktop: a random choice gives every desktop its own picture (neighbouring desktops differ when the folder has enough pictures)."
+        "Tato verze Windows 11 má tapetu pro každou plochu: obrázek se nastaví všem plochám najednou.",
+        "This version of Windows 11 has a wallpaper per desktop: the picture is set on all desktops at once."
     ],
     WallWin11Unknown => [
-        "Tapety jednotlivých ploch nejsou pro tuto verzi Windows 11 ověřené: použije se jen dokumentované nastavení jednoho obrázku a náhodný výběr dá jeden obrázek všem plochám.",
-        "Per-desktop wallpapers are not verified for this version of Windows 11: only the documented setting of one picture is used, and a random choice gives one picture to all desktops."
+        "Tapety jednotlivých ploch nejsou pro tuto verzi Windows 11 ověřené: použije se dokumentované nastavení tapety Windows, které nemusí změnit všechny plochy.",
+        "Per-desktop wallpapers are not verified for this version of Windows 11: the documented Windows wallpaper setting is used, which may not change every desktop."
     ],
     WallWin10 => [
-        "Windows 10 nemá tapety jednotlivých ploch: použije se jeden obrázek pro všechny plochy, náhodný výběr dá jeden náhodný obrázek všem plochám.",
-        "Windows 10 has no per-desktop wallpapers: one picture is used for all desktops, and a random choice gives one random picture to all desktops."
+        "Windows 10 mají jednu tapetu pro všechny plochy.",
+        "Windows 10 has one wallpaper for all desktops."
     ],
     WallNoRestore => [
         "Po ukončení AutoSpaces tapety zůstanou, jak jsou.",
         "When AutoSpaces exits, the wallpapers stay as they are."
     ],
     WallChooseImage => ["Vybrat obrázek tapety", "Choose a wallpaper picture"],
-    WallChooseFolder => ["Vyberte složku s obrázky tapet", "Choose a folder with wallpaper pictures"],
     FileFilterImages => ["Obrázky (*.jpg; *.jpeg; *.png; *.bmp)", "Pictures (*.jpg; *.jpeg; *.png; *.bmp)"],
     WallNeedImage => [
         "Vyberte obrázek, který se má použít na všech plochách (.jpg, .jpeg, .png nebo .bmp).",
         "Choose the picture to use on all desktops (.jpg, .jpeg, .png or .bmp)."
     ],
-    WallNeedFolder => [
-        "Ve vybrané složce nejsou žádné obrázky (.jpg, .jpeg, .png, .bmp). Vyberte jinou složku.",
-        "The chosen folder contains no pictures (.jpg, .jpeg, .png, .bmp). Choose another folder."
-    ],
-    WallShuffled => ["Tapety jsou zamíchané.", "The wallpapers have been shuffled."],
 }
 
 /// Text of `key` in `lang`.
