@@ -22,11 +22,13 @@ const REQUIRED_SLOTS: [&str; 9] = [
     "RemoveDesktop",
     "FindDesktop",
 ];
-const OPTIONAL_SLOTS: [&str; 4] = [
+const OPTIONAL_SLOTS: [&str; 6] = [
     "SwitchDesktopWithAnimation",
     "WaitForAnimationToComplete",
     "SwitchDesktopAndMoveForegroundView",
     "SetDesktopName",
+    "SetDesktopWallpaper",
+    "UpdateWallpaperPathForAllDesktops",
 ];
 const MAX_SLOT: usize = 128;
 
@@ -145,6 +147,24 @@ fn check_slot_order(s: &Slots) -> Result<(), String> {
         if !ok {
             return Err(format!("slot '{name}' is out of place"));
         }
+    }
+    // Wallpapers (plan 12.17): every source has SetDesktopName, SetDesktopWallpaper and
+    // UpdateWallpaperPathForAllDesktops right after each other, below SwitchDesktopWithAnimation.
+    // These setters cannot be self-tested (they change the user's wallpaper), so a description
+    // that breaks this shape is refused before anything is called.
+    let name = s.opt("SetDesktopName");
+    for (key, off) in [("SetDesktopWallpaper", 1), ("UpdateWallpaperPathForAllDesktops", 2)] {
+        if let Some(slot) = s.opt(key) {
+            if name.map(|n| n + off) != Some(slot) {
+                return Err(format!("slot '{key}' must be SetDesktopName + {off}"));
+            }
+            if s.opt("SwitchDesktopWithAnimation").is_some_and(|a| slot >= a) {
+                return Err(format!("slot '{key}' must be below 'SwitchDesktopWithAnimation'"));
+            }
+        }
+    }
+    if s.opt("UpdateWallpaperPathForAllDesktops").is_some() && s.opt("SetDesktopWallpaper").is_none() {
+        return Err("'UpdateWallpaperPathForAllDesktops' needs 'SetDesktopWallpaper'".into());
     }
     let mut all: Vec<usize> = order.iter().map(|o| o.1).chain(s.optional.iter().map(|o| o.1)).collect();
     all.sort_unstable();
@@ -418,6 +438,39 @@ mod tests {
         assert!(parse_variants(&with("\"IsViewPinned\":7,\"PinView\":6,\"UnpinView\":8")).is_err());
         assert!(parse_variants(&with("\"IsViewPinned\":6,\"PinView\":7")).is_err());
         assert!(parse_variants(&with("\"IsViewPinned\":6,\"PinView\":7,\"UnpinView\":8,\"PinAppID\":4")).is_err());
+    }
+
+    #[test]
+    fn wallpaper_slots_from_two_sources_on_windows_11_only() {
+        let v = parse_variants(EMBEDDED).unwrap();
+        let by = |n: &str| v.iter().find(|x| x.name == n).unwrap().clone();
+        for (n, name, wall, all) in [
+            ("win11-24h2", 16, 17, 18),
+            ("win11-23h2-3085", 15, 16, 17),
+            ("win11-22h2-2215", 15, 16, 17),
+            ("win11-22h2", 16, 17, 18),
+            ("win11-21h2", 15, 16, 17),
+        ] {
+            let s = by(n).slots;
+            assert_eq!(
+                (s.opt("SetDesktopName"), s.opt("SetDesktopWallpaper"), s.opt("UpdateWallpaperPathForAllDesktops")),
+                (Some(name), Some(wall), Some(all)),
+                "{n}"
+            );
+        }
+        // Windows 10 has no per-desktop wallpapers.
+        let w10 = by("win10").slots;
+        assert_eq!((w10.opt("SetDesktopWallpaper"), w10.opt("UpdateWallpaperPathForAllDesktops")), (None, None));
+        // Consistency: right after SetDesktopName, in this order, below the animated switch.
+        let opt = |s: &str| MIN.replace("\"FindDesktop\":13", &format!("\"FindDesktop\":13,{s}"));
+        assert!(parse_variants(&opt("\"SetDesktopName\":15,\"SetDesktopWallpaper\":16,\"UpdateWallpaperPathForAllDesktops\":17")).is_ok());
+        assert!(parse_variants(&opt("\"SetDesktopName\":15,\"SetDesktopWallpaper\":16")).is_ok());
+        assert!(parse_variants(&opt("\"SetDesktopWallpaper\":16")).is_err(), "without SetDesktopName");
+        assert!(parse_variants(&opt("\"SetDesktopName\":15,\"SetDesktopWallpaper\":17")).is_err());
+        assert!(parse_variants(&opt("\"SetDesktopName\":15,\"UpdateWallpaperPathForAllDesktops\":17")).is_err(), "needs the per-desktop one");
+        assert!(parse_variants(&opt("\"SetDesktopName\":15,\"SetDesktopWallpaper\":16,\"UpdateWallpaperPathForAllDesktops\":18")).is_err());
+        assert!(parse_variants(&opt("\"SetDesktopName\":15,\"SetDesktopWallpaper\":16,\"SwitchDesktopWithAnimation\":16")).is_err());
+        assert!(parse_variants(&opt("\"SetDesktopName\":15,\"SetDesktopWallpaper\":16,\"SwitchDesktopWithAnimation\":17")).is_ok());
     }
 
     #[test]

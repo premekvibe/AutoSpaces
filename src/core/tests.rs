@@ -52,6 +52,8 @@ struct World {
     activated: RefCell<Vec<usize>>,
     /// Windows `maximize_inactive` was called for.
     maximized: RefCell<Vec<usize>>,
+    /// Windows `show_inactive` was called for with a normal / minimized state (plan 12.16).
+    shown: RefCell<Vec<(usize, super::settings::WindowShow)>>,
     /// Windows `stop_flash` was called for (in order).
     unflashed: RefCell<Vec<usize>>,
     /// Process start time per window id (0 = unknown).
@@ -292,6 +294,20 @@ impl WindowSystem for FW {
     }
     fn stop_flash(&self, hwnd: HWND) {
         self.0.unflashed.borrow_mut().push(hwnd as usize);
+    }
+    fn show_inactive(&self, hwnd: HWND, show: super::settings::WindowShow) -> bool {
+        use super::settings::WindowShow;
+        let id = hwnd as usize;
+        let state = match show {
+            WindowShow::Max => return self.maximize_inactive(hwnd),
+            WindowShow::Normal => State::Normal,
+            WindowShow::Min => State::Minimized,
+        };
+        self.0.shown.borrow_mut().push((id, show));
+        if let Some(w) = self.0.wins.borrow_mut().get_mut(&id) {
+            w.state = state;
+        }
+        true
     }
     fn maximize_inactive(&self, hwnd: HWND) -> bool {
         let id = hwnd as usize;
@@ -3369,4 +3385,144 @@ fn focus_follow_up_leaves_a_window_moved_to_another_desktop_alone() {
     w.tick(150);
     o.on_event(focus_token(), Event::Recheck);
     assert_eq!((w.fg.get(), w.activated.borrow().len()), (902, before));
+}
+
+// ---------------------------------------------------------------- window state of layout apps (plan 12.16)
+
+fn profile_shows(count: u32, rules: &[(u32, &str, super::settings::WindowShow)]) -> Settings {
+    let mut s = profile(count, &[]);
+    s.layout.rules = rules.iter().map(|(d, p, show)| LayoutRule::new(*d, "", p, "", p).unwrap().with_show(*show)).collect();
+    s
+}
+
+#[test]
+fn layout_normal_and_minimized_apps_get_their_state_in_the_background() {
+    use super::settings::WindowShow;
+    let w = World::new(1);
+    put(&w, 1, 1);
+    proc_of(&w, 1, "mail.exe");
+    w.set_state(1, State::Maximized); // running and maximized: becomes a normal window
+    put(&w, 50, 1);
+    w.fg.set(50);
+    let mut o = started(&w);
+    o.apply_settings(profile_shows(3, &[(2, "mail.exe", WindowShow::Normal), (3, "trade.exe", WindowShow::Min)]));
+    assert!(o.start_layout().is_some(), "trade.exe is awaited");
+    assert_eq!(w.desk_of(1), g(2), "moved to its desktop");
+    assert_eq!(w.state(1), State::Normal);
+    // The launched app shows a normal window on the desktop being viewed: moved and minimized.
+    w.open(2, State::Normal);
+    proc_of(&w, 2, "trade.exe");
+    ev(&w, &mut o, 2, Event::Show);
+    assert_eq!(w.desk_of(2), g(3));
+    assert_eq!(w.state(2), State::Minimized);
+    assert_eq!(*w.shown.borrow(), vec![(1, WindowShow::Normal), (2, WindowShow::Min)]);
+    assert!(w.maximized.borrow().is_empty(), "nothing maximized");
+    settle(&w, &mut o);
+    assert_eq!(w.current.get(), g(1), "background: no view switch");
+    assert!(w.switches.borrow().is_empty());
+    assert!(!w.activated.borrow().contains(&1) && !w.activated.borrow().contains(&2), "no focus taken");
+    assert_eq!(list(&w), vec![1, 2, 3]);
+    assert!(!o.is_managed(h(1)) && !o.is_managed(h(2)), "no helper desktops");
+}
+
+#[test]
+fn layout_window_already_in_its_state_is_left_alone_and_restores_are_not_fought_forever() {
+    use super::settings::WindowShow;
+    let w = World::new(1);
+    put(&w, 1, 1);
+    proc_of(&w, 1, "a.exe");
+    w.set_state(1, State::Minimized);
+    let mut o = started(&w);
+    o.apply_settings(profile_shows(2, &[(2, "a.exe", WindowShow::Min)]));
+    assert!(o.start_layout().is_none());
+    assert_eq!(w.desk_of(1), g(2));
+    assert!(w.shown.borrow().is_empty() && w.maximized.borrow().is_empty(), "already minimized: no call");
+    // A launched app that keeps maximizing itself is brought back a few times only.
+    let w = World::new(1);
+    put(&w, 50, 1);
+    let mut o = started(&w);
+    o.apply_settings(profile_shows(2, &[(2, "b.exe", WindowShow::Normal)]));
+    assert!(o.start_layout().is_some());
+    w.open(2, State::Maximized);
+    proc_of(&w, 2, "b.exe");
+    ev(&w, &mut o, 2, Event::Show);
+    for _ in 0..5 {
+        w.set_state(2, State::Maximized); // the app applies its saved (maximized) placement
+        ev(&w, &mut o, 2, Loc);
+    }
+    assert_eq!(w.shown.borrow().len(), 3, "a few times, never a fight");
+    assert_eq!(w.desk_of(2), g(2));
+    assert!(!o.is_managed(h(2)), "a profile window maximized by its app never gets a helper desktop");
+}
+
+#[test]
+fn normal_or_minimized_profile_window_triggers_nothing_and_keeps_its_desktop() {
+    use super::settings::WindowShow;
+    let w = World::new(1);
+    put(&w, 1, 1);
+    proc_of(&w, 1, "mail.exe");
+    put(&w, 2, 1);
+    proc_of(&w, 2, "notes.exe");
+    let mut o = started(&w);
+    o.always_own_desktop = false;
+    o.apply_settings(profile_shows(3, &[(2, "mail.exe", WindowShow::Normal), (3, "notes.exe", WindowShow::Min)]));
+    assert!(o.start_layout().is_none());
+    assert_eq!((w.state(1), w.state(2)), (State::Normal, State::Minimized));
+    // Another window maximized on desktop 2 next to the normal one: it stays (a normal window is
+    // not a maximized one), no new desktop.
+    w.current.set(g(2));
+    put(&w, 3, 2);
+    w.set_state(3, State::Maximized);
+    ev(&w, &mut o, 3, Loc);
+    assert!(!o.is_managed(h(3)));
+    assert_eq!(list(&w), vec![1, 2, 3]);
+    // The user maximizes the profile window on its own desktop: it stays there.
+    w.set_state(3, State::Normal);
+    ev(&w, &mut o, 3, Loc);
+    w.set_state(1, State::Maximized);
+    ev(&w, &mut o, 1, Loc);
+    assert_eq!(w.desk_of(1), g(2));
+    assert!(!o.is_managed(h(1)));
+    w.current.set(g(1));
+    // Desktop 3 holds only the minimized window: occupied. A compaction (a window closing on
+    // desktop 1) keeps it, also above the minimum.
+    o.apply_settings(Settings { layout: Layout { desktop_count: 1, ..o.settings.layout.clone() }, ..o.settings.clone() });
+    put(&w, 9, 1);
+    vanish(&w, &mut o, 9);
+    assert_eq!(list(&w), vec![1, 2, 3], "the minimized window keeps desktop 3, the normal ones desktop 2");
+    // Only when it is closed does its desktop go (it is the last one, above the minimum).
+    vanish(&w, &mut o, 2);
+    assert_eq!(list(&w)[..2], [1, 2]);
+}
+
+#[test]
+fn minimized_window_of_any_app_occupies_its_desktop() {
+    // Plan 12.1 "occupied": minimized windows count (also of apps outside the profile).
+    let (w, mut o) = five_desktops_minimum_three();
+    w.set_state(30, State::Minimized);
+    put(&w, 9, 1);
+    vanish(&w, &mut o, 9);
+    assert_eq!(list(&w), vec![1, 2, 3, 4, 5], "desktop 3 with a minimized window is no gap");
+    vanish(&w, &mut o, 30);
+    assert_eq!(list(&w), vec![1, 2, 4, 5], "closed: now it is a gap");
+}
+
+#[test]
+fn capture_layout_takes_the_window_state_along() {
+    use super::settings::WindowShow;
+    let w = World::new(4);
+    for (id, d, p, st) in [
+        (1, 2, "mail.exe", State::Normal),
+        (2, 3, "trade.exe", State::Minimized),
+        (3, 4, "video.exe", State::Maximized),
+        (4, 1, "notepad.exe", State::Normal),
+    ] {
+        put(&w, id, d);
+        proc_of(&w, id, p);
+        w.set_state(id, st);
+    }
+    let o = started(&w);
+    let (_, rules) = o.capture_layout();
+    let got: Vec<(&str, WindowShow)> = rules.iter().map(|r| (r.process.as_str(), r.show)).collect();
+    assert_eq!(got, vec![("mail.exe", WindowShow::Normal), ("trade.exe", WindowShow::Min), ("video.exe", WindowShow::Max)]);
 }

@@ -215,7 +215,7 @@ strings! {
     PickLayoutTitle => ["Přidat do rozložení", "Add to layout"],
     PickLayoutButton => ["Přidat", "Add"],
     LayoutCountLabel => ["Počet ploch po startu (nejméně {0}):", "Number of desktops at startup (at least {0}):"],
-    LayoutRow => ["Plocha {0} – {1}", "Desktop {0} – {1}"],
+    LayoutRow => ["Plocha {0} – {1} – {2}", "Desktop {0} – {1} – {2}"],
     LayoutFull => ["V rozložení může být nejvýše {0} aplikací.", "The layout can hold at most {0} apps."],
     FileFilterPrograms => ["Programy (*.exe)", "Programs (*.exe)"],
     FileFilterAll => ["Všechny soubory (*.*)", "All files (*.*)"],
@@ -315,11 +315,61 @@ strings! {
         "Kontrola aktualizací se nezdařila. Zkontrolujte připojení k internetu a zkuste to později.",
         "Checking for updates failed. Check your internet connection and try again later."
     ],
+    // Window state of layout apps (plan 12.16): combo box and the suffix of a list row
+    ShowMax => ["Maximalizovaně", "Maximized"],
+    ShowNormal => ["V okně", "Normal window"],
+    ShowMin => ["Minimalizovaně", "Minimized"],
+    ShowMaxRow => ["maximalizovaně", "maximized"],
+    ShowNormalRow => ["v okně", "normal window"],
+    ShowMinRow => ["minimalizovaně", "minimized"],
+    // Wallpapers (plan 12.17)
+    TabWallpapers => ["Tapety", "Wallpapers"],
+    WallPerDesktop => [
+        "Tato verze Windows 11 má tapetu pro každou plochu: náhodný výběr dá každé ploše jiný obrázek (sousední plochy různé, pokud je ze složky z čeho vybírat).",
+        "This version of Windows 11 has a wallpaper per desktop: a random choice gives every desktop its own picture (neighbouring desktops differ when the folder has enough pictures)."
+    ],
+    WallWin11Unknown => [
+        "Tapety jednotlivých ploch nejsou pro tuto verzi Windows 11 ověřené: použije se jen dokumentované nastavení jednoho obrázku a náhodný výběr dá jeden obrázek všem plochám.",
+        "Per-desktop wallpapers are not verified for this version of Windows 11: only the documented setting of one picture is used, and a random choice gives one picture to all desktops."
+    ],
+    WallWin10 => [
+        "Windows 10 nemá tapety jednotlivých ploch: použije se jeden obrázek pro všechny plochy, náhodný výběr dá jeden náhodný obrázek všem plochám.",
+        "Windows 10 has no per-desktop wallpapers: one picture is used for all desktops, and a random choice gives one random picture to all desktops."
+    ],
+    WallNoRestore => [
+        "Po ukončení AutoSpaces tapety zůstanou, jak jsou.",
+        "When AutoSpaces exits, the wallpapers stay as they are."
+    ],
+    WallChooseImage => ["Vybrat obrázek tapety", "Choose a wallpaper picture"],
+    WallChooseFolder => ["Vyberte složku s obrázky tapet", "Choose a folder with wallpaper pictures"],
+    FileFilterImages => ["Obrázky (*.jpg; *.jpeg; *.png; *.bmp)", "Pictures (*.jpg; *.jpeg; *.png; *.bmp)"],
+    WallNeedImage => [
+        "Vyberte obrázek, který se má použít na všech plochách (.jpg, .jpeg, .png nebo .bmp).",
+        "Choose the picture to use on all desktops (.jpg, .jpeg, .png or .bmp)."
+    ],
+    WallNeedFolder => [
+        "Ve vybrané složce nejsou žádné obrázky (.jpg, .jpeg, .png, .bmp). Vyberte jinou složku.",
+        "The chosen folder contains no pictures (.jpg, .jpeg, .png, .bmp). Choose another folder."
+    ],
+    WallShuffled => ["Tapety jsou zamíchané.", "The wallpapers have been shuffled."],
 }
 
 /// Text of `key` in `lang`.
 pub fn tr(lang: Lang, key: Key) -> &'static str {
     TABLE[key as usize][lang as usize]
+}
+
+/// Name of a window state of a layout app: in the combo box (`row` = false) or in a list row.
+pub fn show_name(s: crate::core::settings::WindowShow, row: bool) -> &'static str {
+    use crate::core::settings::WindowShow as W;
+    t(match (s, row) {
+        (W::Max, false) => Key::ShowMax,
+        (W::Normal, false) => Key::ShowNormal,
+        (W::Min, false) => Key::ShowMin,
+        (W::Max, true) => Key::ShowMaxRow,
+        (W::Normal, true) => Key::ShowNormalRow,
+        (W::Min, true) => Key::ShowMinRow,
+    })
 }
 
 /// Text of `key` in the current language.
@@ -450,8 +500,8 @@ mod tests {
     fn placeholders_are_filled() {
         assert_eq!(fill("a {0} b {1} {0}", &["x", "y"]), "a x b y x");
         for l in LANGS {
-            assert!(fill(tr(l, Key::LayoutRow), &["2", "Foo"]).contains("2"));
-            assert!(!fill(tr(l, Key::LayoutRow), &["2", "Foo"]).contains('{'));
+            assert!(fill(tr(l, Key::LayoutRow), &["2", "Foo", "x"]).contains("2"));
+            assert!(!fill(tr(l, Key::LayoutRow), &["2", "Foo", "x"]).contains('{'));
         }
     }
 

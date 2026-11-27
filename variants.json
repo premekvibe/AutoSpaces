@@ -2,6 +2,7 @@
   "variants": [
     {
       "name": "win11-24h2",
+      "wallpaperSource": "SetDesktopWallpaper/UpdateWallpaperPathForAllDesktops right after SetDesktopName, HSTRING path: MScholtes/VirtualDesktop VirtualDesktop11-24H2.cs, Ciantic/VirtualDesktopAccessor src/interfaces.rs (set_wallpaper, update_wallpaper_for_all), mrob95/pyvda com_defns.py (OVER_26100 SetWallpaper, SetWallpaperForAllDesktops)",
       "verified": true,
       "minBuild": 26100,
       "source": "verified live on 26340; MScholtes/VirtualDesktop VirtualDesktop11-24H2.cs (v1.21), Ciantic/VirtualDesktopAccessor (winvd 0.0.48+), mrob95/pyvda (OVER_26100)",
@@ -21,6 +22,8 @@
         "RemoveDesktop": 13,
         "FindDesktop": 14,
         "SetDesktopName": 16,
+        "SetDesktopWallpaper": 17,
+        "UpdateWallpaperPathForAllDesktops": 18,
         "SwitchDesktopWithAnimation": 22,
         "WaitForAnimationToComplete": 24
       },
@@ -35,6 +38,7 @@
     },
     {
       "name": "win11-23h2-3085",
+      "wallpaperSource": "SetDesktopWallpaper/UpdateWallpaperPathForAllDesktops right after SetDesktopName, HSTRING path: MScholtes/VirtualDesktop VirtualDesktop11.cs v1.17 (commit 4dd34ce), Ciantic/VirtualDesktopAccessor commit 0276add, mrob95/pyvda (OVER_22631)",
       "verified": false,
       "minBuild": 22621,
       "maxBuild": 22631,
@@ -52,7 +56,9 @@
         "CreateDesktop": 10,
         "RemoveDesktop": 12,
         "FindDesktop": 13,
-        "SetDesktopName": 15
+        "SetDesktopName": 15,
+        "SetDesktopWallpaper": 16,
+        "UpdateWallpaperPathForAllDesktops": 17
       },
       "pinnedApps": {
         "source": "IVirtualDesktopPinnedApps: same IID, service and method order in MScholtes/VirtualDesktop (file of this variant) and mrob95/pyvda com_defns.py (not build-dependent); for 22621+ also Ciantic/VirtualDesktopAccessor src/interfaces.rs",
@@ -64,6 +70,7 @@
     },
     {
       "name": "win11-22h2-2215",
+      "wallpaperSource": "SetDesktopWallpaper/UpdateWallpaperPathForAllDesktops right after SetDesktopName, HSTRING path: MScholtes/VirtualDesktop VirtualDesktop11-23H2.cs (commit 546b673), Ciantic/VirtualDesktopAccessor commit c918946, mrob95/pyvda (OVER_22621)",
       "verified": false,
       "minBuild": 22621,
       "maxBuild": 22631,
@@ -81,7 +88,9 @@
         "CreateDesktop": 10,
         "RemoveDesktop": 12,
         "FindDesktop": 13,
-        "SetDesktopName": 15
+        "SetDesktopName": 15,
+        "SetDesktopWallpaper": 16,
+        "UpdateWallpaperPathForAllDesktops": 17
       },
       "pinnedApps": {
         "source": "IVirtualDesktopPinnedApps: same IID, service and method order in MScholtes/VirtualDesktop (file of this variant) and mrob95/pyvda com_defns.py (not build-dependent); for 22621+ also Ciantic/VirtualDesktopAccessor src/interfaces.rs",
@@ -93,6 +102,7 @@
     },
     {
       "name": "win11-22h2",
+      "wallpaperSource": "SetDesktopWallpaper/UpdateWallpaperPathForAllDesktops right after SetDesktopName, HSTRING path, no monitor argument: MScholtes/VirtualDesktop VirtualDesktop11.cs (commit 546b673), mrob95/pyvda (OVER_22449)",
       "verified": false,
       "minBuild": 22621,
       "maxBuild": 22621,
@@ -110,7 +120,9 @@
         "CreateDesktop": 11,
         "RemoveDesktop": 13,
         "FindDesktop": 14,
-        "SetDesktopName": 16
+        "SetDesktopName": 16,
+        "SetDesktopWallpaper": 17,
+        "UpdateWallpaperPathForAllDesktops": 18
       },
       "pinnedApps": {
         "source": "IVirtualDesktopPinnedApps: same IID, service and method order in MScholtes/VirtualDesktop (file of this variant) and mrob95/pyvda com_defns.py (not build-dependent); for 22621+ also Ciantic/VirtualDesktopAccessor src/interfaces.rs",
@@ -122,6 +134,7 @@
     },
     {
       "name": "win11-21h2",
+      "wallpaperSource": "SetDesktopWallpaper/UpdateWallpaperPathForAllDesktops right after SetDesktopName, HSTRING path, no monitor argument: MScholtes/VirtualDesktop VirtualDesktop11-21H2.cs (commit 546b673), mrob95/pyvda (OVER_21313)",
       "verified": false,
       "minBuild": 22000,
       "maxBuild": 22000,
@@ -139,7 +152,9 @@
         "CreateDesktop": 10,
         "RemoveDesktop": 12,
         "FindDesktop": 13,
-        "SetDesktopName": 15
+        "SetDesktopName": 15,
+        "SetDesktopWallpaper": 16,
+        "UpdateWallpaperPathForAllDesktops": 17
       },
       "pinnedApps": {
         "source": "IVirtualDesktopPinnedApps: same IID, service and method order in MScholtes/VirtualDesktop (file of this variant) and mrob95/pyvda com_defns.py (not build-dependent); for 22621+ also Ciantic/VirtualDesktopAccessor src/interfaces.rs",

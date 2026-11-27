@@ -411,6 +411,46 @@ impl WindowSystem for Win32Windows {
             SetWindowPlacement(hwnd, &wp) != 0 && ShowWindowAsync(hwnd, SW_SHOWNOACTIVATE) != 0
         }
     }
+    fn show_inactive(&self, hwnd: HWND, show: crate::core::settings::WindowShow) -> bool {
+        use crate::core::settings::WindowShow;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            GetWindowPlacement, IsIconic, IsZoomed, PostMessageW, SetWindowPlacement, SC_MINIMIZE, SW_SHOWNOACTIVATE,
+            WINDOWPLACEMENT, WM_SYSCOMMAND, WPF_ASYNCWINDOWPLACEMENT,
+        };
+        unsafe {
+            match show {
+                WindowShow::Max => self.maximize_inactive(hwnd),
+                WindowShow::Normal => {
+                    if IsIconic(hwnd) == 0 && IsZoomed(hwnd) == 0 {
+                        return true;
+                    }
+                    // Minimized (classic apps start so, SW_SHOWMINNOACTIVE) or maximized: shown at
+                    // its normal position without activation, on the window's own thread
+                    // (asynchronous). Without WPF_RESTORETOMAXIMIZED a minimized window comes
+                    // back as a normal one, not maximized.
+                    let mut wp: WINDOWPLACEMENT = std::mem::zeroed();
+                    wp.length = std::mem::size_of::<WINDOWPLACEMENT>() as u32;
+                    if GetWindowPlacement(hwnd, &mut wp) == 0 {
+                        return false;
+                    }
+                    wp.flags = WPF_ASYNCWINDOWPLACEMENT;
+                    wp.showCmd = SW_SHOWNOACTIVATE as u32;
+                    SetWindowPlacement(hwnd, &wp) != 0
+                }
+                WindowShow::Min => {
+                    if IsIconic(hwnd) != 0 {
+                        return true;
+                    }
+                    // The window minimizes itself, as after a click on its minimize button: no
+                    // minimize call from this process (see `maximize_inactive` on shell mods). The
+                    // window is not the foreground one (the profile gives the focus back first), so
+                    // no other window is activated. An app that hides itself in the tray instead is
+                    // no longer counted on its desktop (it is hidden).
+                    PostMessageW(hwnd, WM_SYSCOMMAND, SC_MINIMIZE as usize, 0) != 0
+                }
+            }
+        }
+    }
     fn recent_user_input(&self, ms: u32) -> bool {
         unsafe {
             let mut li = LASTINPUTINFO { cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32, dwTime: 0 };

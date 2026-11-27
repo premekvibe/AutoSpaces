@@ -1,6 +1,6 @@
 [package]
 name = "autospaces"
-version = "0.2.1"
+version = "0.2.2"
 license = "GPL-3.0-or-later"
 edition = "2021"
 
@@ -31,6 +31,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_UI_Input",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
     "Win32_UI_WindowsAndMessaging",
 ] }
 

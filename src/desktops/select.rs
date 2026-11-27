@@ -220,6 +220,16 @@ impl Guard {
         self.dirty = true;
         self.flush();
     }
+
+    /// Remembers at once that `name` must not be tried again on `build` (e.g. Explorer died
+    /// during an undocumented call: the call lives in Explorer, so this process survives it).
+    pub fn record_crash(&mut self, name: &str, build: u32) {
+        if !self.crashed(name, build) {
+            self.crashed.push((name.to_string(), build));
+        }
+        self.dirty = true;
+        self.flush();
+    }
 }
 
 #[cfg(test)]

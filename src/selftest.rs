@@ -228,6 +228,9 @@ pub fn run(select_only: bool) -> i32 {
             yes(b.has_move_switch()),
             yes(b.animates())
         ));
+        // Wallpapers (plan 12.17): described slots only; the setters are never called here.
+        let (per, all) = b.wallpaper_slots();
+        out.say(&format!("wallpapers: SetDesktopWallpaper described {}, UpdateWallpaperPathForAllDesktops described {}", yes(per), yes(all)));
     }
     if select_only {
         out.say("RESULT: PASS");

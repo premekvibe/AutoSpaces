@@ -153,7 +153,8 @@ fn redact_value(v: &Json, env: &Env) -> Json {
                         ("excludedNames", Json::Obj(names)) => {
                             Json::Obj(names.iter().map(|(p, _)| (anonymize(p, env), Json::Str(OMITTED.into()))).collect())
                         }
-                        ("name" | "args", Json::Str(s)) if !s.is_empty() => Json::Str(OMITTED.into()),
+                        // Wallpaper picture and folder (plan 12.17): personal names and places.
+                        ("name" | "args" | "image" | "folder", Json::Str(s)) if !s.is_empty() => Json::Str(OMITTED.into()),
                         ("launch", Json::Str(s)) => Json::Str(anonymize(&launch_label(s), env)),
                         _ => redact_value(x, env),
                     };
@@ -401,6 +402,17 @@ mod tests {
         }
         // The output is valid JSON again.
         assert!(parse_json(&out).is_ok(), "{out}");
+    }
+
+    #[test]
+    fn wallpaper_paths_are_left_out() {
+        let e = env();
+        let settings = r#"{"wallpapers":{"mode":"random","image":"D:\\Fotky\\Jana u more.jpg","folder":"D:\\Fotky\\Dovolena","subfolders":true,"newDesktops":true}}"#;
+        let out = redact_json(settings, &e);
+        for bad in ["Fotky", "Jana", "Dovolena"] {
+            assert!(!out.contains(bad), "{bad} in {out}");
+        }
+        assert!(out.contains("\"mode\": \"random\"") && out.contains("(omitted)"), "{out}");
     }
 
     #[test]

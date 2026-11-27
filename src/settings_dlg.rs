@@ -1,7 +1,10 @@
 //! Settings dialog (plan 12.2): plain Win32 dialog templates from assets/autospaces.rc,
 //! created only on request (no cost while idle). Ids below must match the .rc file.
 
-use crate::core::settings::{display_label, file_name_lower, renumber_rules, Layout, LayoutRule, MAX_LAYOUT_DESKTOPS, SYSTEM_HOSTS};
+use crate::core::settings::{
+    display_label, file_name_lower, renumber_rules, Layout, LayoutRule, WallMode, Wallpapers, WindowShow, MAX_LAYOUT_DESKTOPS,
+    SYSTEM_HOSTS,
+};
 use crate::core::Settings;
 use crate::i18n::{self, t, tf, Key, Pref, LANGS};
 use crate::sysopts;
@@ -20,7 +23,7 @@ use windows_sys::Win32::UI::Shell::ShellExecuteW;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, GetKeyState, SetFocus, VK_CONTROL, VK_SHIFT, VK_TAB};
 use windows_sys::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL, EndDialog, GetDlgItem, GetDlgItemInt, SetDlgItemInt, SetDlgItemTextW, SetWindowTextW,
+    CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL, EndDialog, GetDlgItem, GetDlgItemInt, GetDlgItemTextW, SetDlgItemInt, SetDlgItemTextW, SetWindowTextW,
     LB_RESETCONTENT, LBN_SELCHANGE, LB_SETHORIZONTALEXTENT, GetWindowLongPtrW, GetWindowTextW, LoadImageW, SendDlgItemMessageW,
     SendMessageW, SetForegroundWindow, SetWindowLongPtrW, GWLP_USERDATA, GWLP_ID,
     ICON_BIG, ICON_SMALL, IMAGE_ICON, LR_SHARED, SM_CXICON, SM_CXSMICON, SM_CYICON, SM_CYSMICON, IDCANCEL, IDOK, LBN_DBLCLK, LB_ADDSTRING, LB_DELETESTRING, LB_ERR,
@@ -68,8 +71,29 @@ const ID_PICK_LIST: i32 = 150;
 /// Tab control of the settings dialog and its pages: child dialogs 106..108 (ids 310.. inside the dialog).
 const ID_TAB: i32 = 300;
 const ID_PAGE0: i32 = 310;
-const IDD_PAGE0: u16 = 106;
-const PAGES: usize = 4;
+/// Templates of the pages, in tab order (110 is the update dialog, so the fifth page is 111).
+const PAGE_DIALOGS: [u16; PAGES] = [106, 107, 108, 109, 111];
+const PAGES: usize = 5;
+/// Page "Wallpapers" (dialog 111, plan 12.17).
+const ID_WALL_OFF: i32 = 186;
+const ID_WALL_SAME: i32 = 187;
+const ID_WALL_RANDOM: i32 = 188;
+const ID_WALL_IMAGE: i32 = 189;
+const ID_WALL_IMAGE_BROWSE: i32 = 190;
+const ID_WALL_FOLDER: i32 = 191;
+const ID_WALL_FOLDER_BROWSE: i32 = 192;
+const ID_WALL_SUBDIRS: i32 = 193;
+const ID_WALL_NEW: i32 = 194;
+const ID_WALL_SHUFFLE: i32 = 195;
+const ID_WALL_DONE: i32 = 196;
+const ID_WALL_NOTE: i32 = 197;
+const ID_WALL_IMAGE_LABEL: i32 = 198;
+const ID_WALL_FOLDER_LABEL: i32 = 199;
+const WALL_PAGE: usize = 4;
+/// Layout dialog: window state of the selected app (plan 12.16).
+const ID_LAY_SHOW: i32 = 174;
+const ID_LAY_SHOW_LABEL: i32 = 175;
+const CBN_SELCHANGE: u32 = 1;
 /// Page "Keys" (dialog 109): carrying a window (plan 12.13).
 const ID_CARRY: i32 = 180;
 const ID_CARRY_NEW: i32 = 181;
@@ -107,6 +131,10 @@ struct Dlg {
     capture: fn() -> (usize, Vec<LayoutRule>),
     /// Why carrying is not available (shortcut taken, unsupported Windows); None = fine.
     carry_status: Option<String>,
+    /// What the wallpaper options do on this Windows (plan 12.17).
+    wall_note: String,
+    /// "Shuffle now": hands the choice to the main window.
+    shuffle: fn(Wallpapers),
 }
 
 const EXPLORER: &str = "explorer.exe";
@@ -131,6 +159,8 @@ pub fn show(
     running: fn() -> Vec<(String, String)>,
     capture: fn() -> (usize, Vec<LayoutRule>),
     carry_status: Option<String>,
+    wall_note: String,
+    shuffle: fn(Wallpapers),
 ) -> Option<Outcome> {
     let prev = OPEN.load(Relaxed);
     if prev != 0 {
@@ -146,6 +176,8 @@ pub fn show(
         running,
         capture,
         carry_status,
+        wall_note,
+        shuffle,
     };
     unsafe {
         InitCommonControlsEx(&INITCOMMONCONTROLSEX { dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32, dwICC: ICC_TAB_CLASSES });
@@ -363,7 +395,7 @@ pub(crate) unsafe fn set_icons(dlg: HWND) {
 /// Tabs, pages (child dialogs) and their initial layout; the first tab is shown.
 unsafe fn create_pages(dlg: HWND) {
     let tab = GetDlgItem(dlg, ID_TAB);
-    for (i, key) in [Key::TabGeneral, Key::TabApps, Key::TabAdvanced, Key::TabKeys].into_iter().enumerate() {
+    for (i, key) in [Key::TabGeneral, Key::TabApps, Key::TabAdvanced, Key::TabKeys, Key::TabWallpapers].into_iter().enumerate() {
         let text = wide(t(key));
         let mut item: TCITEMW = std::mem::zeroed();
         item.mask = TCIF_TEXT;
@@ -371,7 +403,7 @@ unsafe fn create_pages(dlg: HWND) {
         SendMessageW(tab, TCM_INSERTITEMW, i, &item as *const TCITEMW as LPARAM);
     }
     for k in 0..PAGES as i32 {
-        let page = i18n::create_dialog(IDD_PAGE0 + k as u16, dlg, Some(page_proc), 0);
+        let page = i18n::create_dialog(PAGE_DIALOGS[k as usize], dlg, Some(page_proc), 0);
         SetWindowLongPtrW(page, GWLP_ID, (ID_PAGE0 + k) as isize);
     }
     layout_pages(dlg);
@@ -413,7 +445,142 @@ unsafe fn init(dlg: HWND, d: &Dlg) {
     }
     SendDlgItemMessageW(pg(dlg, ID_LANGUAGE), ID_LANGUAGE, CB_SETCURSEL, d.settings.language.index(), 0);
     update_buttons(dlg);
+    wall_init(dlg, d);
 }
+
+// ---------------------------------------------------------------- page "Wallpapers" (plan 12.17)
+
+unsafe fn set_text(dlg: HWND, id: i32, text: &str) {
+    SetDlgItemTextW(pg(dlg, id), id, wide(text).as_ptr());
+}
+
+unsafe fn get_text(dlg: HWND, id: i32) -> String {
+    let mut buf = vec![0u16; 1040];
+    let n = GetDlgItemTextW(pg(dlg, id), id, buf.as_mut_ptr(), buf.len() as i32);
+    String::from_utf16_lossy(&buf[..n as usize]).trim().trim_matches('"').trim().to_string()
+}
+
+unsafe fn wall_init(dlg: HWND, d: &Dlg) {
+    let w = &d.settings.wallpapers;
+    let radio = match w.mode {
+        WallMode::Off => ID_WALL_OFF,
+        WallMode::Same => ID_WALL_SAME,
+        WallMode::Random => ID_WALL_RANDOM,
+    };
+    CheckRadioButton(pg(dlg, ID_WALL_OFF), ID_WALL_OFF, ID_WALL_RANDOM, radio);
+    set_text(dlg, ID_WALL_IMAGE, &w.image);
+    set_text(dlg, ID_WALL_FOLDER, &w.folder);
+    CheckDlgButton(pg(dlg, ID_WALL_SUBDIRS), ID_WALL_SUBDIRS, check(w.subfolders));
+    CheckDlgButton(pg(dlg, ID_WALL_NEW), ID_WALL_NEW, check(w.new_desktops));
+    set_text(dlg, ID_WALL_NOTE, &d.wall_note);
+    wall_enable(dlg);
+}
+
+/// The fields of the chosen option are enabled, the others greyed.
+unsafe fn wall_enable(dlg: HWND) {
+    let same = checked(dlg, ID_WALL_SAME);
+    let random = checked(dlg, ID_WALL_RANDOM);
+    for id in [ID_WALL_IMAGE_LABEL, ID_WALL_IMAGE, ID_WALL_IMAGE_BROWSE] {
+        EnableWindow(GetDlgItem(pg(dlg, id), id), same as i32);
+    }
+    for id in [ID_WALL_FOLDER_LABEL, ID_WALL_FOLDER, ID_WALL_FOLDER_BROWSE, ID_WALL_SUBDIRS, ID_WALL_NEW, ID_WALL_SHUFFLE] {
+        EnableWindow(GetDlgItem(pg(dlg, id), id), random as i32);
+    }
+}
+
+unsafe fn wall_read(dlg: HWND) -> Wallpapers {
+    let mode = if checked(dlg, ID_WALL_SAME) {
+        WallMode::Same
+    } else if checked(dlg, ID_WALL_RANDOM) {
+        WallMode::Random
+    } else {
+        WallMode::Off
+    };
+    Wallpapers {
+        mode,
+        image: get_text(dlg, ID_WALL_IMAGE),
+        folder: get_text(dlg, ID_WALL_FOLDER),
+        subfolders: checked(dlg, ID_WALL_SUBDIRS),
+        new_desktops: checked(dlg, ID_WALL_NEW),
+    }
+}
+
+/// The choice can be applied: a picture for "same", a folder with pictures for "random". Otherwise
+/// a message, the page is shown and the field gets the focus.
+unsafe fn wall_valid(dlg: HWND, w: &Wallpapers) -> bool {
+    use crate::core::wallpaper::{is_image, list_images};
+    let (ok, key, field) = match w.mode {
+        WallMode::Off => (true, Key::WallNeedImage, ID_WALL_IMAGE),
+        WallMode::Same => {
+            let p = std::path::Path::new(&w.image);
+            let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            (p.is_file() && is_image(&name), Key::WallNeedImage, ID_WALL_IMAGE)
+        }
+        WallMode::Random => {
+            (!list_images(std::path::Path::new(&w.folder), w.subfolders).is_empty(), Key::WallNeedFolder, ID_WALL_FOLDER)
+        }
+    };
+    if !ok {
+        let tab = GetDlgItem(dlg, ID_TAB);
+        SendMessageW(tab, TCM_SETCURSEL, WALL_PAGE, 0);
+        show_page(dlg, WALL_PAGE);
+        MessageBoxW(dlg, wide(t(key)).as_ptr(), wide(t(Key::AppName)).as_ptr(), MB_OK | MB_ICONINFORMATION);
+        SetFocus(GetDlgItem(pg(dlg, field), field));
+    }
+    ok
+}
+
+/// Standard file dialog for a picture.
+unsafe fn choose_image(parent: HWND, current: &str) -> Option<String> {
+    use windows_sys::Win32::UI::Controls::Dialogs::{
+        GetOpenFileNameW, OFN_FILEMUSTEXIST, OFN_HIDEREADONLY, OFN_NOCHANGEDIR, OFN_PATHMUSTEXIST, OPENFILENAMEW,
+    };
+    let mut file = [0u16; 1040];
+    for (i, c) in current.encode_utf16().take(file.len() - 1).enumerate() {
+        file[i] = c;
+    }
+    let filter: Vec<u16> = format!("{}\0*.jpg;*.jpeg;*.png;*.bmp\0{}\0*.*\0\0", t(Key::FileFilterImages), t(Key::FileFilterAll))
+        .encode_utf16()
+        .collect();
+    let title = wide(t(Key::WallChooseImage));
+    let mut ofn: OPENFILENAMEW = std::mem::zeroed();
+    ofn.lStructSize = std::mem::size_of::<OPENFILENAMEW>() as u32;
+    ofn.hwndOwner = parent;
+    ofn.lpstrFilter = filter.as_ptr();
+    ofn.lpstrFile = file.as_mut_ptr();
+    ofn.nMaxFile = file.len() as u32;
+    ofn.lpstrTitle = title.as_ptr();
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR | OFN_HIDEREADONLY;
+    if GetOpenFileNameW(&mut ofn) == 0 {
+        return None;
+    }
+    let n = file.iter().position(|&c| c == 0).unwrap_or(file.len());
+    Some(String::from_utf16_lossy(&file[..n]))
+}
+
+/// Folder picker of the shell.
+unsafe fn choose_folder(parent: HWND) -> Option<String> {
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
+    use windows_sys::Win32::UI::Shell::{SHBrowseForFolderW, SHGetPathFromIDListW, BIF_NEWDIALOGSTYLE, BIF_RETURNONLYFSDIRS, BROWSEINFOW};
+    let title = wide(t(Key::WallChooseFolder));
+    let mut bi: BROWSEINFOW = std::mem::zeroed();
+    bi.hwndOwner = parent;
+    bi.lpszTitle = title.as_ptr();
+    bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+    let pidl = SHBrowseForFolderW(&bi);
+    if pidl.is_null() {
+        return None;
+    }
+    let mut buf = [0u16; 1040];
+    let ok = SHGetPathFromIDListW(pidl, buf.as_mut_ptr()) != 0;
+    CoTaskMemFree(pidl as *const core::ffi::c_void);
+    if !ok {
+        return None;
+    }
+    let n = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    Some(String::from_utf16_lossy(&buf[..n]))
+}
+
 
 /// Checked state of a button of any page.
 unsafe fn checked(dlg: HWND, id: i32) -> bool {
@@ -441,6 +608,7 @@ unsafe fn collect(dlg: HWND, d: &mut Dlg) {
     s.carry_create_new = checked(dlg, ID_CARRY_NEW);
     let sel = SendDlgItemMessageW(pg(dlg, ID_LANGUAGE), ID_LANGUAGE, CB_GETCURSEL, 0, 0);
     s.language = if sel < 0 { d.settings.language } else { Pref::from_index(sel as usize) };
+    s.wallpapers = wall_read(dlg);
     d.out = Some(Outcome {
         settings: s,
         forgotten: std::mem::take(&mut d.forgotten),
@@ -473,8 +641,29 @@ unsafe extern "system" fn proc(dlg: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> i
             let Some(d) = state(dlg) else { return 0 };
             match id {
                 x if x == IDOK => {
+                    if !wall_valid(dlg, &wall_read(dlg)) {
+                        return 1;
+                    }
                     collect(dlg, d);
                     EndDialog(dlg, IDOK as isize);
+                }
+                ID_WALL_OFF | ID_WALL_SAME | ID_WALL_RANDOM => wall_enable(dlg),
+                ID_WALL_IMAGE_BROWSE => {
+                    if let Some(p) = choose_image(dlg, &get_text(dlg, ID_WALL_IMAGE)) {
+                        set_text(dlg, ID_WALL_IMAGE, &p);
+                    }
+                }
+                ID_WALL_FOLDER_BROWSE => {
+                    if let Some(p) = choose_folder(dlg) {
+                        set_text(dlg, ID_WALL_FOLDER, &p);
+                    }
+                }
+                ID_WALL_SHUFFLE => {
+                    let w = Wallpapers { mode: WallMode::Random, ..wall_read(dlg) };
+                    if wall_valid(dlg, &w) {
+                        (d.shuffle)(w);
+                        set_text(dlg, ID_WALL_DONE, t(Key::WallShuffled));
+                    }
                 }
                 x if x == IDCANCEL => {
                     EndDialog(dlg, IDCANCEL as isize);
@@ -674,7 +863,7 @@ unsafe fn lay_refill(dlg: HWND, l: &mut Layout, sel: Option<usize>) {
     SendDlgItemMessageW(dlg, ID_LAY_LIST, LB_RESETCONTENT, 0, 0);
     let mut longest = 0;
     for (i, r) in l.rules.iter().enumerate() {
-        let text = tf(Key::LayoutRow, &[&r.desktop.to_string(), &r.label()]);
+        let text = tf(Key::LayoutRow, &[&r.desktop.to_string(), &r.label(), i18n::show_name(r.show, true)]);
         longest = longest.max(text.chars().count());
         list_add(dlg, ID_LAY_LIST, &text, i);
     }
@@ -692,6 +881,11 @@ unsafe fn lay_buttons(dlg: HWND, l: &Layout) {
     let sel = SendDlgItemMessageW(dlg, ID_LAY_LIST, LB_GETCURSEL, 0, 0);
     let has = sel != LB_ERR as isize;
     let i = sel.max(0) as usize;
+    // The window state of the selected app (greyed without a selection).
+    let show = l.rules.get(i).filter(|_| has).map(|r| r.show);
+    SendDlgItemMessageW(dlg, ID_LAY_SHOW, CB_SETCURSEL, show.map_or(usize::MAX, |s| s.index()), 0);
+    EnableWindow(GetDlgItem(dlg, ID_LAY_SHOW), has as i32);
+    EnableWindow(GetDlgItem(dlg, ID_LAY_SHOW_LABEL), has as i32);
     EnableWindow(GetDlgItem(dlg, ID_LAY_DEL), has as i32);
     EnableWindow(GetDlgItem(dlg, ID_LAY_UP), (has && i > 0) as i32);
     EnableWindow(GetDlgItem(dlg, ID_LAY_DOWN), (has && i + 1 < l.rules.len()) as i32);
@@ -809,6 +1003,9 @@ unsafe extern "system" fn layout_proc(dlg: HWND, msg: u32, wp: WPARAM, lp: LPARA
                 SetDlgItemTextW(dlg, ID_LAY_INFO, wide(t(Key::LayoutInfo)).as_ptr());
                 CheckDlgButton(dlg, ID_LAY_ENABLED, check(st.layout.enabled));
                 SetDlgItemInt(dlg, ID_LAY_COUNT, st.layout.count() as u32, 0);
+                for s in WindowShow::ALL {
+                    SendDlgItemMessageW(dlg, ID_LAY_SHOW, CB_ADDSTRING, 0, wide(i18n::show_name(s, false)).as_ptr() as LPARAM);
+                }
                 MakeDragList(GetDlgItem(dlg, ID_LAY_LIST));
                 st.drag_msg = RegisterWindowMessageW(wide("commctrl_DragListMsg").as_ptr());
                 lay_refill(dlg, &mut st.layout, None);
@@ -833,6 +1030,13 @@ unsafe extern "system" fn layout_proc(dlg: HWND, msg: u32, wp: WPARAM, lp: LPARA
                 ID_LAY_LIST => {
                     if notify == LBN_SELCHANGE {
                         lay_buttons(dlg, &st.layout);
+                    }
+                }
+                ID_LAY_SHOW => {
+                    let c = SendDlgItemMessageW(dlg, ID_LAY_SHOW, CB_GETCURSEL, 0, 0);
+                    if let (CBN_SELCHANGE, Some(i), true) = (notify, sel.filter(|i| *i < st.layout.rules.len()), c >= 0) {
+                        st.layout.rules[i].show = WindowShow::from_index(c as usize);
+                        lay_refill(dlg, &mut st.layout, Some(i));
                     }
                 }
                 ID_LAY_COUNT => {

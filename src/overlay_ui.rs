@@ -458,6 +458,20 @@ fn decode(path: &str, size: impl FnOnce(i32, i32) -> (i32, i32)) -> Option<(Vec<
 static mut WALL_CACHE: Vec<(String, Vec<u32>)> = Vec::new();
 const CACHE_MAX: usize = 6;
 
+/// AutoSpaces changed wallpapers (plan 12.17): the small pictures are decoded again. The paths
+/// are read from the registry at the start of every carry anyway, and a key holds the file's time,
+/// so this only frees pictures that may never be needed again and keeps a picture replaced in
+/// place within the same second from being shown stale.
+pub fn wallpapers_changed() {
+    unsafe { (*std::ptr::addr_of_mut!(WALL_CACHE)).clear() };
+}
+
+/// The wallpaper Explorer records for one desktop (`…\VirtualDesktops\Desktops\{GUID}\Wallpaper`;
+/// Windows 11 only), for checking what a wallpaper call did.
+pub fn registry_wallpaper(g: &Guid) -> Option<String> {
+    reg_string(&desktop_key(g), "Wallpaper").filter(|p| !p.is_empty())
+}
+
 fn cache_get(key: &str) -> Option<Vec<u32>> {
     unsafe { (*std::ptr::addr_of!(WALL_CACHE)).iter().find(|e| e.0 == key).map(|e| e.1.clone()) }
 }

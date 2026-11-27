@@ -117,6 +117,45 @@ pub fn packaged_launch(path: &str, manifest: impl Fn(&str) -> Option<String>) ->
     Some(apps_folder(&format!("{family}!{id}")))
 }
 
+/// Window state a profile app is given on its desktop (plan 12.16): key `"show"` of a rule,
+/// missing or unknown = maximized (the behaviour before 0.2.2).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WindowShow {
+    #[default]
+    Max,
+    Normal,
+    Min,
+}
+
+impl WindowShow {
+    pub const ALL: [WindowShow; 3] = [WindowShow::Max, WindowShow::Normal, WindowShow::Min];
+
+    pub fn from_code(s: &str) -> WindowShow {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "normal" => WindowShow::Normal,
+            "min" => WindowShow::Min,
+            _ => WindowShow::Max,
+        }
+    }
+
+    pub fn code(self) -> &'static str {
+        match self {
+            WindowShow::Max => "max",
+            WindowShow::Normal => "normal",
+            WindowShow::Min => "min",
+        }
+    }
+
+    /// Position in the combo box of the layout dialog (Max, Normal, Min).
+    pub fn index(self) -> usize {
+        self as usize
+    }
+
+    pub fn from_index(i: usize) -> WindowShow {
+        Self::ALL.get(i).copied().unwrap_or_default()
+    }
+}
+
 /// One application of the layout profile (plan 12.7): `launch` starts it, `process` pairs a
 /// running window with it (never by pid: launchers exit and hand over to another process).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -130,6 +169,8 @@ pub struct LayoutRule {
     pub args: String,
     /// Lower-case process image name used for matching windows.
     pub process: String,
+    /// Window state on its desktop (plan 12.16).
+    pub show: WindowShow,
 }
 
 /// Desktop layout applied after start (plan 12.7).
@@ -181,7 +222,13 @@ impl LayoutRule {
             launch,
             args: args.trim().to_string(),
             process,
+            show: WindowShow::Max,
         })
+    }
+
+    pub fn with_show(mut self, show: WindowShow) -> LayoutRule {
+        self.show = show;
+        self
     }
 
     pub fn label(&self) -> String {
@@ -248,7 +295,8 @@ impl Layout {
                 let text = |k: &str| r.get(k).and_then(Json::as_str).unwrap_or("");
                 let process = r.get("match").and_then(|m| m.get("process")).and_then(Json::as_str).unwrap_or("");
                 let desktop = r.get("desktop").and_then(Json::as_uint).unwrap_or(1) as u32;
-                if let Some(rule) = LayoutRule::new(desktop, text("name"), text("launch"), text("args"), process) {
+                let show = WindowShow::from_code(text("show"));
+                if let Some(rule) = LayoutRule::new(desktop, text("name"), text("launch"), text("args"), process).map(|r| r.with_show(show)) {
                     if !l.rules.contains(&rule) {
                         l.rules.push(rule);
                     }
@@ -268,12 +316,13 @@ impl Layout {
             .enumerate()
             .map(|(i, r)| {
                 format!(
-                    "    {{\"desktop\": {}, \"name\": {}, \"launch\": {}, \"args\": {}, \"match\": {{\"process\": {}}}}}",
+                    "    {{\"desktop\": {}, \"name\": {}, \"launch\": {}, \"args\": {}, \"match\": {{\"process\": {}}}, \"show\": {}}}",
                     (i as u32 + 2).min(MAX_LAYOUT_DESKTOPS),
                     quote(&r.name),
                     quote(&r.launch),
                     quote(&r.args),
-                    quote(&r.process)
+                    quote(&r.process),
+                    quote(r.show.code())
                 )
             })
             .collect();
@@ -284,6 +333,102 @@ impl Layout {
             self.desktop_count.max(self.min_count()),
             self.start_delay_ms,
             list
+        )
+    }
+}
+
+/// What AutoSpaces does with the wallpapers of the desktops (plan 12.17).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WallMode {
+    /// Nothing is touched (Windows manages the wallpapers).
+    #[default]
+    Off,
+    /// One picture on every desktop.
+    Same,
+    /// A random picture of a folder per desktop (Windows 10: one random picture for all).
+    Random,
+}
+
+impl WallMode {
+    pub fn from_code(s: &str) -> WallMode {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "same" => WallMode::Same,
+            "random" => WallMode::Random,
+            _ => WallMode::Off,
+        }
+    }
+
+    pub fn code(self) -> &'static str {
+        match self {
+            WallMode::Off => "off",
+            WallMode::Same => "same",
+            WallMode::Random => "random",
+        }
+    }
+}
+
+/// Key `"wallpapers"` of `settings.json` (plan 12.17).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Wallpapers {
+    pub mode: WallMode,
+    /// The picture of `Same`.
+    pub image: String,
+    /// The folder of `Random`.
+    pub folder: String,
+    /// `Random` also takes pictures from subfolders.
+    pub subfolders: bool,
+    /// `Random`: a desktop created later (by AutoSpaces or by hand) gets a random picture too.
+    pub new_desktops: bool,
+}
+
+impl Default for Wallpapers {
+    fn default() -> Self {
+        Wallpapers { mode: WallMode::Off, image: String::new(), folder: String::new(), subfolders: false, new_desktops: true }
+    }
+}
+
+impl Wallpapers {
+    /// The choice that decides which pictures the desktops get changed (applied again on OK);
+    /// only `new_desktops` changed = nothing to apply now.
+    pub fn changed_from(&self, old: &Wallpapers) -> bool {
+        if self.mode != old.mode {
+            return true;
+        }
+        match self.mode {
+            WallMode::Off => false,
+            WallMode::Same => self.image != old.image,
+            WallMode::Random => self.folder != old.folder || self.subfolders != old.subfolders,
+        }
+    }
+
+    fn from_json(j: &Json) -> Wallpapers {
+        let mut w = Wallpapers::default();
+        if let Some(m) = j.get("mode").and_then(Json::as_str) {
+            w.mode = WallMode::from_code(m);
+        }
+        if let Some(t) = j.get("image").and_then(Json::as_str) {
+            w.image = t.trim().to_string();
+        }
+        if let Some(t) = j.get("folder").and_then(Json::as_str) {
+            w.folder = t.trim().to_string();
+        }
+        if let Some(Json::Bool(b)) = j.get("subfolders") {
+            w.subfolders = *b;
+        }
+        if let Some(Json::Bool(b)) = j.get("newDesktops") {
+            w.new_desktops = *b;
+        }
+        w
+    }
+
+    fn to_json(&self) -> String {
+        format!(
+            "{{\"mode\": {}, \"image\": {}, \"folder\": {}, \"subfolders\": {}, \"newDesktops\": {}}}",
+            quote(self.mode.code()),
+            quote(&self.image),
+            quote(&self.folder),
+            self.subfolders,
+            self.new_desktops
         )
     }
 }
@@ -329,6 +474,8 @@ pub struct Settings {
     pub carry_style: CarryStyle,
     /// Look for a new version on GitHub (plan 12.15): 10 minutes after start, then daily.
     pub check_updates: bool,
+    /// Wallpapers of the desktops (plan 12.17).
+    pub wallpapers: Wallpapers,
 }
 
 /// Value of the hidden `"carryStyle"` key: the visual method of carrying a window.
@@ -423,6 +570,7 @@ impl Default for Settings {
             carry_create_new: false,
             carry_style: CarryStyle::Auto,
             check_updates: true,
+            wallpapers: Wallpapers::default(),
         }
     }
 }
@@ -511,6 +659,9 @@ impl Settings {
         if let Some(code) = j.get("backend").and_then(Json::as_str) {
             s.backend = BackendPref::from_code(code);
         }
+        if let Some(w @ Json::Obj(_)) = j.get("wallpapers") {
+            s.wallpapers = Wallpapers::from_json(w);
+        }
         if let Some(l @ Json::Obj(_)) = j.get("layout") {
             s.layout = Layout::from_json(l);
         }
@@ -552,6 +703,7 @@ impl Settings {
   \"carryCreateNew\": {},
   \"checkUpdates\": {},
   \"language\": {},{}{}{}
+  \"wallpapers\": {},
   \"layout\": {}
 }}
 ",
@@ -578,6 +730,7 @@ impl Settings {
                 BackendPref::Auto => String::new(),
                 b => format!("\n  \"backend\": {},", quote(b.code())),
             },
+            self.wallpapers.to_json(),
             self.layout.to_json()
         )
     }
@@ -931,4 +1084,76 @@ mod tests {
         assert!(never_learn("", "X"));
     }
 
+    #[test]
+    fn window_show_of_layout_rules_defaults_to_maximized() {
+        // Files of 0.2.1 and older have no "show": maximized, as before.
+        let old = Settings::from_json(r#"{"layout":{"enabled":true,"rules":[{"desktop":2,"launch":"a.exe"}]}}"#).unwrap();
+        assert_eq!(old.layout.rules[0].show, WindowShow::Max);
+        let s = Settings::from_json(
+            r#"{"layout":{"rules":[{"launch":"a.exe","show":"normal"},{"launch":"b.exe","show":" MIN "},
+                {"launch":"c.exe","show":"max"},{"launch":"d.exe","show":"huge"},{"launch":"e.exe","show":3}]}}"#,
+        )
+        .unwrap();
+        let got: Vec<WindowShow> = s.layout.rules.iter().map(|r| r.show).collect();
+        assert_eq!(got, vec![WindowShow::Normal, WindowShow::Min, WindowShow::Max, WindowShow::Max, WindowShow::Max]);
+        let text = s.to_json();
+        assert!(text.contains(r#""show": "normal""#) && text.contains(r#""show": "min""#) && text.contains(r#""show": "max""#));
+        assert_eq!(Settings::from_json(&text).unwrap(), s);
+        for w in WindowShow::ALL {
+            assert_eq!(WindowShow::from_index(w.index()), w);
+            assert_eq!(WindowShow::from_code(w.code()), w);
+        }
+        assert_eq!(WindowShow::from_index(9), WindowShow::Max);
+        // The same app twice with another state stays two rules.
+        let two = Settings::from_json(r#"{"layout":{"rules":[{"launch":"a.exe"},{"launch":"a.exe","show":"min"}]}}"#).unwrap();
+        assert_eq!(two.layout.rules.len(), 2);
+    }
+
+    #[test]
+    fn wallpapers_default_off_tolerant_and_roundtrip() {
+        let d = Settings::from_json("{}").unwrap().wallpapers;
+        assert_eq!(d, Wallpapers::default());
+        assert!(d.mode == WallMode::Off && d.new_desktops && !d.subfolders);
+        let s = Settings::from_json(
+            r#"{"wallpapers":{"mode":"RANDOM","folder":" C:\\Pics ","subfolders":true,"newDesktops":false,"image":5}}"#,
+        )
+        .unwrap()
+        .wallpapers;
+        assert_eq!(
+            (s.mode, s.folder.as_str(), s.subfolders, s.new_desktops, s.image.as_str()),
+            (WallMode::Random, r"C:\Pics", true, false, "")
+        );
+        assert_eq!(Settings::from_json(r#"{"wallpapers":{"mode":"tiles"}}"#).unwrap().wallpapers.mode, WallMode::Off);
+        assert_eq!(Settings::from_json(r#"{"wallpapers":[1]}"#).unwrap().wallpapers, Wallpapers::default());
+        let mut all = Settings::default();
+        all.wallpapers = Wallpapers {
+            mode: WallMode::Same,
+            image: r#"C:\a "b".jpg"#.into(),
+            folder: r"D:\x".into(),
+            subfolders: true,
+            new_desktops: false,
+        };
+        let text = all.to_json();
+        assert!(text.contains(r#""wallpapers": {"mode": "same""#));
+        assert_eq!(Settings::from_json(&text).unwrap(), all);
+        for m in [WallMode::Off, WallMode::Same, WallMode::Random] {
+            assert_eq!(WallMode::from_code(m.code()), m);
+        }
+    }
+
+    #[test]
+    fn wallpaper_changes_that_need_applying() {
+        let base = Wallpapers { mode: WallMode::Random, folder: "a".into(), ..Wallpapers::default() };
+        assert!(!base.changed_from(&base));
+        assert!(!Wallpapers { new_desktops: false, ..base.clone() }.changed_from(&base), "only the option for new desktops");
+        assert!(!Wallpapers { image: "x.jpg".into(), ..base.clone() }.changed_from(&base), "the picture of another mode");
+        assert!(Wallpapers { folder: "b".into(), ..base.clone() }.changed_from(&base));
+        assert!(Wallpapers { subfolders: true, ..base.clone() }.changed_from(&base));
+        assert!(Wallpapers { mode: WallMode::Off, ..base.clone() }.changed_from(&base));
+        let same = Wallpapers { mode: WallMode::Same, image: "x.jpg".into(), ..Wallpapers::default() };
+        assert!(Wallpapers { image: "y.jpg".into(), ..same.clone() }.changed_from(&same));
+        assert!(!Wallpapers { folder: "z".into(), ..same.clone() }.changed_from(&same));
+        let off = Wallpapers::default();
+        assert!(!Wallpapers { image: "y.jpg".into(), ..off.clone() }.changed_from(&off), "off touches nothing");
+    }
 }

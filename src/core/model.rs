@@ -112,6 +112,14 @@ pub trait WindowSystem {
     fn maximize_inactive(&self, _hwnd: HWND) -> bool {
         false
     }
+    /// Brings a profile window into the window state of its rule (plan 12.16) without activating
+    /// it: maximized (`maximize_inactive`), a normal window, or minimized. False when it cannot.
+    fn show_inactive(&self, hwnd: HWND, show: crate::core::settings::WindowShow) -> bool {
+        match show {
+            crate::core::settings::WindowShow::Max => self.maximize_inactive(hwnd),
+            _ => false,
+        }
+    }
     /// A visible, unowned top-level window that may not be a candidate (a splash screen without
     /// a title): the profile moves such windows of the apps it launches.
     fn is_plain_toplevel(&self, _hwnd: HWND) -> bool {

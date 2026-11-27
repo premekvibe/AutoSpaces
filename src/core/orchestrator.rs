@@ -5,7 +5,7 @@
 use super::carry::{self, Next, Step};
 use super::learned::{FailReason, Learned, NoLearned};
 use super::model::{Event, ManagedSpace, Schedule, State, WindowSystem};
-use super::settings::{is_system_window, launch_label, never_learn, CarryStyle, LayoutRule, Settings, SYSTEM_HOSTS};
+use super::settings::{is_system_window, launch_label, never_learn, CarryStyle, LayoutRule, Settings, WindowShow, SYSTEM_HOSTS};
 use crate::desktops::backend::Error;
 use crate::desktops::{DesktopBackend, Guid};
 use std::collections::{HashMap, HashSet};
@@ -136,8 +136,10 @@ struct LayoutRun {
 /// A window the profile placed.
 struct Claim {
     hwnd: HWND,
-    /// Still to be kept maximized (launched by the profile, maximizable, attempts left).
-    maximize: bool,
+    /// Still to be kept in the window state of its rule (attempts left, the window can take it).
+    apply: bool,
+    /// The window state of its rule (plan 12.16): maximized, a normal window or minimized.
+    show: WindowShow,
     tries: u8,
 }
 
@@ -1383,6 +1385,12 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
         list.into_iter().filter(|d| !self.spaces.contains_key(d)).nth(k.max(1) as usize - 1)
     }
 
+    /// The desktop list as this app last saw it (no call into Explorer): desktops it created or
+    /// that the user added appear here after the event / registry change that brought them.
+    pub fn known_desktops(&self) -> &[Guid] {
+        &self.last_list
+    }
+
     /// True while the startup sequence is pending or launched profile applications are still
     /// awaited or settling.
     pub fn layout_running(&self) -> bool {
@@ -1458,8 +1466,9 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
             let process = run.rules[i].process.clone();
             match self.layout_find(&run, &wins, &process) {
                 // A running app is not started again: its window (the first unclaimed one, in
-                // window enumeration order) is moved and maximized like a launched one, also when
-                // minimized or on another desktop. If it is the user's foreground window, it still
+                // window enumeration order) is moved and given the window state of its rule
+                // (maximized by default, plan 12.16) like a launched one, also when minimized or on
+                // another desktop. If it is the user's foreground window, it still
                 // moves (the startup sequence then takes the view along, "Apply now" does not).
                 Some(w) => {
                     if self.place(&mut run, i, w, true) == Placed::NotYet {
@@ -1497,11 +1506,12 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
         })
     }
 
-    /// Moves `hwnd` to the desktop of rule `i` (no view switch); a window the profile launched is
-    /// also maximized (`maximize`; running apps too), without activation. The window is registered as placed: the ordinary logic
-    /// never moves it to a helper desktop (plan 12.7).
-    fn place(&mut self, run: &mut LayoutRun, i: usize, hwnd: HWND, maximize: bool) -> Placed {
-        let (desk, proc) = (run.rules[i].desktop, run.rules[i].process.clone());
+    /// Moves `hwnd` to the desktop of rule `i` (no view switch) and, with `apply` (launched and
+    /// running apps alike), gives it the window state of the rule without activation: maximized
+    /// (default), a normal window or minimized (plan 12.16). The window is registered as placed:
+    /// the ordinary logic never moves it to a helper desktop (plan 12.7).
+    fn place(&mut self, run: &mut LayoutRun, i: usize, hwnd: HWND, apply: bool) -> Placed {
+        let (desk, proc, show) = (run.rules[i].desktop, run.rules[i].process.clone(), run.rules[i].show);
         if !self.allowed(&proc) {
             return Placed::No;
         }
@@ -1537,34 +1547,39 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
         }
         let l = self.desk_label(target);
         self.note(format!("layout: {proc} {:#x} {} -> desktop {desk} ({l})", hwnd as usize, self.ws.class(hwnd)));
-        run.claimed.push(Claim { hwnd, maximize, tries: 0 });
+        run.claimed.push(Claim { hwnd, apply, show, tries: 0 });
         self.profile_windows.insert(hwnd);
         self.rejected.insert(hwnd);
-        // Focus back to the user first: the maximize then stays inside the app (no view switch).
+        // Focus back to the user first: the state change then stays inside the app (no view switch).
         self.layout_guard(run);
         // An app asking for the foreground under our lock gets a flashing taskbar button instead.
         self.ws.stop_flash(hwnd);
-        if maximize {
-            self.layout_maximize(run, run.claimed.len() - 1);
+        if apply {
+            self.layout_show(run, run.claimed.len() - 1);
         }
         Placed::Yes
     }
 
-    /// Maximizes a launched profile window without activating it (at most a few times: an app may
-    /// restore its own saved placement right after showing the window).
-    fn layout_maximize(&mut self, run: &mut LayoutRun, c: usize) {
-        let hwnd = run.claimed[c].hwnd;
-        if !run.claimed[c].maximize
-            || matches!(self.ws.state(hwnd), State::Maximized | State::Fullscreen | State::Hidden | State::Destroyed)
-        {
+    /// Gives a placed profile window the window state of its rule without activating it (at most
+    /// a few times: an app may restore its own saved placement right after showing the window).
+    /// Nothing when it already is in that state.
+    fn layout_show(&mut self, run: &mut LayoutRun, c: usize) {
+        let (hwnd, show) = (run.claimed[c].hwnd, run.claimed[c].show);
+        let state = self.ws.state(hwnd);
+        let done = match show {
+            WindowShow::Max => matches!(state, State::Maximized | State::Fullscreen),
+            WindowShow::Normal => state == State::Normal,
+            WindowShow::Min => state == State::Minimized,
+        };
+        if !run.claimed[c].apply || done || matches!(state, State::Hidden | State::Destroyed) {
             return;
         }
         run.claimed[c].tries += 1;
-        run.claimed[c].maximize = run.claimed[c].tries < MAX_PROFILE_MAXIMIZE;
-        if self.ws.maximize_inactive(hwnd) {
-            self.note(format!("layout: {:#x} maximized", hwnd as usize));
+        run.claimed[c].apply = run.claimed[c].tries < MAX_PROFILE_MAXIMIZE;
+        if self.ws.show_inactive(hwnd, show) {
+            self.note(format!("layout: {:#x} {}", hwnd as usize, show_label(show)));
         } else {
-            run.claimed[c].maximize = false; // e.g. a splash screen without a maximize box
+            run.claimed[c].apply = false; // e.g. a splash screen without a maximize box
         }
     }
 
@@ -1664,7 +1679,7 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
     fn layout_claim(&mut self, run: &mut LayoutRun, hwnd: HWND) -> bool {
         if let Some(c) = run.claimed.iter().position(|c| c.hwnd == hwnd) {
             self.ws.stop_flash(hwnd);
-            self.layout_maximize(run, c);
+            self.layout_show(run, c);
             return true;
         }
         if self.by_window.contains_key(&hwnd) {
@@ -1817,8 +1832,14 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
                 continue;
             }
             let path = self.ws.launch_command(pid);
+            // The window state as it is now (plan 12.16): the first window of the app on that desktop.
+            let show = match self.ws.state(w) {
+                State::Minimized => WindowShow::Min,
+                State::Normal => WindowShow::Normal,
+                _ => WindowShow::Max,
+            };
             if let Some(r) = LayoutRule::new(desktop, &self.ws.app_name(pid), &path, "", &process) {
-                rules.push(r);
+                rules.push(r.with_show(show));
             }
         }
         rules.sort_by(|a, b| (a.desktop, &a.process).cmp(&(b.desktop, &b.process)));
@@ -2322,6 +2343,15 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
         if self.settings.enabled {
             self.compact(None);
         }
+    }
+}
+
+/// The window state in the log.
+fn show_label(s: WindowShow) -> &'static str {
+    match s {
+        WindowShow::Max => "maximized",
+        WindowShow::Normal => "restored to a normal window",
+        WindowShow::Min => "minimized",
     }
 }
 

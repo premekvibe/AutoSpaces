@@ -16,6 +16,7 @@ mod sysopts;
 mod tray;
 mod update;
 mod update_dlg;
+mod wallpaper;
 mod windowing;
 
 use crate::core::{Event, Orchestrator, Schedule, Settings};
@@ -630,7 +631,17 @@ fn open_settings(hwnd: HWND) {
     }
     let learned = o.learned_mut().list_named();
     // Modal; events keep flowing meanwhile, so the orchestrator is looked up again afterwards.
-    let Some(out) = settings_dlg::show(&current, learned, settings_dlg::running_apps, capture_layout, carry_status()) else {
+    let wall_note = wallpaper::status(wallpaper::caps(Some(o.backend())));
+    let old_wall = current.wallpapers.clone();
+    let Some(out) = settings_dlg::show(
+        &current,
+        learned,
+        settings_dlg::running_apps,
+        capture_layout,
+        carry_status(),
+        wall_note,
+        wallpaper::request_shuffle,
+    ) else {
         return;
     };
     let Some(o) = orch() else { return };
@@ -649,6 +660,10 @@ fn open_settings(hwnd: HWND) {
         }
     }
     LOGGING.store(logging_wanted(out.settings.log), Relaxed);
+    // Wallpapers (plan 12.17): applied at once when the choice changed; "do not change" touches nothing.
+    if out.settings.wallpapers.changed_from(&old_wall) {
+        wallpaper::apply(Some(o.backend()), &out.settings.wallpapers, &mut |l| log_line(&l));
+    }
     o.apply_settings(out.settings);
     // "Apply now": the profile is applied at once (the timer, if any, only runs while apps are awaited).
     let sch = if out.apply_now { o.start_layout() } else { None };
@@ -771,6 +786,8 @@ fn after_orchestrator(hwnd: HWND, o: &mut Orch, sch: Option<Schedule>) {
         schedule(hwnd, s);
     }
     carry_sync(hwnd, o);
+    // A desktop that appeared gets its wallpaper (plan 12.17); cheap when nothing changed.
+    wallpaper::sync(o.backend(), o.known_desktops(), o.carrying(), &o.settings.wallpapers, &mut |l| log_line(&l));
 }
 
 // ---------------------------------------------------------------- carrying a window (plan 12.13)
@@ -1290,6 +1307,13 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             // The system cleans the raw input up.
             DefWindowProcW(hwnd, msg, wp, lp)
         }
+        wallpaper::WM_WALL_SHUFFLE => {
+            if let (Some(w), Some(o)) = (wallpaper::take_pending(), orch().filter(|o| !o.carrying())) {
+                log_line("wallpaper: shuffle now");
+                wallpaper::apply(Some(o.backend()), &w, &mut |l| log_line(&l));
+            }
+            0
+        }
         carry_ui::WM_CARRY_DROP => {
             on_carry_drop(hwnd, wp != 0);
             0
@@ -1591,6 +1615,7 @@ fn main() {
         if hwnd.is_null() {
             return;
         }
+        wallpaper::set_main(hwnd);
 
         let _apartment = desktops::Apartment::init();
         i18n::set_pref(settings_path().map_or(i18n::Pref::Auto, |p| Settings::load(&p).language));

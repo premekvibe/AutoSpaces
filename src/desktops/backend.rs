@@ -125,6 +125,21 @@ pub trait DesktopBackend {
     fn is_pinned(&self, _hwnd: HWND) -> Result<bool> {
         Err(Error::Permanent(E_NOTIMPL))
     }
+
+    // ---- wallpapers (plan 12.17); the defaults mean "not available".
+
+    /// (`SetDesktopWallpaper` described, `UpdateWallpaperPathForAllDesktops` described).
+    fn wallpaper_slots(&self) -> (bool, bool) {
+        (false, false)
+    }
+    /// Sets the wallpaper of one desktop (undocumented; only on a variant that passed the self-test).
+    fn set_desktop_wallpaper(&self, _desk: Guid, _path: &str) -> Result<()> {
+        Err(Error::Permanent(E_NOTIMPL))
+    }
+    /// Sets one wallpaper on every desktop (undocumented, as above).
+    fn set_all_wallpapers(&self, _path: &str) -> Result<()> {
+        Err(Error::Permanent(E_NOTIMPL))
+    }
 }
 
 pub const E_NOTIMPL: i32 = 0x8000_4001_u32 as i32;

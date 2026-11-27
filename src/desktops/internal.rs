@@ -114,6 +114,24 @@ fn query_service(sp: &ComPtr, sid: &Guid, iid: &Guid) -> Result<ComPtr> {
     out_ptr(|p| unsafe { sp.slot::<Qs>(SLOT_QUERY_SERVICE)(sp.raw(), sid, iid, p) })
 }
 
+// ---------------------------------------------------------------- documented wallpaper API
+
+const CLSID_DESKTOP_WALLPAPER: &str = "C2CF3110-460E-4FC1-B9D0-8A1C0C9CC4BD";
+const IID_DESKTOP_WALLPAPER: &str = "B92B56A9-8B55-4E14-9A89-0199BBB6F93B";
+/// `IDesktopWallpaper::SetWallpaper(monitorID, wallpaper)` (shobjidl_core.h, first method).
+const SLOT_SET_WALLPAPER: usize = 3;
+
+/// Documented `IDesktopWallpaper::SetWallpaper(NULL, path)`: the picture on every monitor
+/// (plan 12.17). Windows 10 has one wallpaper for all desktops; on Windows 11 the documentation
+/// does not say which virtual desktops it changes, so AutoSpaces uses it there only when the
+/// variant has no `UpdateWallpaperPathForAllDesktops` (and logs what the registry says afterwards).
+pub fn set_wallpaper_documented(path: &str) -> Result<()> {
+    type FnSet = unsafe extern "system" fn(Raw, *const u16, *const u16) -> Hr;
+    let dw = create_instance(CLSID_DESKTOP_WALLPAPER, CLSCTX_ALL, IID_DESKTOP_WALLPAPER)?;
+    let w: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
+    check(unsafe { dw.slot::<FnSet>(SLOT_SET_WALLPAPER)(dw.raw(), std::ptr::null(), w.as_ptr()) })
+}
+
 // ---------------------------------------------------------------- OS build
 
 #[repr(C)]
@@ -129,6 +147,33 @@ struct OsVersionInfo {
 #[link(name = "ntdll", kind = "raw-dylib")]
 extern "system" {
     fn RtlGetVersion(info: *mut OsVersionInfo) -> i32;
+}
+
+// HSTRING for the wallpaper setters (combase.dll is loaded by COM anyway).
+#[link(name = "combase", kind = "raw-dylib")]
+extern "system" {
+    fn WindowsCreateString(src: *const u16, len: u32, out: *mut Raw) -> Hr;
+    fn WindowsDeleteString(s: Raw) -> Hr;
+}
+
+/// An owned HSTRING (null = the empty string).
+struct HString(Raw);
+
+impl HString {
+    fn new(s: &str) -> Result<HString> {
+        let w: Vec<u16> = s.encode_utf16().collect();
+        let mut h: Raw = null_mut();
+        check(unsafe { WindowsCreateString(w.as_ptr(), w.len() as u32, &mut h) })?;
+        Ok(HString(h))
+    }
+}
+
+impl Drop for HString {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { WindowsDeleteString(self.0) };
+        }
+    }
 }
 
 pub fn os_build() -> u32 {
@@ -168,6 +213,8 @@ pub struct InternalBackend {
     shell: ComPtr,
     /// `IVirtualDesktopPinnedApps`, obtained on first use (plan 12.13).
     pins: std::cell::RefCell<Option<ComPtr>>,
+    /// The wallpaper setters were switched off for this run (Explorer died in one of them).
+    wall_off: std::cell::Cell<bool>,
 }
 
 /// No variant passed; carries diagnostics for extending `variants.json` (plan 5.3).
@@ -350,7 +397,7 @@ impl Candidate for System<'_> {
         let public = create_instance(CLSID_VDM_PUBLIC, CLSCTX_ALL, IID_VDM_PUBLIC).map_err(|e| Skip::Views(e.hr()))?;
         let name = format!("internal:{}", v.name);
         let shell = self.shell.query(&guid(IID_SERVICE_PROVIDER)).map_err(|e| Skip::Views(e.hr()))?;
-        self.opened = Some(InternalBackend { name, v: v.clone(), mgr, views, public, shell, pins: Default::default() });
+        self.opened = Some(InternalBackend { name, v: v.clone(), mgr, views, public, shell, pins: Default::default(), wall_off: Default::default() });
         Ok(())
     }
 
@@ -420,6 +467,33 @@ impl InternalBackend {
         let mut buf = [0u8; 8];
         check(unsafe { pins.slot::<FnInOutBool>(slot)(pins.raw(), view.raw(), buf.as_mut_ptr() as *mut i32) })?;
         Ok(buf)
+    }
+
+    /// Calls one of the undocumented wallpaper setters (plan 12.17). They cannot be self-tested
+    /// (they change the user's wallpaper), so: only on a variant that passed the read-only
+    /// self-test (an `InternalBackend` exists only then), only with slots that two sources agree on
+    /// and that sit right after `SetDesktopName` (checked when `variants.json` is read), and never
+    /// again on this build once Explorer died during such a call (the call runs in Explorer, so a
+    /// wrong slot would take Explorer down, not this process).
+    fn wall_call(&self, f: impl FnOnce(&HString) -> Hr, path: &str) -> Result<()> {
+        let mut guard = match std::env::var_os("LOCALAPPDATA") {
+            Some(base) => Guard::open(std::path::Path::new(&base).join("AutoSpaces").join("selftest-guard.txt")),
+            None => Guard::default(),
+        };
+        let (name, build) = (format!("wall:{}", self.v.name), os_build());
+        if self.wall_off.get() || guard.crashed(&name, build) {
+            return Err(Error::Permanent(super::backend::E_NOTIMPL));
+        }
+        let h = HString::new(path)?;
+        let res = check(f(&h));
+        if let Err(e) = res {
+            if e.is_transient() {
+                // RPC_E_DISCONNECTED & co.: Explorer went away during the call.
+                self.wall_off.set(true);
+                guard.record_crash(&name, build);
+            }
+        }
+        res
     }
 
     /// Picks the first variant whose build range matches, whose IID Explorer accepts and which
@@ -622,5 +696,25 @@ impl DesktopBackend for InternalBackend {
 
     fn is_pinned(&self, hwnd: HWND) -> Result<bool> {
         Ok(self.view_pinned(hwnd)?.iter().any(|&b| b != 0))
+    }
+
+    fn wallpaper_slots(&self) -> (bool, bool) {
+        let s = &self.v.slots;
+        (s.opt("SetDesktopWallpaper").is_some(), s.opt("UpdateWallpaperPathForAllDesktops").is_some())
+    }
+
+    fn set_desktop_wallpaper(&self, desk: Guid, path: &str) -> Result<()> {
+        type FnDeskStr = unsafe extern "system" fn(Raw, Raw, Raw) -> Hr;
+        let slot = self.v.slots.opt("SetDesktopWallpaper").ok_or(Error::Permanent(super::backend::E_NOTIMPL))?;
+        let d = self.find(desk)?;
+        let m = &self.mgr;
+        self.wall_call(|h| unsafe { m.slot::<FnDeskStr>(slot)(m.raw(), d.raw(), h.0) }, path)
+    }
+
+    fn set_all_wallpapers(&self, path: &str) -> Result<()> {
+        type FnStr = unsafe extern "system" fn(Raw, Raw) -> Hr;
+        let slot = self.v.slots.opt("UpdateWallpaperPathForAllDesktops").ok_or(Error::Permanent(super::backend::E_NOTIMPL))?;
+        let m = &self.mgr;
+        self.wall_call(|h| unsafe { m.slot::<FnStr>(slot)(m.raw(), h.0) }, path)
     }
 }
