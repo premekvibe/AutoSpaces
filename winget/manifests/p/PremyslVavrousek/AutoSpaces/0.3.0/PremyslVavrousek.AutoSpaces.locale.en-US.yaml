@@ -1,7 +1,7 @@
 # yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.28.0.schema.json
 
 PackageIdentifier: PremyslVavrousek.AutoSpaces
-PackageVersion: 0.2.2
+PackageVersion: 0.3.0
 PackageLocale: en-US
 Publisher: Přemysl Vavroušek
 PublisherUrl: https://www.premysl-vavrousek.cz
@@ -14,7 +14,7 @@ LicenseUrl: https://github.com/premekvibe/AutoSpaces/blob/main/LICENSE
 Copyright: Copyright © 2026 Přemysl Vavroušek
 ShortDescription: Gives maximized windows their own virtual desktop, like Spaces on macOS.
 Description: |-
-  AutoSpaces is a small tray utility that manages Windows virtual desktops for you. When you maximize another window on a desktop, it moves to a desktop of its own; when you restore or close it, you return to where you came from and the extra desktop is removed. It can also spread already maximized windows over separate desktops at startup and open chosen apps on chosen desktops. Hold Win+Ctrl+Shift and use the arrow keys to carry the active window to another desktop. A single executable under 1 MB; it connects only to GitHub to check for updates, which can be turned off.
+  AutoSpaces is a small tray utility that manages Windows virtual desktops for you. When you maximize another window on a desktop, it moves to a desktop of its own; when you restore or close it, you return to where you came from and the extra desktop is removed. It can also spread already maximized windows over separate desktops at startup and open chosen apps on chosen desktops, arranged side by side in layouts like Windows snap layouts. Hold Win+Ctrl+Shift and use the arrow keys to carry the active window to another desktop. A single executable under 1 MB; it connects only to GitHub to check for updates, which can be turned off.
 Moniker: autospaces
 Tags:
 - virtual-desktop
@@ -23,6 +23,6 @@ Tags:
 - spaces
 - maximize
 - tray
-ReleaseNotesUrl: https://github.com/premekvibe/AutoSpaces/releases/tag/v0.2.2
+ReleaseNotesUrl: https://github.com/premekvibe/AutoSpaces/releases/tag/v0.3.0
 ManifestType: defaultLocale
 ManifestVersion: 1.28.0
