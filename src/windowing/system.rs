@@ -1,6 +1,7 @@
 //! Win32 implementation of `core::WindowSystem`.
 
 use super::classifier;
+use crate::core::overlay::Rect;
 use crate::core::{State, WindowSystem};
 use std::time::Instant;
 use windows_sys::Win32::Foundation::{CloseHandle, HWND, LPARAM};
@@ -459,5 +460,94 @@ impl WindowSystem for Win32Windows {
     }
     fn is_elevated(&self, hwnd: HWND) -> bool {
         runs_elevated(hwnd)
+    }
+    fn work_area(&self) -> Option<Rect> {
+        primary_monitor().map(|m| m.0)
+    }
+    fn frame_rect(&self, hwnd: HWND) -> Option<Rect> {
+        frame_of(hwnd)
+    }
+    fn place_in_zone(&self, hwnd: HWND, zone: Rect) -> bool {
+        place_in_zone(hwnd, zone)
+    }
+}
+
+/// (work area, monitor rectangle) of the primary monitor.
+fn primary_monitor() -> Option<(Rect, Rect)> {
+    use windows_sys::Win32::Foundation::POINT;
+    use windows_sys::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTOPRIMARY};
+    unsafe {
+        let mut mi: MONITORINFO = std::mem::zeroed();
+        mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        if GetMonitorInfoW(MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY), &mut mi) == 0 {
+            return None;
+        }
+        Some((rect(mi.rcWork), rect(mi.rcMonitor)))
+    }
+}
+
+fn rect(r: windows_sys::Win32::Foundation::RECT) -> Rect {
+    Rect::new(r.left, r.top, r.right, r.bottom)
+}
+
+fn window_rect(hwnd: HWND) -> Option<Rect> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect;
+    let mut r = unsafe { std::mem::zeroed() };
+    (unsafe { GetWindowRect(hwnd, &mut r) } != 0).then(|| rect(r))
+}
+
+/// Visible frame (`DWMWA_EXTENDED_FRAME_BOUNDS`), else the window rectangle.
+fn frame_of(hwnd: HWND) -> Option<Rect> {
+    use windows_sys::Win32::Foundation::RECT;
+    use windows_sys::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
+    let mut r: RECT = unsafe { std::mem::zeroed() };
+    let hr = unsafe {
+        DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS as u32, &mut r as *mut RECT as *mut _, std::mem::size_of::<RECT>() as u32)
+    };
+    if hr >= 0 && r.right > r.left && r.bottom > r.top {
+        return Some(rect(r));
+    }
+    window_rect(hwnd)
+}
+
+/// Plan 12.18. A maximized or minimized window is restored without activation straight into the
+/// zone (`SetWindowPlacement` with `rcNormalPosition` in workspace coordinates, `SW_SHOWNOACTIVATE`,
+/// asynchronously on the window's thread); its invisible borders cannot be measured in that state,
+/// so they are guessed and the next pass corrects them. A normal window is moved and sized by
+/// `SetWindowPos` (no activation, no z-order change, asynchronous) with the borders measured
+/// (`GetWindowRect` against `DWMWA_EXTENDED_FRAME_BOUNDS`), so that the visible frame covers the
+/// zone exactly. Never a minimize or maximize call (see `maximize_inactive`).
+fn place_in_zone(hwnd: HWND, zone: Rect) -> bool {
+    use crate::core::zones::{to_workspace, window_rect_for, Margins};
+    use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetWindowPlacement, IsIconic, IsZoomed, SetWindowPlacement, SetWindowPos, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE,
+        SWP_NOOWNERZORDER, SWP_NOZORDER, SW_SHOWNOACTIVATE, WINDOWPLACEMENT, WPF_ASYNCWINDOWPLACEMENT,
+    };
+    unsafe {
+        if IsIconic(hwnd) != 0 || IsZoomed(hwnd) != 0 {
+            let Some((work, monitor)) = primary_monitor() else { return false };
+            let r = to_workspace(window_rect_for(zone, Margins::guess(GetDpiForWindow(hwnd))), work, monitor);
+            let mut wp: WINDOWPLACEMENT = std::mem::zeroed();
+            wp.length = std::mem::size_of::<WINDOWPLACEMENT>() as u32;
+            if GetWindowPlacement(hwnd, &mut wp) == 0 {
+                return false;
+            }
+            wp.flags = WPF_ASYNCWINDOWPLACEMENT;
+            wp.showCmd = SW_SHOWNOACTIVATE as u32;
+            wp.rcNormalPosition = windows_sys::Win32::Foundation::RECT { left: r.left, top: r.top, right: r.right, bottom: r.bottom };
+            return SetWindowPlacement(hwnd, &wp) != 0;
+        }
+        let (Some(win), Some(frame)) = (window_rect(hwnd), frame_of(hwnd)) else { return false };
+        let r = window_rect_for(zone, Margins::measure(win, frame));
+        SetWindowPos(
+            hwnd,
+            std::ptr::null_mut(),
+            r.left,
+            r.top,
+            r.w(),
+            r.h(),
+            SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_ASYNCWINDOWPOS,
+        ) != 0
     }
 }

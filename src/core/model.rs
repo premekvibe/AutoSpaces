@@ -130,4 +130,19 @@ pub trait WindowSystem {
     fn is_elevated(&self, _hwnd: HWND) -> bool {
         false
     }
+    /// Work area (`rcWork`) of the primary monitor, physical pixels (plan 12.18); None when unknown.
+    fn work_area(&self) -> Option<crate::core::overlay::Rect> {
+        None
+    }
+    /// The visible frame of a window (`DWMWA_EXTENDED_FRAME_BOUNDS`, without the invisible
+    /// borders); None when unknown.
+    fn frame_rect(&self, _hwnd: HWND) -> Option<crate::core::overlay::Rect> {
+        None
+    }
+    /// Puts the window, without activating it, so that its visible frame covers `zone` (plan
+    /// 12.18): a maximized or minimized window is first restored (no activation), then the
+    /// invisible borders are compensated. Asynchronous; false when it cannot be asked to.
+    fn place_in_zone(&self, _hwnd: HWND, _zone: crate::core::overlay::Rect) -> bool {
+        false
+    }
 }

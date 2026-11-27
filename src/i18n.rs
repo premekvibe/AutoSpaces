@@ -190,8 +190,8 @@ strings! {
         "To make a click on a running app's taskbar icon switch to its desktop, open Settings > System > Multitasking in Windows and, under Desktops, set “On the taskbar, show all the open windows” to “On all desktops”. Shift + click on the icon starts a new instance of the app."
     ],
     LayoutInfo => [
-        "Při startu AutoSpaces doplní počet ploch, okna běžících aplikací přesune na zvolené plochy a ostatní aplikace spustí. Okno, které se do 30 sekund neobjeví, se vzdá a zapíše do protokolu. Pohled zůstane na vaší ploše.",
-        "At startup, AutoSpaces adds any missing desktops, moves the windows of running apps to the chosen desktops and launches the other apps. If a window does not appear within 30 seconds, AutoSpaces gives up on it and notes it in the log. Your view stays on your own desktop."
+        "Při startu AutoSpaces doplní plochy, okna běžících aplikací přesune do zvolených zón a ostatní aplikace spustí na pozadí. Zóny jsou na hlavním monitoru; okna netvoří skupinu přichycení Windows. Plocha 1 zůstává vám, pořadí ploch změníte přetažením.",
+        "At startup, AutoSpaces adds any missing desktops, moves the windows of running apps into the chosen zones and launches the other apps in the background. Zones are on the main monitor; the windows do not form a Windows snap group. Desktop 1 stays yours; drag desktops to reorder them."
     ],
     ReportIntro => [
         "AutoSpaces vytvoří textový soubor report.txt s údaji, které pomohou chybu najít: verze AutoSpaces a Windows, nastavení, naučené výjimky a poslední řádky záznamu činnosti. Neobsahuje titulky oken ani jméno uživatele či počítače a nikam se neodesílá. Před odesláním si ho můžete prohlédnout. Pak otevřete hlášení na GitHubu a soubor do něj přetáhněte.",
@@ -217,6 +217,25 @@ strings! {
     LayoutCountLabel => ["Počet ploch po startu (nejméně {0}):", "Number of desktops at startup (at least {0}):"],
     LayoutRow => ["Plocha {0} – {1} – {2}", "Desktop {0} – {1} – {2}"],
     LayoutFull => ["V rozložení může být nejvýše {0} aplikací.", "The layout can hold at most {0} apps."],
+    // Window layouts of a desktop (plan 12.18)
+    LayoutFullDesks => ["V rozložení může být nejvýše {0} ploch.", "The layout can hold at most {0} desktops."],
+    LayoutDeskGroup => ["Plocha {0}", "Desktop {0}"],
+    LayoutNoDesk => ["Žádná plocha – přidejte ji", "No desktop – add one"],
+    LayoutDeskEmpty => ["bez aplikací", "no apps"],
+    LayoutZoneRow => ["{0} – {1}", "{0} – {1}"],
+    LayoutZoneEmpty => ["(prázdná)", "(empty)"],
+    LayoutDoubles => [
+        "Pozor: {0} je ve více zónách. Aplikace z Microsoft Storu nebo spuštěná bez parametrů často otevře jen jedno okno a další zóny zůstanou prázdné.",
+        "Note: {0} is in more than one zone. An app from the Microsoft Store or one started without parameters often opens only one window, and the other zones stay empty."
+    ],
+    TplFull => ["Celá obrazovka", "Full screen"],
+    TplHalves => ["Dvě poloviny", "Two halves"],
+    TplTwoThirdsLeft => ["2/3 + 1/3", "2/3 + 1/3"],
+    TplTwoThirdsRight => ["1/3 + 2/3", "1/3 + 2/3"],
+    TplThirds => ["Tři sloupce", "Three columns"],
+    TplWideCenter => ["Široký prostřední sloupec", "Wide middle column"],
+    TplBigLeft => ["Velké vlevo, dvě vpravo", "Large left, two on the right"],
+    TplQuarters => ["Čtyři čtvrtiny", "Four quarters"],
     FileFilterPrograms => ["Programy (*.exe)", "Programs (*.exe)"],
     FileFilterAll => ["Všechny soubory (*.*)", "All files (*.*)"],
     FileChooseApp => ["Vybrat aplikaci", "Choose an app"],

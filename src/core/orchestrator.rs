@@ -5,7 +5,12 @@
 use super::carry::{self, Next, Step};
 use super::learned::{FailReason, Learned, NoLearned};
 use super::model::{Event, ManagedSpace, Schedule, State, WindowSystem};
-use super::settings::{is_system_window, launch_label, never_learn, CarryStyle, LayoutRule, Settings, WindowShow, SYSTEM_HOSTS};
+use super::overlay::Rect;
+use super::settings::{
+    is_system_window, launch_label, never_learn, CarryStyle, DesktopPlan, Layout, LayoutRule, Settings, Template, WindowShow,
+    SYSTEM_HOSTS,
+};
+use super::zones;
 use crate::desktops::backend::Error;
 use crate::desktops::{DesktopBackend, Guid};
 use std::collections::{HashMap, HashSet};
@@ -43,6 +48,16 @@ const LAYOUT_FLASH_TICK_MS: u32 = 120;
 /// after a splash screen) go to its desktop, and focus / view taken by it are given back.
 const LAYOUT_SETTLE_MS: u64 = 10_000;
 const MAX_PROFILE_MAXIMIZE: u8 = 3;
+/// A window placed into a zone (plan 12.18) is put there at most this often: the first try may only
+/// restore it from maximized / minimized (borders measured afterwards), an app may restore its own
+/// saved position after showing the window (as for the window state, plan 12.16: three times), and
+/// a window moved in from a monitor with another DPI is rescaled by its app once.
+const MAX_ZONE_TRIES: u8 = 4;
+/// After placing a window into its zone it is looked at again after this long (the move is
+/// asynchronous: its own location events meanwhile are not a reason to place it again) ...
+const ZONE_RECHECK_MS: u64 = 250;
+/// ... and kept in its zone for this long after the last placement.
+const ZONE_SETTLE_MS: u64 = 3_000;
 /// Startup sequence after a manual start (the windows exist already; only the Start menu or
 /// Explorer that launched us has to give the foreground back). After a start with Windows the
 /// profile's `startDelayMs` applies to the whole sequence instead.
@@ -141,6 +156,12 @@ struct Claim {
     /// The window state of its rule (plan 12.16): maximized, a normal window or minimized.
     show: WindowShow,
     tries: u8,
+    /// Zone of its rule (plan 12.18): the visible frame goes there (a normal window); None = the
+    /// whole screen in the window state `show`.
+    zone: Option<Rect>,
+    /// Zone windows: not looked at again before (ms of `WindowSystem::now`), kept placed until.
+    next_at: u64,
+    until: u64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -705,6 +726,8 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
         if !s.enabled {
             return Vec::new();
         }
+        let profile_apps: Vec<String> =
+            if s.layout.enabled { s.layout.rules().into_iter().map(|r| r.process).collect() } else { Vec::new() };
         let wins = self.real_windows();
         let mut all = s.arrange_at_start && self.spaces.is_empty();
         if all {
@@ -742,7 +765,7 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
             if !self.allowed(&process) {
                 continue;
             }
-            if s.layout.enabled && s.layout.rules.iter().any(|r| r.process == process) {
+            if profile_apps.contains(&process) {
                 continue; // the layout profile places this app
             }
             let t = self.ws.process_started(pid);
@@ -1443,7 +1466,7 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
         let user_fg = self.ws.foreground();
         let user_fg_pid = if user_fg.is_null() { 0 } else { self.ws.process(user_fg).1 };
         let mut run = LayoutRun {
-            rules: lay.rules,
+            rules: lay.rules(),
             pending: Vec::new(),
             watch: Vec::new(),
             claimed: Vec::new(),
@@ -1505,7 +1528,8 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
     /// (default), a normal window or minimized (plan 12.16). The window is registered as placed:
     /// the ordinary logic never moves it to a helper desktop (plan 12.7).
     fn place(&mut self, run: &mut LayoutRun, i: usize, hwnd: HWND, apply: bool) -> Placed {
-        let (desk, proc, show) = (run.rules[i].desktop, run.rules[i].process.clone(), run.rules[i].show);
+        let (desk, proc, mut show) = (run.rules[i].desktop, run.rules[i].process.clone(), run.rules[i].show);
+        let (template, zone_i) = (run.rules[i].template, run.rules[i].zone as usize);
         if !self.allowed(&proc) {
             return Placed::No;
         }
@@ -1541,7 +1565,19 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
         }
         let l = self.desk_label(target);
         self.note(format!("layout: {proc} {:#x} {} -> desktop {desk} ({l})", hwnd as usize, self.ws.class(hwnd)));
-        run.claimed.push(Claim { hwnd, apply, show, tries: 0 });
+        // A zone of a window layout (plan 12.18): in the work area of the primary monitor.
+        let zone = match template {
+            Template::Full => None,
+            t => match self.ws.work_area().and_then(|w| zones::zone(t, w, zone_i)) {
+                Some(z) => Some(z),
+                None => {
+                    self.note(format!("layout: {proc} {:#x}: work area unknown; a normal window instead of zone {}", hwnd as usize, zone_i + 1));
+                    show = WindowShow::Normal;
+                    None
+                }
+            },
+        };
+        run.claimed.push(Claim { hwnd, apply, show, tries: 0, zone, next_at: 0, until: 0 });
         self.profile_windows.insert(hwnd);
         self.rejected.insert(hwnd);
         // Focus back to the user first: the state change then stays inside the app (no view switch).
@@ -1558,6 +1594,9 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
     /// a few times: an app may restore its own saved placement right after showing the window).
     /// Nothing when it already is in that state.
     fn layout_show(&mut self, run: &mut LayoutRun, c: usize) {
+        if run.claimed[c].zone.is_some() {
+            return self.layout_zone(run, c);
+        }
         let (hwnd, show) = (run.claimed[c].hwnd, run.claimed[c].show);
         let state = self.ws.state(hwnd);
         let done = match show {
@@ -1574,6 +1613,46 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
             self.note(format!("layout: {:#x} {}", hwnd as usize, show_label(show)));
         } else {
             run.claimed[c].apply = false; // e.g. a splash screen without a maximize box
+        }
+    }
+
+    /// Puts a placed window into the zone of its rule (plan 12.18): a normal window whose visible
+    /// frame covers the zone, without activation. Checked again a moment after each placement (the
+    /// move is asynchronous) and for `ZONE_SETTLE_MS` after the last one (an app may restore its
+    /// own saved position); at most `MAX_ZONE_TRIES` placements, then it stays as it is.
+    fn layout_zone(&mut self, run: &mut LayoutRun, c: usize) {
+        let Some(z) = run.claimed[c].zone else { return };
+        let hwnd = run.claimed[c].hwnd;
+        let state = self.ws.state(hwnd);
+        let now = self.ws.now();
+        if !run.claimed[c].apply || matches!(state, State::Hidden | State::Destroyed) || now < run.claimed[c].next_at {
+            return;
+        }
+        let frame = self.ws.frame_rect(hwnd);
+        if state == State::Normal && frame.is_some_and(|f| zones::fits(f, z)) {
+            if now >= run.claimed[c].until {
+                run.claimed[c].apply = false;
+                self.note(format!("layout: {:#x} stays in its zone", hwnd as usize));
+            }
+            return;
+        }
+        let zl = rect_label(z);
+        if run.claimed[c].tries >= MAX_ZONE_TRIES {
+            run.claimed[c].apply = false;
+            let got = frame.map_or("?".into(), rect_label);
+            self.note(format!("layout: {:#x} not in its zone {zl} after {MAX_ZONE_TRIES} tries ({got}); left as it is", hwnd as usize));
+            return;
+        }
+        let cl = &mut run.claimed[c];
+        cl.tries += 1;
+        cl.next_at = now + ZONE_RECHECK_MS;
+        cl.until = now + ZONE_SETTLE_MS;
+        let tries = cl.tries;
+        if self.ws.place_in_zone(hwnd, z) {
+            self.note(format!("layout: {:#x} -> zone {zl} (try {tries})", hwnd as usize));
+        } else {
+            run.claimed[c].apply = false;
+            self.note(format!("layout: {:#x} cannot be put into its zone {zl}", hwnd as usize));
         }
     }
 
@@ -1623,7 +1702,9 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
     fn layout_continue(&mut self, mut run: LayoutRun) -> Option<Schedule> {
         let now = self.ws.now();
         run.watch.retain(|w| now < w.1);
-        if run.pending.is_empty() && run.watch.is_empty() {
+        // Windows still being put into their zones keep the run (and its timer) going.
+        let zones_busy = run.claimed.iter().any(|c| c.zone.is_some() && c.apply);
+        if run.pending.is_empty() && run.watch.is_empty() && !zones_busy {
             self.layout = None;
             self.end_layout(run);
             return None;
@@ -1785,6 +1866,13 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
                 }
             }
         }
+        // Zone windows are checked by the timer too (an app may move its window without events
+        // reaching us while it sits on another desktop).
+        for c in 0..run.claimed.len() {
+            if run.claimed[c].zone.is_some() {
+                self.layout_zone(&mut run, c);
+            }
+        }
         self.layout_guard(&mut run);
         self.layout_continue(run)
     }
@@ -1799,49 +1887,69 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
         let ordinary: Vec<Guid> = list.into_iter().filter(|d| !self.spaces.contains_key(d)).collect();
         self.settings
             .layout
-            .rules
+            .rules()
             .iter()
             .any(|r| r.process == process && ordinary.get(r.desktop.max(1) as usize - 1) == Some(&desktop))
     }
 
-    /// Current desktops and windows as a profile: (number of desktops, one rule per
-    /// application and desktop). Reads exe version info, so call it on request only.
-    pub fn capture_layout(&self) -> (usize, Vec<LayoutRule>) {
+    /// Current desktops and windows as a profile (plan 12.7, 12.16, 12.18): (number of desktops,
+    /// one planned desktop per ordinary desktop 2, 3 ... with app windows). The normal windows of a
+    /// desktop that lie roughly in the zones of a template (at least two of them) give that
+    /// template, each zone the topmost window in it; otherwise the desktop is the whole screen for
+    /// its topmost window in its current window state. Empty desktops are left out (gaps close).
+    /// Reads exe version info, so call it on request only.
+    pub fn capture_layout(&self) -> (usize, Vec<DesktopPlan>) {
         let Ok(list) = self.backend.desktops() else { return (0, Vec::new()) };
         let ordinary: Vec<Guid> = list.into_iter().filter(|d| !self.spaces.contains_key(d)).collect();
-        let mut rules: Vec<LayoutRule> = Vec::new();
-        for w in self.ws.app_windows() {
-            let Some(rank) = self.backend.window_desktop(w).and_then(|d| ordinary.iter().position(|x| *x == d)) else {
-                continue;
+        let wins = self.ws.app_windows();
+        let work = self.ws.work_area();
+        let mut plans: Vec<DesktopPlan> = Vec::new();
+        // Desktop 1 stays the user's.
+        for (k, d) in ordinary.iter().enumerate().skip(1) {
+            let here: Vec<(HWND, String, u32)> = wins
+                .iter()
+                .filter(|w| self.backend.window_desktop(**w) == Some(*d))
+                .map(|w| {
+                    let (p, pid) = self.ws.process(*w);
+                    (*w, p, pid)
+                })
+                .filter(|(_, p, _)| !p.is_empty() && !SYSTEM_HOSTS.contains(&p.as_str()))
+                .collect();
+            let Some(first) = here.first() else { continue };
+            let desktop = k as u32 + 1;
+            let rule = |w: &(HWND, String, u32)| LayoutRule::new(desktop, &self.ws.app_name(w.2), &self.ws.launch_command(w.2), "", &w.1);
+            let normal: Vec<(usize, Rect)> = here
+                .iter()
+                .enumerate()
+                .filter(|(_, w)| self.ws.state(w.0) == State::Normal)
+                .filter_map(|(i, w)| self.ws.frame_rect(w.0).map(|f| (i, f)))
+                .collect();
+            let frames: Vec<Rect> = normal.iter().map(|n| n.1).collect();
+            let plan = match work.and_then(|wk| zones::recognize(&frames, wk)) {
+                Some((t, slots)) => DesktopPlan {
+                    template: t,
+                    slots: slots.into_iter().map(|s| s.and_then(|j| rule(&here[normal[j].0]))).collect(),
+                },
+                None => {
+                    // The window state as it is now (plan 12.16).
+                    let show = match self.ws.state(first.0) {
+                        State::Minimized => WindowShow::Min,
+                        State::Normal => WindowShow::Normal,
+                        _ => WindowShow::Max,
+                    };
+                    match rule(first) {
+                        Some(r) => DesktopPlan::full(r.with_show(show)),
+                        None => continue,
+                    }
+                }
             };
-            let (process, pid) = self.ws.process(w);
-            if process.is_empty() || SYSTEM_HOSTS.contains(&process.as_str()) {
-                continue;
-            }
-            let desktop = rank as u32 + 1;
-            if desktop == 1 {
-                continue; // desktop 1 stays the user's
-            }
-            if rules.iter().any(|r| r.desktop == desktop && r.process == process) {
-                continue;
-            }
-            let path = self.ws.launch_command(pid);
-            // The window state as it is now (plan 12.16): the first window of the app on that desktop.
-            let show = match self.ws.state(w) {
-                State::Minimized => WindowShow::Min,
-                State::Normal => WindowShow::Normal,
-                _ => WindowShow::Max,
-            };
-            if let Some(r) = LayoutRule::new(desktop, &self.ws.app_name(pid), &path, "", &process) {
-                rules.push(r.with_show(show));
-            }
+            plans.push(plan);
         }
-        rules.sort_by(|a, b| (a.desktop, &a.process).cmp(&(b.desktop, &b.process)));
-        // Same shape as a saved list: the order gives the desktops (2, 3 ...), gaps close.
-        crate::core::settings::renumber_rules(&mut rules);
-        (ordinary.len().max(rules.len() + 1), rules)
+        // Same shape as a saved list: the order gives the desktops (2, 3 ...).
+        let mut l = Layout { desktops: plans, ..Layout::default() };
+        l.renumber();
+        (ordinary.len().max(l.desktops.len() + 1), l.desktops)
     }
-
     // ------------------------------------------------------------ carrying a window (plan 12.13)
 
     /// The host's writer of `state.json`, called at once when the list of pinned windows changes
@@ -2341,6 +2449,11 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
 }
 
 /// The window state in the log.
+/// "(left, top, right, bottom)" for the log.
+fn rect_label(r: Rect) -> String {
+    format!("({}, {}, {}, {})", r.left, r.top, r.right, r.bottom)
+}
+
 fn show_label(s: WindowShow) -> &'static str {
     match s {
         WindowShow::Max => "maximized",

@@ -405,6 +405,24 @@ mod tests {
     }
 
     #[test]
+    fn slots_of_window_layouts_are_cut_like_rules() {
+        // Format of 0.3.0 (plan 12.18), as written by `Settings::to_json`.
+        let mut s = crate::core::Settings::default();
+        let mut d = crate::core::settings::DesktopPlan::new(crate::core::settings::Template::Halves);
+        d.slots[0] = crate::core::settings::LayoutRule::new(2, "My Inbox - Outlook", r"C:\Users\Jana\Apps\foo.exe", "--profile Jana", "");
+        s.layout.desktops.push(d);
+        s.layout.renumber();
+        let out = redact_json(&s.to_json(), &env());
+        for bad in ["Inbox", "Jana", "Users", "--profile"] {
+            assert!(!out.contains(bad), "{bad} in {out}");
+        }
+        for good in ["\"foo.exe\"", "\"halves\"", "null", "(omitted)"] {
+            assert!(out.contains(good), "{good} missing in {out}");
+        }
+        assert!(parse_json(&out).is_ok(), "{out}");
+    }
+
+    #[test]
     fn wallpaper_paths_are_left_out() {
         let e = env();
         let settings = r#"{"wallpapers":{"mode":"random","image":"D:\\Fotky\\Jana u more.jpg","folder":"D:\\Fotky\\Dovolena","subfolders":true,"newDesktops":true}}"#;

@@ -683,7 +683,7 @@ fn open_about() {
 }
 
 /// "Use current layout" button of the layout dialog.
-fn capture_layout() -> (usize, Vec<core::settings::LayoutRule>) {
+fn capture_layout() -> (usize, Vec<core::settings::DesktopPlan>) {
     orch().map(|o| o.capture_layout()).unwrap_or_default()
 }
 

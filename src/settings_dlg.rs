@@ -1,22 +1,29 @@
 //! Settings dialog (plan 12.2): plain Win32 dialog templates from assets/autospaces.rc,
 //! created only on request (no cost while idle). Ids below must match the .rc file.
 
+use crate::core::overlay::Rect;
 use crate::core::settings::{
-    display_label, file_name_lower, renumber_rules, Layout, LayoutRule, WallMode, Wallpapers, WindowShow, MAX_LAYOUT_DESKTOPS,
-    SYSTEM_HOSTS,
+    display_label, file_name_lower, DesktopPlan, Layout, LayoutRule, Template, WallMode, Wallpapers, WindowShow, MAX_LAYOUT_DESKTOPS,
+    MAX_LAYOUT_RULES, SYSTEM_HOSTS,
 };
+use crate::core::zones;
 use crate::core::Settings;
 use crate::i18n::{self, t, tf, Key, Pref, LANGS};
 use crate::sysopts;
 use crate::tray::wide;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-use windows_sys::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MapWindowPoints, MONITORINFO, MONITOR_DEFAULTTONEAREST};
+use windows_sys::Win32::Graphics::Gdi::{
+    DrawTextW, FillRect, FrameRect, GetMonitorInfoW, GetSysColor, GetSysColorBrush, InvalidateRect, MapWindowPoints, MonitorFromWindow,
+    ScreenToClient, SelectObject, SetBkMode, SetTextColor, COLOR_BTNSHADOW, COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, COLOR_WINDOW,
+    COLOR_WINDOWFRAME, COLOR_WINDOWTEXT, DT_CALCRECT, DT_CENTER, DT_EDITCONTROL, DT_END_ELLIPSIS, DT_NOPREFIX, DT_WORDBREAK,
+    MONITORINFO, MONITOR_DEFAULTTONEAREST, TRANSPARENT,
+};
 use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Controls::{
     CheckDlgButton, CheckRadioButton, DrawInsert, EnableThemeDialogTexture, IsDlgButtonChecked, LBItemFromPt, MakeDragList,
-    BST_CHECKED, BST_UNCHECKED, DL_BEGINDRAG, DL_DRAGGING, DL_DROPPED, DL_MOVECURSOR, DL_STOPCURSOR, DRAGLISTINFO, ETDT_ENABLE, ETDT_USETABTEXTURE,
+    BST_CHECKED, BST_UNCHECKED, DRAWITEMSTRUCT, DL_BEGINDRAG, DL_DRAGGING, DL_DROPPED, DL_MOVECURSOR, DL_STOPCURSOR, DRAGLISTINFO, ETDT_ENABLE, ETDT_USETABTEXTURE,
     InitCommonControlsEx, ICC_TAB_CLASSES, INITCOMMONCONTROLSEX, NMHDR, TCIF_TEXT, TCITEMW, TCM_ADJUSTRECT, TCM_GETCURSEL, TCM_INSERTITEMW, TCM_SETCURSEL, TCN_SELCHANGE,
 };
 use windows_sys::Win32::UI::Shell::ShellExecuteW;
@@ -31,7 +38,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WM_SETICON, SW_SHOWNORMAL, DWLP_MSGRESULT, MessageBoxW, RegisterWindowMessageW, MB_ICONINFORMATION, MB_OK,
     CallNextHookEx, GetAncestor, GetClientRect, GetParent, GetWindowRect, SetWindowPos, SetWindowsHookExW, ShowWindow,
     UnhookWindowsHookEx, GA_ROOT, MSG, MSGF_DIALOGBOX, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOW, WH_MSGFILTER,
-    WM_KEYDOWN, WM_NOTIFY,
+    WM_KEYDOWN, WM_NOTIFY, WM_DRAWITEM, WM_GETFONT, GetMessagePos, STN_CLICKED, STN_DBLCLK,
 };
 
 const IDD_SETTINGS: u16 = 101;
@@ -61,6 +68,19 @@ const ID_LAY_DOWN: i32 = 170;
 const ID_LAY_COUNT_LABEL: i32 = 171;
 const ID_LAY_INFO: i32 = 173;
 const EN_KILLFOCUS: u32 = 0x0200;
+const EN_CHANGE: u32 = 0x0300;
+/// Window layout of a desktop (plan 12.18): desktop buttons, the group of the selected desktop,
+/// template, preview, zones, launch parameters, warning.
+const ID_LAY_DESK_ADD: i32 = 270;
+const ID_LAY_DESK_DEL: i32 = 271;
+const ID_LAY_DESK_GRP: i32 = 272;
+const ID_LAY_TEMPLATE_LABEL: i32 = 273;
+const ID_LAY_TEMPLATE: i32 = 274;
+const ID_LAY_PREVIEW: i32 = 275;
+const ID_LAY_ZONES: i32 = 276;
+const ID_LAY_ARGS_LABEL: i32 = 277;
+const ID_LAY_ARGS: i32 = 278;
+const ID_LAY_WARN: i32 = 279;
 const ID_LAY_LIST: i32 = 163;
 const ID_LAY_ADD_RUN: i32 = 164;
 const ID_LAY_ADD_FILE: i32 = 165;
@@ -119,8 +139,8 @@ struct Dlg {
     out: Option<Outcome>,
     /// Source of the "running apps" picker.
     running: fn() -> Vec<(String, String)>,
-    /// Current desktops and windows as a layout profile (number of desktops, rules).
-    capture: fn() -> (usize, Vec<LayoutRule>),
+    /// Current desktops and windows as a layout profile (number of desktops, planned desktops).
+    capture: fn() -> (usize, Vec<DesktopPlan>),
     /// Why carrying is not available (shortcut taken, unsupported Windows); None = fine.
     carry_status: Option<String>,
     /// What the wallpaper option does on this Windows (plan 12.17).
@@ -147,7 +167,7 @@ pub fn show(
     settings: &Settings,
     learned: Vec<(String, String)>,
     running: fn() -> Vec<(String, String)>,
-    capture: fn() -> (usize, Vec<LayoutRule>),
+    capture: fn() -> (usize, Vec<DesktopPlan>),
     carry_status: Option<String>,
     wall_note: String,
 ) -> Option<Outcome> {
@@ -740,21 +760,33 @@ pub fn running_apps_full() -> Vec<(String, String, String)> {
         .collect()
 }
 
-// ---------------------------------------------------------------- layout profile (plan 12.7)
+// ---------------------------------------------------------------- layout profile (plan 12.7, 12.18)
 
 struct LayDlg {
     layout: Layout,
-    capture: fn() -> (usize, Vec<LayoutRule>),
+    capture: fn() -> (usize, Vec<DesktopPlan>),
     apply: bool,
     /// Registered message of the drag list box ("commctrl_DragListMsg").
     drag_msg: u32,
     /// Row being dragged.
     drag_src: Option<usize>,
+    /// Selected zone of the selected desktop (0-based).
+    zone: usize,
+    /// Controls are being filled from the model: their change notifications are not user input.
+    filling: bool,
 }
 
 /// The layout dialog; true when the user chose "Apply now" (the profile is stored in `d`).
 unsafe fn layout_dialog(parent: HWND, d: &mut Dlg) -> bool {
-    let mut st = LayDlg { layout: d.settings.layout.clone(), capture: d.capture, apply: false, drag_msg: 0, drag_src: None };
+    let mut st = LayDlg {
+        layout: d.settings.layout.clone(),
+        capture: d.capture,
+        apply: false,
+        drag_msg: 0,
+        drag_src: None,
+        zone: 0,
+        filling: false,
+    };
     let r = i18n::dialog_box(IDD_LAYOUT, parent, Some(layout_proc), &mut st as *mut LayDlg as LPARAM);
     if r != IDOK as isize {
         return false;
@@ -783,63 +815,236 @@ unsafe fn lay_fix_count(dlg: HWND, l: &Layout) {
     }
 }
 
-/// Fills the list in the order of the rules (the order gives the desktops: the first application
-/// is desktop 2, ...); item data = index into the rules. `sel` is selected afterwards.
-unsafe fn lay_refill(dlg: HWND, l: &mut Layout, sel: Option<usize>) {
-    renumber_rules(&mut l.rules);
+/// Name of a window layout (combo box, list rows).
+fn template_name(tp: Template) -> &'static str {
+    t(match tp {
+        Template::Full => Key::TplFull,
+        Template::Halves => Key::TplHalves,
+        Template::TwoThirdsLeft => Key::TplTwoThirdsLeft,
+        Template::TwoThirdsRight => Key::TplTwoThirdsRight,
+        Template::Thirds => Key::TplThirds,
+        Template::WideCenter => Key::TplWideCenter,
+        Template::BigLeft => Key::TplBigLeft,
+        Template::Quarters => Key::TplQuarters,
+    })
+}
+
+/// Row of the desktop list: "Desktop 2 – Two halves – Outlook, TradingView"; a full-screen app
+/// with its window state.
+fn desk_row(i: usize, d: &DesktopPlan) -> String {
+    let apps: Vec<String> = d
+        .apps()
+        .map(|r| match d.template {
+            Template::Full => format!("{} ({})", r.short_label(), i18n::show_name(r.show, true)),
+            _ => r.short_label().to_string(),
+        })
+        .collect();
+    let apps = if apps.is_empty() { t(Key::LayoutDeskEmpty).to_string() } else { apps.join(", ") };
+    tf(Key::LayoutRow, &[&(i + 2).to_string(), template_name(d.template), &apps])
+}
+
+/// Index of the selected desktop (the list always keeps one selected while there are any).
+unsafe fn lay_desk(dlg: HWND) -> Option<usize> {
+    let sel = SendDlgItemMessageW(dlg, ID_LAY_LIST, LB_GETCURSEL, 0, 0);
+    (sel != LB_ERR as isize).then_some(sel as usize)
+}
+
+/// Fills the desktop list in the order of the plan (the order gives the desktops: the first is
+/// desktop 2, ...); `sel` is selected afterwards (the last one when out of range), then the rest.
+unsafe fn lay_refill(dlg: HWND, st: &mut LayDlg, sel: Option<usize>) {
+    st.layout.renumber();
     SendDlgItemMessageW(dlg, ID_LAY_LIST, LB_RESETCONTENT, 0, 0);
     let mut longest = 0;
-    for (i, r) in l.rules.iter().enumerate() {
-        let text = tf(Key::LayoutRow, &[&r.desktop.to_string(), &r.label(), i18n::show_name(r.show, true)]);
+    for (i, d) in st.layout.desktops.iter().enumerate() {
+        let text = desk_row(i, d);
         longest = longest.max(text.chars().count());
         list_add(dlg, ID_LAY_LIST, &text, i);
     }
     // Long names scroll sideways instead of being cut off (extent in pixels, generous per char).
     let dpi = GetDpiForWindow(dlg).max(96) as usize;
     SendDlgItemMessageW(dlg, ID_LAY_LIST, LB_SETHORIZONTALEXTENT, longest * 8 * dpi / 96 + 16, 0);
-    if let Some(s) = sel.filter(|s| *s < l.rules.len()) {
-        SendDlgItemMessageW(dlg, ID_LAY_LIST, LB_SETCURSEL, s, 0);
+    let n = st.layout.desktops.len();
+    if n > 0 {
+        SendDlgItemMessageW(dlg, ID_LAY_LIST, LB_SETCURSEL, sel.unwrap_or(0).min(n - 1), 0);
     }
-    lay_fix_count(dlg, l);
-    lay_buttons(dlg, l);
+    lay_fix_count(dlg, &st.layout);
+    lay_desk_changed(dlg, st);
 }
 
-unsafe fn lay_buttons(dlg: HWND, l: &Layout) {
-    let sel = SendDlgItemMessageW(dlg, ID_LAY_LIST, LB_GETCURSEL, 0, 0);
-    let has = sel != LB_ERR as isize;
-    let i = sel.max(0) as usize;
-    // The window state of the selected app (greyed without a selection).
-    let show = l.rules.get(i).filter(|_| has).map(|r| r.show);
+/// The selected desktop changed (or its content): template, preview, zones, buttons.
+unsafe fn lay_desk_changed(dlg: HWND, st: &mut LayDlg) {
+    st.filling = true;
+    let desk = lay_desk(dlg).and_then(|i| st.layout.desktops.get(i).map(|d| (i, d.clone())));
+    let group = match &desk {
+        Some((i, _)) => tf(Key::LayoutDeskGroup, &[&(i + 2).to_string()]),
+        None => t(Key::LayoutNoDesk).to_string(),
+    };
+    SetDlgItemTextW(dlg, ID_LAY_DESK_GRP, wide(&group).as_ptr());
+    let tpl = desk.as_ref().map(|d| d.1.template);
+    SendDlgItemMessageW(dlg, ID_LAY_TEMPLATE, CB_SETCURSEL, tpl.map_or(usize::MAX, |t| t.index()), 0);
+    // Zones of the desktop: one row each ("1 – Outlook", "2 – (empty)").
+    SendDlgItemMessageW(dlg, ID_LAY_ZONES, LB_RESETCONTENT, 0, 0);
+    let mut longest = 0;
+    if let Some((_, d)) = &desk {
+        st.zone = st.zone.min(d.slots.len().saturating_sub(1));
+        for (z, s) in d.slots.iter().enumerate() {
+            let label = s.as_ref().map_or(t(Key::LayoutZoneEmpty).to_string(), |r| r.label());
+            let text = tf(Key::LayoutZoneRow, &[&(z + 1).to_string(), &label]);
+            longest = longest.max(text.chars().count());
+            list_add(dlg, ID_LAY_ZONES, &text, z);
+        }
+        SendDlgItemMessageW(dlg, ID_LAY_ZONES, LB_SETCURSEL, st.zone, 0);
+    }
+    let dpi = GetDpiForWindow(dlg).max(96) as usize;
+    SendDlgItemMessageW(dlg, ID_LAY_ZONES, LB_SETHORIZONTALEXTENT, longest * 8 * dpi / 96 + 16, 0);
+    let slot = desk.as_ref().and_then(|(_, d)| d.slots.get(st.zone).cloned().flatten());
+    SetDlgItemTextW(dlg, ID_LAY_ARGS, wide(slot.as_ref().map_or("", |r| r.args.as_str())).as_ptr());
+    let full = tpl == Some(Template::Full);
+    let show = slot.as_ref().filter(|_| full).map(|r| r.show);
     SendDlgItemMessageW(dlg, ID_LAY_SHOW, CB_SETCURSEL, show.map_or(usize::MAX, |s| s.index()), 0);
-    EnableWindow(GetDlgItem(dlg, ID_LAY_SHOW), has as i32);
-    EnableWindow(GetDlgItem(dlg, ID_LAY_SHOW_LABEL), has as i32);
-    EnableWindow(GetDlgItem(dlg, ID_LAY_DEL), has as i32);
-    EnableWindow(GetDlgItem(dlg, ID_LAY_UP), (has && i > 0) as i32);
-    EnableWindow(GetDlgItem(dlg, ID_LAY_DOWN), (has && i + 1 < l.rules.len()) as i32);
+    st.filling = false;
+    // Buttons and fields that need a desktop, a zone with an app, the whole-screen template.
+    let has_desk = desk.is_some();
+    let i = desk.as_ref().map_or(0, |d| d.0);
+    let n = st.layout.desktops.len();
+    let has_app = slot.is_some();
+    for (id, on) in [
+        (ID_LAY_DESK_DEL, has_desk),
+        (ID_LAY_UP, has_desk && i > 0),
+        (ID_LAY_DOWN, has_desk && i + 1 < n),
+        (ID_LAY_TEMPLATE, has_desk),
+        (ID_LAY_TEMPLATE_LABEL, has_desk),
+        (ID_LAY_ZONES, has_desk),
+        (ID_LAY_DEL, has_app),
+        (ID_LAY_ARGS, has_app),
+        (ID_LAY_ARGS_LABEL, has_app),
+        (ID_LAY_SHOW, has_app && full),
+        (ID_LAY_SHOW_LABEL, has_app && full),
+    ] {
+        EnableWindow(GetDlgItem(dlg, id), on as i32);
+    }
+    lay_warn(dlg, &st.layout);
+    InvalidateRect(GetDlgItem(dlg, ID_LAY_PREVIEW), std::ptr::null(), 1);
 }
 
-/// Moves a row (drag or the up / down buttons): the desktops follow the new order at once.
-unsafe fn lay_move(dlg: HWND, l: &mut Layout, from: usize, to: usize) {
-    if from >= l.rules.len() || to >= l.rules.len() || from == to {
+/// The warning about apps in several zones that may open only one window (plan 12.18); empty when
+/// there is none. It never blocks saving.
+unsafe fn lay_warn(dlg: HWND, l: &Layout) {
+    let names = l.single_instance_doubles();
+    let text = if names.is_empty() { String::new() } else { tf(Key::LayoutDoubles, &[&names.join(", ")]) };
+    SetDlgItemTextW(dlg, ID_LAY_WARN, wide(&text).as_ptr());
+}
+
+/// Moves a desktop (drag or the up / down buttons): the numbers follow the new order at once.
+unsafe fn lay_move(dlg: HWND, st: &mut LayDlg, from: usize, to: usize) {
+    let l = &mut st.layout;
+    if from >= l.desktops.len() || to >= l.desktops.len() || from == to {
         return;
     }
-    let r = l.rules.remove(from);
-    l.rules.insert(to, r);
-    lay_refill(dlg, l, Some(to));
+    let d = l.desktops.remove(from);
+    l.desktops.insert(to, d);
+    lay_refill(dlg, st, Some(to));
 }
 
-/// New applications go to the end of the list: the next desktop.
-unsafe fn lay_add(dlg: HWND, l: &mut Layout, name: &str, launch: &str, process: &str) {
-    if l.rules.len() + 1 >= MAX_LAYOUT_DESKTOPS as usize {
-        let text = tf(Key::LayoutFull, &[&(MAX_LAYOUT_DESKTOPS - 1).to_string()]);
+/// A new (whole-screen, empty) desktop at the end; false when the limit is reached.
+unsafe fn lay_add_desk(dlg: HWND, st: &mut LayDlg) -> bool {
+    if st.layout.desktops.len() + 1 >= MAX_LAYOUT_DESKTOPS as usize {
+        let text = tf(Key::LayoutFullDesks, &[&(MAX_LAYOUT_DESKTOPS - 1).to_string()]);
+        MessageBoxW(dlg, wide(&text).as_ptr(), wide(t(Key::AppName)).as_ptr(), MB_OK | MB_ICONINFORMATION);
+        return false;
+    }
+    st.layout.desktops.push(DesktopPlan::new(Template::Full));
+    st.zone = 0;
+    let last = st.layout.desktops.len() - 1;
+    lay_refill(dlg, st, Some(last));
+    true
+}
+
+/// Puts an app into the selected zone (a desktop is added first when there is none); the next
+/// empty zone is selected afterwards, so a layout fills zone by zone.
+unsafe fn lay_add(dlg: HWND, st: &mut LayDlg, name: &str, launch: &str, process: &str) {
+    if st.layout.app_count() >= MAX_LAYOUT_RULES {
+        let text = tf(Key::LayoutFull, &[&MAX_LAYOUT_RULES.to_string()]);
         MessageBoxW(dlg, wide(&text).as_ptr(), wide(t(Key::AppName)).as_ptr(), MB_OK | MB_ICONINFORMATION);
         return;
     }
-    if let Some(r) = LayoutRule::new(l.rules.len() as u32 + 2, name, launch, "", process) {
-        if !l.rules.iter().any(|x| x.process == r.process && x.launch == r.launch) {
-            l.rules.push(r);
-            lay_refill(dlg, l, Some(l.rules.len() - 1));
-        }
+    if lay_desk(dlg).is_none() && !lay_add_desk(dlg, st) {
+        return;
+    }
+    let Some(i) = lay_desk(dlg) else { return };
+    let Some(d) = st.layout.desktops.get_mut(i) else { return };
+    let z = st.zone.min(d.slots.len().saturating_sub(1));
+    let Some(mut r) = LayoutRule::new(i as u32 + 2, name, launch, "", process) else { return };
+    if let Some(old) = d.slots[z].as_ref() {
+        r.show = old.show; // another app in the same zone keeps the chosen window state
+    }
+    d.slots[z] = Some(r);
+    let n = d.slots.len();
+    if let Some(next) = (1..n).map(|k| (z + k) % n).find(|k| d.slots[*k].is_none()) {
+        st.zone = next;
+    }
+    lay_refill(dlg, st, Some(i));
+}
+
+/// The zone under the point `pt` (client coordinates of the preview).
+fn zone_at(t: Template, area: Rect, x: i32, y: i32) -> Option<usize> {
+    zones::zones(t, area).iter().position(|z| x >= z.left && x < z.right && y >= z.top && y < z.bottom)
+}
+
+/// The screen of the preview inside the control (a frame of one pixel around it).
+fn preview_area(rc: &RECT) -> Rect {
+    Rect::new(rc.left + 1, rc.top + 1, rc.right - 1, rc.bottom - 1)
+}
+
+/// Draws the preview of the selected desktop: its zones, numbered, with the app of each (owner-
+/// drawn static, `WM_DRAWITEM`); the selected zone in the selection colour.
+unsafe fn draw_preview(dlg: HWND, st: &LayDlg, dis: &DRAWITEMSTRUCT) {
+    let hdc = dis.hDC;
+    let rc = dis.rcItem;
+    FillRect(hdc, &rc, GetSysColorBrush(COLOR_BTNSHADOW));
+    let Some(d) = lay_desk(dlg).and_then(|i| st.layout.desktops.get(i)) else { return };
+    let font = SendMessageW(dlg, WM_GETFONT, 0, 0);
+    let old = if font != 0 { SelectObject(hdc, font as _) } else { std::ptr::null_mut() };
+    SetBkMode(hdc, TRANSPARENT as i32);
+    let dpi = GetDpiForWindow(dlg).max(96) as i32;
+    let gap = (2 * dpi + 48) / 96;
+    for (z, r) in zones::zones(d.template, preview_area(&rc)).into_iter().enumerate() {
+        let mut box_ = RECT { left: r.left + gap, top: r.top + gap, right: r.right - gap, bottom: r.bottom - gap };
+        let sel = z == st.zone;
+        FillRect(hdc, &box_, GetSysColorBrush(if sel { COLOR_HIGHLIGHT } else { COLOR_WINDOW }));
+        FrameRect(hdc, &box_, GetSysColorBrush(COLOR_WINDOWFRAME));
+        SetTextColor(hdc, GetSysColor(if sel { COLOR_HIGHLIGHTTEXT } else { COLOR_WINDOWTEXT }));
+        let app = d.slots.get(z).and_then(|s| s.as_ref()).map_or(t(Key::LayoutZoneEmpty).to_string(), |r| r.short_label().to_string());
+        let text: Vec<u16> = format!("{}\n{app}", z + 1).encode_utf16().collect();
+        box_.left += gap * 2;
+        box_.right -= gap * 2;
+        // Centred vertically: measured first, then drawn in the middle of the zone.
+        let mut calc = box_;
+        let flags = DT_CENTER | DT_WORDBREAK | DT_NOPREFIX | DT_EDITCONTROL;
+        DrawTextW(hdc, text.as_ptr() as *mut u16, text.len() as i32, &mut calc, flags | DT_CALCRECT);
+        let h = (calc.bottom - calc.top).min(box_.bottom - box_.top);
+        box_.top += ((box_.bottom - box_.top) - h) / 2;
+        box_.bottom = box_.top + h;
+        DrawTextW(hdc, text.as_ptr() as *mut u16, text.len() as i32, &mut box_, flags | DT_END_ELLIPSIS);
+    }
+    if !old.is_null() {
+        SelectObject(hdc, old);
+    }
+}
+
+/// A click on the preview selects the zone under the mouse.
+unsafe fn preview_click(dlg: HWND, st: &mut LayDlg) {
+    let Some(d) = lay_desk(dlg).and_then(|i| st.layout.desktops.get(i)) else { return };
+    let ctl = GetDlgItem(dlg, ID_LAY_PREVIEW);
+    let pos = GetMessagePos();
+    let mut pt = POINT { x: (pos & 0xffff) as i16 as i32, y: ((pos >> 16) & 0xffff) as i16 as i32 };
+    ScreenToClient(ctl, &mut pt);
+    let mut rc: RECT = std::mem::zeroed();
+    GetClientRect(ctl, &mut rc);
+    if let Some(z) = zone_at(d.template, preview_area(&rc), pt.x, pt.y) {
+        st.zone = z;
+        lay_desk_changed(dlg, st);
+        SetFocus(GetDlgItem(dlg, ID_LAY_ZONES));
     }
 }
 
@@ -885,7 +1090,7 @@ unsafe fn lay_drag(dlg: HWND, st: &mut LayDlg, info: &DRAGLISTINFO) -> isize {
             } else {
                 st.drag_src = Some(item as usize);
                 SendMessageW(lb, LB_SETCURSEL, item as usize, 0);
-                lay_buttons(dlg, &st.layout);
+                lay_desk_changed(dlg, st);
                 1
             }
         }
@@ -902,7 +1107,7 @@ unsafe fn lay_drag(dlg: HWND, st: &mut LayDlg, info: &DRAGLISTINFO) -> isize {
             DrawInsert(dlg, lb, -1);
             let item = LBItemFromPt(lb, info.ptCursor, 0);
             if let (Some(from), true) = (st.drag_src.take(), item >= 0) {
-                lay_move(dlg, &mut st.layout, from, item as usize);
+                lay_move(dlg, st, from, item as usize);
             }
             0
         }
@@ -927,15 +1132,29 @@ unsafe extern "system" fn layout_proc(dlg: HWND, msg: u32, wp: WPARAM, lp: LPARA
         WM_INITDIALOG => {
             SetWindowLongPtrW(dlg, GWLP_USERDATA, lp);
             if let Some(st) = (lp as *mut LayDlg).as_mut() {
+                set_icons(dlg);
                 SetDlgItemTextW(dlg, ID_LAY_INFO, wide(t(Key::LayoutInfo)).as_ptr());
                 CheckDlgButton(dlg, ID_LAY_ENABLED, check(st.layout.enabled));
                 SetDlgItemInt(dlg, ID_LAY_COUNT, st.layout.count() as u32, 0);
                 for s in WindowShow::ALL {
                     SendDlgItemMessageW(dlg, ID_LAY_SHOW, CB_ADDSTRING, 0, wide(i18n::show_name(s, false)).as_ptr() as LPARAM);
                 }
+                for tp in Template::ALL {
+                    SendDlgItemMessageW(dlg, ID_LAY_TEMPLATE, CB_ADDSTRING, 0, wide(template_name(tp)).as_ptr() as LPARAM);
+                }
                 MakeDragList(GetDlgItem(dlg, ID_LAY_LIST));
                 st.drag_msg = RegisterWindowMessageW(wide("commctrl_DragListMsg").as_ptr());
-                lay_refill(dlg, &mut st.layout, None);
+                lay_refill(dlg, st, Some(0));
+            }
+            1
+        }
+        WM_DRAWITEM => {
+            let dis = &*(lp as *const DRAWITEMSTRUCT);
+            if dis.CtlID != ID_LAY_PREVIEW as u32 {
+                return 0;
+            }
+            if let Some(st) = (GetWindowLongPtrW(dlg, GWLP_USERDATA) as *mut LayDlg).as_ref() {
+                draw_preview(dlg, st, dis);
             }
             1
         }
@@ -943,8 +1162,7 @@ unsafe extern "system" fn layout_proc(dlg: HWND, msg: u32, wp: WPARAM, lp: LPARA
             let id = (wp & 0xffff) as i32;
             let notify = ((wp >> 16) & 0xffff) as u32;
             let Some(st) = (GetWindowLongPtrW(dlg, GWLP_USERDATA) as *mut LayDlg).as_mut() else { return 0 };
-            let sel = SendDlgItemMessageW(dlg, ID_LAY_LIST, LB_GETCURSEL, 0, 0);
-            let sel = (sel != LB_ERR as isize).then_some(sel as usize);
+            let desk = lay_desk(dlg).filter(|i| *i < st.layout.desktops.len());
             match id {
                 x if x == IDOK || x == ID_LAY_APPLY => {
                     lay_collect(dlg, st);
@@ -956,19 +1174,64 @@ unsafe extern "system" fn layout_proc(dlg: HWND, msg: u32, wp: WPARAM, lp: LPARA
                 }
                 ID_LAY_LIST => {
                     if notify == LBN_SELCHANGE {
-                        lay_buttons(dlg, &st.layout);
+                        st.zone = 0;
+                        lay_desk_changed(dlg, st);
+                    }
+                }
+                ID_LAY_ZONES => {
+                    let z = SendDlgItemMessageW(dlg, ID_LAY_ZONES, LB_GETCURSEL, 0, 0);
+                    if notify == LBN_SELCHANGE && z != LB_ERR as isize {
+                        st.zone = z as usize;
+                        lay_desk_changed(dlg, st);
+                    }
+                }
+                ID_LAY_PREVIEW => {
+                    if notify == STN_CLICKED || notify == STN_DBLCLK {
+                        preview_click(dlg, st);
+                    }
+                }
+                ID_LAY_TEMPLATE => {
+                    let c = SendDlgItemMessageW(dlg, ID_LAY_TEMPLATE, CB_GETCURSEL, 0, 0);
+                    if let (CBN_SELCHANGE, Some(i), true, false) = (notify, desk, c >= 0, st.filling) {
+                        st.layout.desktops[i].set_template(Template::from_index(c as usize));
+                        lay_refill(dlg, st, Some(i));
                     }
                 }
                 ID_LAY_SHOW => {
                     let c = SendDlgItemMessageW(dlg, ID_LAY_SHOW, CB_GETCURSEL, 0, 0);
-                    if let (CBN_SELCHANGE, Some(i), true) = (notify, sel.filter(|i| *i < st.layout.rules.len()), c >= 0) {
-                        st.layout.rules[i].show = WindowShow::from_index(c as usize);
-                        lay_refill(dlg, &mut st.layout, Some(i));
+                    if let (CBN_SELCHANGE, Some(i), true, false) = (notify, desk, c >= 0, st.filling) {
+                        if let Some(Some(r)) = st.layout.desktops[i].slots.get_mut(st.zone) {
+                            r.show = WindowShow::from_index(c as usize);
+                        }
+                        lay_refill(dlg, st, Some(i));
+                    }
+                }
+                ID_LAY_ARGS => {
+                    if let (EN_CHANGE, Some(i), false) = (notify, desk, st.filling) {
+                        // As typed (quotes are part of the parameters), only trimmed.
+                        let mut buf = vec![0u16; 1040];
+                        let n = GetDlgItemTextW(dlg, ID_LAY_ARGS, buf.as_mut_ptr(), buf.len() as i32).max(0) as usize;
+                        let text = String::from_utf16_lossy(&buf[..n]).trim().to_string();
+                        if let Some(Some(r)) = st.layout.desktops[i].slots.get_mut(st.zone) {
+                            r.args = text;
+                        }
+                        lay_warn(dlg, &st.layout);
                     }
                 }
                 ID_LAY_COUNT => {
                     if notify == EN_KILLFOCUS {
                         lay_fix_count(dlg, &st.layout);
+                    }
+                }
+                ID_LAY_DESK_ADD => {
+                    lay_add_desk(dlg, st);
+                }
+                ID_LAY_DESK_DEL => {
+                    if let Some(i) = desk {
+                        st.layout.desktops.remove(i);
+                        st.zone = 0;
+                        lay_refill(dlg, st, Some(i));
+                        SetFocus(GetDlgItem(dlg, ID_LAY_LIST));
                     }
                 }
                 ID_LAY_ADD_RUN => {
@@ -981,38 +1244,41 @@ unsafe extern "system" fn layout_proc(dlg: HWND, msg: u32, wp: WPARAM, lp: LPARA
                     let entries = picker_entries(raw, &[], &own);
                     if let Some((p, n)) = pick_from(dlg, entries, t(Key::PickLayoutTitle), t(Key::PickLayoutButton)) {
                         let path = full.iter().find(|f| f.0 == p).map(|f| f.2.clone()).unwrap_or_default();
-                        lay_add(dlg, &mut st.layout, &n, &path, &p);
+                        lay_add(dlg, st, &n, &path, &p);
                     }
                 }
                 ID_LAY_ADD_FILE => {
                     if let Some(path) = choose_exe(dlg) {
                         let name = crate::windowing::system::version_name(&path);
                         let launch = crate::launch_for_path(&path);
-                        lay_add(dlg, &mut st.layout, &name, &launch, &file_name_lower(&path));
+                        lay_add(dlg, st, &name, &launch, &file_name_lower(&path));
                     }
                 }
                 ID_LAY_DEL => {
-                    if let Some(i) = sel.filter(|i| *i < st.layout.rules.len()) {
-                        st.layout.rules.remove(i);
-                        let next = i.min(st.layout.rules.len().saturating_sub(1));
-                        lay_refill(dlg, &mut st.layout, Some(next));
+                    if let Some(i) = desk {
+                        if let Some(s) = st.layout.desktops[i].slots.get_mut(st.zone) {
+                            *s = None;
+                        }
+                        lay_refill(dlg, st, Some(i));
+                        SetFocus(GetDlgItem(dlg, ID_LAY_ZONES));
                     }
                 }
                 ID_LAY_UP | ID_LAY_DOWN => {
-                    if let Some(i) = sel {
+                    if let Some(i) = desk {
                         let to = if id == ID_LAY_UP { i.saturating_sub(1) } else { i + 1 };
-                        lay_move(dlg, &mut st.layout, i, to);
+                        lay_move(dlg, st, i, to);
                         // A button that just got disabled must not keep the keyboard focus.
                         SetFocus(GetDlgItem(dlg, ID_LAY_LIST));
                     }
                 }
                 ID_LAY_CAPTURE => {
-                    let (n, rules) = (st.capture)();
+                    let (n, desks) = (st.capture)();
                     if n > 0 {
-                        st.layout.rules = rules;
+                        st.layout.desktops = desks;
                         st.layout.desktop_count = n as u32;
+                        st.zone = 0;
                         SetDlgItemInt(dlg, ID_LAY_COUNT, n as u32, 0);
-                        lay_refill(dlg, &mut st.layout, None);
+                        lay_refill(dlg, st, Some(0));
                     }
                 }
                 _ => return 0,

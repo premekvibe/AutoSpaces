@@ -1,4 +1,4 @@
-﻿#pragma code_page(65001)
+#pragma code_page(65001)
 
 // rc.exe runs without the SDK include path, so the few style bits used here are spelled out.
 #define DS_MODALFRAME 0x80
@@ -26,6 +26,7 @@
 #define SS_CENTERIMAGE 0x200
 #define SS_REALSIZECONTROL 0x40
 #define SS_OWNERDRAW 0xD
+#define SS_NOTIFY 0x100
 #define CBS_DROPDOWNLIST 3
 #define BS_MULTILINE 0x2000
 

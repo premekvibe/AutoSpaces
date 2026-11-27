@@ -1,6 +1,7 @@
 //! Orchestrator tests with a fake backend and a fake window system.
 
 use super::learned::{FailReason, Learned};
+use super::overlay::Rect;
 use super::*;
 use crate::desktops::backend::{Error, Result as BResult};
 use crate::desktops::{DesktopBackend, Guid};
@@ -86,6 +87,15 @@ struct World {
     elevated: RefCell<Vec<usize>>,
     /// state.json texts written through `set_persist`, with the pinned list at that moment.
     persisted: RefCell<Vec<(String, Vec<usize>)>>,
+    // ---- window layouts (plan 12.18)
+    /// Work area of the primary monitor (None = unknown).
+    work: Cell<Option<Rect>>,
+    /// Visible frame per window id (None = unknown).
+    frames: RefCell<HashMap<usize, Rect>>,
+    /// `place_in_zone` calls, in order.
+    zoned: RefCell<Vec<(usize, Rect)>>,
+    /// Windows whose app ignores being placed (keeps its own position).
+    stubborn: RefCell<Vec<usize>>,
 }
 
 impl World {
@@ -340,6 +350,23 @@ impl WindowSystem for FW {
     }
     fn is_elevated(&self, hwnd: HWND) -> bool {
         self.0.elevated.borrow().contains(&(hwnd as usize))
+    }
+    fn work_area(&self) -> Option<Rect> {
+        self.0.work.get()
+    }
+    fn frame_rect(&self, hwnd: HWND) -> Option<Rect> {
+        self.0.frames.borrow().get(&(hwnd as usize)).copied()
+    }
+    fn place_in_zone(&self, hwnd: HWND, zone: Rect) -> bool {
+        let id = hwnd as usize;
+        self.0.zoned.borrow_mut().push((id, zone));
+        if !self.0.stubborn.borrow().contains(&id) {
+            self.0.frames.borrow_mut().insert(id, zone);
+            if let Some(w) = self.0.wins.borrow_mut().get_mut(&id) {
+                w.state = State::Normal;
+            }
+        }
+        true
     }
 }
 
@@ -1644,7 +1671,27 @@ fn apply_settings_keeps_the_tray_toggle() {
 // ---------------------------------------------------------------- layout profile (plan 12.7)
 
 use super::orchestrator::{layout_tick_token, startup_token};
-use super::settings::{Layout, LayoutRule};
+use super::settings::{DesktopPlan, Layout, LayoutRule};
+
+/// Whole-screen desktops (the shape of 0.2.2 and older), each rule on the desktop it names (desktops
+/// before it without a rule stay empty in the plan).
+fn full_desktops(rules: Vec<LayoutRule>) -> Vec<DesktopPlan> {
+    let mut rules = rules;
+    rules.sort_by_key(|r| r.desktop);
+    let mut out: Vec<DesktopPlan> = Vec::new();
+    for r in rules {
+        let i = r.desktop.max(2) as usize - 2;
+        while out.len() <= i {
+            out.push(DesktopPlan::new(super::settings::Template::Full));
+        }
+        if out[i].slots[0].is_none() {
+            out[i].slots[0] = Some(r);
+        } else {
+            out.push(DesktopPlan::full(r));
+        }
+    }
+    out
+}
 
 fn profile(count: u32, rules: &[(u32, &str)]) -> Settings {
     let mut s = Settings::default();
@@ -1652,8 +1699,9 @@ fn profile(count: u32, rules: &[(u32, &str)]) -> Settings {
         enabled: true,
         desktop_count: count,
         start_delay_ms: 1000,
-        rules: rules.iter().map(|(d, p)| LayoutRule::new(*d, "", p, "", p).unwrap()).collect(),
+        desktops: full_desktops(rules.iter().map(|(d, p)| LayoutRule::new(*d, "", p, "", p).unwrap()).collect()),
     };
+    s.layout.renumber();
     s
 }
 
@@ -2107,13 +2155,16 @@ fn capture_layout_reads_desktops_and_windows() {
         proc_of(&w, id, p);
     }
     let o = started(&w);
-    let (n, rules) = o.capture_layout();
-    assert_eq!(n, 3, "two applications need three desktops");
-    let got: Vec<(u32, &str)> = rules.iter().map(|r| (r.desktop, r.process.as_str())).collect();
-    // Desktop 1 (notepad) stays the user's; the order gives the numbers.
-    assert_eq!(got, vec![(2, "calc.exe"), (3, "mail.exe")]);
-    assert_eq!(rules[0].launch, r"C:\apps\calc.exe");
-    assert_eq!(rules[0].name, "Name 4");
+    let (n, desks) = o.capture_layout();
+    assert_eq!(n, 2, "one planned desktop: two desktops");
+    // Desktop 1 (notepad) stays the user's. Desktop 2 has three windows in no layout of zones (the
+    // fake has no geometry): the whole screen for the topmost one.
+    assert_eq!(desks.len(), 1);
+    assert_eq!(desks[0].template, super::settings::Template::Full);
+    let r = desks[0].slots[0].as_ref().unwrap();
+    assert_eq!((r.desktop, r.process.as_str()), (2, "mail.exe"));
+    assert_eq!(r.launch, r"C:\apps\mail.exe");
+    assert_eq!(r.name, "Name 1");
 }
 
 #[test]
@@ -3391,7 +3442,9 @@ fn focus_follow_up_leaves_a_window_moved_to_another_desktop_alone() {
 
 fn profile_shows(count: u32, rules: &[(u32, &str, super::settings::WindowShow)]) -> Settings {
     let mut s = profile(count, &[]);
-    s.layout.rules = rules.iter().map(|(d, p, show)| LayoutRule::new(*d, "", p, "", p).unwrap().with_show(*show)).collect();
+    s.layout.desktops =
+        full_desktops(rules.iter().map(|(d, p, show)| LayoutRule::new(*d, "", p, "", p).unwrap().with_show(*show)).collect());
+    s.layout.renumber();
     s
 }
 
@@ -3522,7 +3575,245 @@ fn capture_layout_takes_the_window_state_along() {
         w.set_state(id, st);
     }
     let o = started(&w);
-    let (_, rules) = o.capture_layout();
+    let (_, desks) = o.capture_layout();
+    let rules: Vec<&LayoutRule> = desks.iter().map(|d| d.slots[0].as_ref().unwrap()).collect();
     let got: Vec<(&str, WindowShow)> = rules.iter().map(|r| (r.process.as_str(), r.show)).collect();
     assert_eq!(got, vec![("mail.exe", WindowShow::Normal), ("trade.exe", WindowShow::Min), ("video.exe", WindowShow::Max)]);
+}
+
+// ---------------------------------------------------------------- window layouts of a desktop (plan 12.18)
+
+const WORK: Rect = Rect::new(0, 0, 1920, 1040);
+
+/// A profile with one planned desktop per entry: (template, apps of its zones in order, with launch
+/// parameters; "" = empty zone).
+fn zoned_profile(desks: &[(super::settings::Template, &[(&str, &str)])]) -> Settings {
+    let mut s = profile(1, &[]);
+    s.layout.desktops = desks
+        .iter()
+        .map(|(t, apps)| {
+            let mut d = DesktopPlan::new(*t);
+            for (z, (p, args)) in apps.iter().enumerate() {
+                if !p.is_empty() {
+                    d.slots[z] = Some(LayoutRule::new(2, "", p, args, p).unwrap());
+                }
+            }
+            d
+        })
+        .collect();
+    s.layout.renumber();
+    s
+}
+
+fn zone_of(t: super::settings::Template, i: usize) -> Rect {
+    super::zones::zone(t, WORK, i).unwrap()
+}
+
+#[test]
+fn zones_running_and_launched_apps_are_placed_side_by_side_in_the_background() {
+    use super::settings::Template;
+    let w = World::new(1);
+    w.work.set(Some(WORK));
+    put(&w, 1, 1);
+    proc_of(&w, 1, "mail.exe");
+    w.set_state(1, State::Maximized); // running, maximized: restored into the left half
+    put(&w, 50, 1);
+    w.fg.set(50);
+    let mut o = started(&w);
+    o.apply_settings(zoned_profile(&[(Template::Halves, &[("mail.exe", ""), ("trade.exe", "--fast")])]));
+    assert!(o.start_layout().is_some(), "trade.exe is awaited");
+    assert_eq!(*w.launched.borrow(), vec!["trade.exe".to_string()]);
+    assert_eq!(w.desk_of(1), g(2));
+    assert_eq!(*w.zoned.borrow(), vec![(1, zone_of(Template::Halves, 0))]);
+    assert_eq!(w.state(1), State::Normal, "restored, not maximized");
+    // The launched app shows its window on the desktop being viewed: moved, put into the right half.
+    w.open(2, State::Normal);
+    proc_of(&w, 2, "trade.exe");
+    ev(&w, &mut o, 2, Event::Show);
+    assert_eq!(w.desk_of(2), g(2));
+    assert_eq!(w.zoned.borrow().last(), Some(&(2, zone_of(Template::Halves, 1))));
+    settle(&w, &mut o);
+    assert_eq!(w.zoned.borrow().len(), 2, "each window placed once: it stayed in its zone");
+    assert!(w.maximized.borrow().is_empty() && w.shown.borrow().is_empty(), "no window state call");
+    assert_eq!(w.current.get(), g(1), "no view switch");
+    assert!(w.switches.borrow().is_empty());
+    assert!(!w.activated.borrow().contains(&1) && !w.activated.borrow().contains(&2), "no focus taken");
+    assert_eq!(list(&w), vec![1, 2], "one desktop for both windows, no helper desktops");
+    assert!(!o.is_managed(h(1)) && !o.is_managed(h(2)));
+    assert!(logged(&mut o, "stays in its zone"));
+}
+
+#[test]
+fn zones_of_one_app_take_its_running_windows_first_then_new_ones_in_zone_order() {
+    use super::settings::Template;
+    let w = World::new(1);
+    w.work.set(Some(WORK));
+    put(&w, 1, 1);
+    proc_of(&w, 1, "chrome.exe");
+    let mut o = started(&w);
+    let four = [("chrome.exe", "--new-window a"), ("chrome.exe", "--new-window b"), ("chrome.exe", "--new-window c"), ("chrome.exe", "--new-window d")];
+    o.apply_settings(zoned_profile(&[(Template::Quarters, &four)]));
+    assert!(o.start_layout().is_some());
+    assert_eq!(w.launched.borrow().len(), 3, "the running window takes zone 1, three more instances are launched");
+    assert_eq!(w.zoned.borrow()[0], (1, zone_of(Template::Quarters, 0)));
+    // The n-th new window fills the n-th zone still waiting.
+    for id in [7, 8, 9] {
+        w.open(id, State::Normal);
+        proc_of(&w, id, "chrome.exe");
+        ev(&w, &mut o, id, Event::Show);
+    }
+    let got: Vec<(usize, Rect)> = w.zoned.borrow().clone();
+    assert_eq!(
+        got,
+        vec![
+            (1, zone_of(Template::Quarters, 0)),
+            (7, zone_of(Template::Quarters, 1)),
+            (8, zone_of(Template::Quarters, 2)),
+            (9, zone_of(Template::Quarters, 3))
+        ]
+    );
+    settle(&w, &mut o);
+    for id in [1, 7, 8, 9] {
+        assert_eq!(w.desk_of(id), g(2));
+    }
+    // Running with more windows than zones: two of three are used, nothing is launched.
+    let w = World::new(1);
+    w.work.set(Some(WORK));
+    for id in [1, 2, 3] {
+        put(&w, id, 1);
+        proc_of(&w, id, "chrome.exe");
+    }
+    let mut o = started(&w);
+    o.apply_settings(zoned_profile(&[(Template::Halves, &[("chrome.exe", ""), ("chrome.exe", "")])]));
+    o.start_layout();
+    settle(&w, &mut o);
+    assert!(w.launched.borrow().is_empty());
+    assert_eq!((w.desk_of(1), w.desk_of(2), w.desk_of(3)), (g(2), g(2), g(1)));
+    assert_eq!(w.zoned.borrow().iter().map(|z| z.0).collect::<Vec<_>>(), vec![1, 2]);
+}
+
+#[test]
+fn zone_windows_trigger_no_move_and_occupy_their_desktop() {
+    use super::settings::Template;
+    let w = World::new(1);
+    w.work.set(Some(WORK));
+    for (id, p) in [(1, "mail.exe"), (2, "trade.exe")] {
+        put(&w, id, 1);
+        proc_of(&w, id, p);
+    }
+    let mut o = started(&w);
+    o.always_own_desktop = false;
+    o.apply_settings(zoned_profile(&[(Template::TwoThirdsLeft, &[("mail.exe", ""), ("trade.exe", "")])]));
+    o.start_layout();
+    settle(&w, &mut o);
+    assert_eq!((w.state(1), w.state(2)), (State::Normal, State::Normal));
+    // Another window maximized next to them on desktop 2: zone windows are no maximized windows,
+    // so it stays (plan 12.1: alone among maximized windows).
+    w.current.set(g(2));
+    put(&w, 3, 2);
+    w.set_state(3, State::Maximized);
+    ev(&w, &mut o, 3, Loc);
+    assert!(!o.is_managed(h(3)));
+    assert_eq!(list(&w), vec![1, 2]);
+    // The app of a zone window maximizes it: it keeps its desktop (placed by the profile).
+    w.set_state(3, State::Normal);
+    ev(&w, &mut o, 3, Loc);
+    w.set_state(1, State::Maximized);
+    ev(&w, &mut o, 1, Loc);
+    assert!(!o.is_managed(h(1)));
+    assert_eq!(w.desk_of(1), g(2));
+    // Desktop 2 is occupied by the zone windows: a compaction keeps it.
+    w.current.set(g(1));
+    put(&w, 9, 1);
+    vanish(&w, &mut o, 9);
+    assert_eq!(list(&w), vec![1, 2]);
+}
+
+#[test]
+fn zone_placement_is_repeated_when_the_app_moves_away_but_never_fought_for_long() {
+    use super::settings::Template;
+    let w = World::new(1);
+    w.work.set(Some(WORK));
+    put(&w, 1, 1);
+    proc_of(&w, 1, "a.exe");
+    put(&w, 2, 1);
+    proc_of(&w, 2, "b.exe");
+    w.stubborn.borrow_mut().push(2); // b.exe never goes where it is put
+    w.frames.borrow_mut().insert(2, Rect::new(100, 100, 700, 600));
+    let mut o = started(&w);
+    o.apply_settings(zoned_profile(&[(Template::Halves, &[("a.exe", ""), ("b.exe", "")])]));
+    o.start_layout();
+    // a.exe restores its own saved position right after being placed: placed again.
+    w.tick(300);
+    w.frames.borrow_mut().insert(1, Rect::new(50, 50, 800, 700));
+    o.on_event(layout_tick_token(), Event::Recheck);
+    let a: Vec<Rect> = w.zoned.borrow().iter().filter(|z| z.0 == 1).map(|z| z.1).collect();
+    assert_eq!(a, vec![zone_of(Template::Halves, 0); 2]);
+    // Location events right after a placement do not place it again (the move is asynchronous).
+    w.frames.borrow_mut().insert(1, Rect::new(50, 50, 800, 700));
+    o.on_event(h(1), Loc);
+    assert_eq!(w.zoned.borrow().iter().filter(|z| z.0 == 1).count(), 2);
+    settle(&w, &mut o);
+    let tries = |id| w.zoned.borrow().iter().filter(|z| z.0 == id).count();
+    assert_eq!(tries(2), 4, "at most four tries, then left as it is");
+    assert!(tries(1) <= 4);
+    assert!(!o.layout_running());
+}
+
+#[test]
+fn zone_without_a_known_work_area_becomes_a_normal_window() {
+    use super::settings::Template;
+    let w = World::new(1);
+    put(&w, 1, 1);
+    proc_of(&w, 1, "a.exe");
+    w.set_state(1, State::Maximized);
+    let mut o = started(&w);
+    o.apply_settings(zoned_profile(&[(Template::Thirds, &[("", ""), ("a.exe", ""), ("", "")])]));
+    o.start_layout();
+    assert!(w.zoned.borrow().is_empty());
+    assert_eq!(*w.shown.borrow(), vec![(1, super::settings::WindowShow::Normal)]);
+    assert!(logged(&mut o, "work area unknown"));
+}
+
+#[test]
+fn capture_layout_recognizes_window_layouts() {
+    use super::settings::{Template, WindowShow};
+    let w = World::new(4);
+    w.work.set(Some(WORK));
+    let q = |i| zone_of(Template::Quarters, i);
+    for (id, d, p, frame) in [
+        // Desktop 2: two windows snapped into halves (a few pixels off), plus a minimized one.
+        (1, 2, "trade.exe", Some(Rect::new(963, 2, 1920, 1040))),
+        (2, 2, "olk.exe", Some(Rect::new(0, 0, 958, 1038))),
+        (3, 2, "notes.exe", None),
+        // Desktop 3: three quarters of a browser.
+        (4, 3, "chrome.exe", Some(q(0))),
+        (5, 3, "chrome.exe", Some(q(1))),
+        (6, 3, "chrome.exe", Some(q(3))),
+        // Desktop 4: one free-floating window: full screen with its state.
+        (7, 4, "calc.exe", Some(Rect::new(300, 200, 700, 600))),
+    ] {
+        put(&w, id, d);
+        proc_of(&w, id, p);
+        if let Some(f) = frame {
+            w.frames.borrow_mut().insert(id, f);
+        }
+    }
+    w.set_state(3, State::Minimized);
+    let o = started(&w);
+    let (n, desks) = o.capture_layout();
+    assert_eq!(n, 4);
+    assert_eq!(desks.iter().map(|d| d.template).collect::<Vec<_>>(), vec![Template::Halves, Template::Quarters, Template::Full]);
+    let names = |d: &DesktopPlan| d.slots.iter().map(|s| s.as_ref().map(|r| r.process.clone())).collect::<Vec<_>>();
+    assert_eq!(names(&desks[0]), vec![Some("olk.exe".into()), Some("trade.exe".into())]);
+    assert_eq!(names(&desks[1]), vec![Some("chrome.exe".into()), Some("chrome.exe".into()), None, Some("chrome.exe".into())]);
+    let r = desks[2].slots[0].as_ref().unwrap();
+    assert_eq!((r.process.as_str(), r.show, r.desktop), ("calc.exe", WindowShow::Normal, 4));
+    let z = desks[1].slots[3].as_ref().unwrap();
+    assert_eq!((z.desktop, z.template, z.zone), (3, Template::Quarters, 3));
+    // Without a known work area nothing is recognized: the topmost window, whole screen.
+    w.work.set(None);
+    let (_, desks) = o.capture_layout();
+    assert_eq!(desks[0].template, Template::Full);
+    assert_eq!(desks[0].slots[0].as_ref().unwrap().process, "trade.exe");
 }

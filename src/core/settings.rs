@@ -1,5 +1,6 @@
 //! Settings (plan 6.6, 12.2): defaults plus `settings.json` in `%APPDATA%\AutoSpaces`.
 
+pub use super::zones::Template;
 use crate::i18n::Pref;
 use crate::json::{parse_json, quote, Json};
 use std::collections::BTreeMap;
@@ -7,7 +8,8 @@ use std::path::Path;
 
 /// Upper bound of desktops a profile may ask for (sanity limit for hand-edited files).
 pub const MAX_LAYOUT_DESKTOPS: u32 = 20;
-const MAX_LAYOUT_RULES: usize = 50;
+/// Upper bound of applications in the profile (all desktops and zones together).
+pub const MAX_LAYOUT_RULES: usize = 50;
 
 /// System hosts that never make sense to exclude, to put into a layout profile or to put on the
 /// learned list (plan 6.7). `explorer.exe` and `applicationframehost.exe` also host ordinary
@@ -157,7 +159,9 @@ impl WindowShow {
 }
 
 /// One application of the layout profile (plan 12.7): `launch` starts it, `process` pairs a
-/// running window with it (never by pid: launchers exit and hand over to another process).
+/// running window with it (never by pid: launchers exit and hand over to another process). In
+/// `settings.json` it is a slot of a desktop (plan 12.18); `desktop`, `template` and `zone` say
+/// where it sits and are kept up to date by `Layout::renumber`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LayoutRule {
     /// Target desktop, 1-based.
@@ -166,26 +170,61 @@ pub struct LayoutRule {
     pub name: String,
     /// Path to the exe or a command (`olk.exe`).
     pub launch: String,
+    /// Launch parameters (optional), passed when the app is launched for this slot.
     pub args: String,
     /// Lower-case process image name used for matching windows.
     pub process: String,
-    /// Window state on its desktop (plan 12.16).
+    /// Window state on its desktop (plan 12.16); only for the `Full` template, else `Max` (unused).
     pub show: WindowShow,
+    /// Window layout of its desktop (plan 12.18).
+    pub template: Template,
+    /// Zone of the template (0-based).
+    pub zone: u8,
 }
 
-/// Desktop layout applied after start (plan 12.7).
+/// One desktop of the layout profile (plan 12.18): a window layout and one slot per zone
+/// (`None` = empty zone).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DesktopPlan {
+    pub template: Template,
+    pub slots: Vec<Option<LayoutRule>>,
+}
+
+impl DesktopPlan {
+    pub fn new(template: Template) -> DesktopPlan {
+        DesktopPlan { template, slots: vec![None; template.zone_count()] }
+    }
+
+    /// The whole screen for one application (what every rule of 0.2.2 and older becomes).
+    pub fn full(rule: LayoutRule) -> DesktopPlan {
+        DesktopPlan { template: Template::Full, slots: vec![Some(rule)] }
+    }
+
+    /// Another template: the slots keep their positions, apps in zones it does not have are dropped.
+    pub fn set_template(&mut self, t: Template) {
+        self.template = t;
+        self.slots.resize(t.zone_count(), None);
+    }
+
+    pub fn apps(&self) -> impl Iterator<Item = &LayoutRule> {
+        self.slots.iter().flatten()
+    }
+}
+
+/// Desktop layout applied after start (plan 12.7, 12.18).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Layout {
     pub enabled: bool,
     pub desktop_count: u32,
     /// Wait after AutoSpaces starts, so apps are not launched into a system still booting.
     pub start_delay_ms: u32,
-    pub rules: Vec<LayoutRule>,
+    /// Desktops 2, 3, ... in order (desktop 1 stays the user's).
+    pub desktops: Vec<DesktopPlan>,
 }
 
 impl Default for Layout {
     fn default() -> Self {
-        Layout { enabled: false, desktop_count: 1, start_delay_ms: 5000, rules: Vec::new() }
+        Layout { enabled: false, desktop_count: 1, start_delay_ms: 5000, desktops: Vec::new() }
     }
 }
 
@@ -223,6 +262,8 @@ impl LayoutRule {
             args: args.trim().to_string(),
             process,
             show: WindowShow::Max,
+            template: Template::Full,
+            zone: 0,
         })
     }
 
@@ -234,23 +275,91 @@ impl LayoutRule {
     pub fn label(&self) -> String {
         display_label(&self.process, &self.name)
     }
-}
 
-/// Numbers rules by their position: the first gets desktop 2, the next 3 ... (desktop 1 is the
-/// user's). Rules beyond the last allowed desktop share it.
-pub fn renumber_rules(rules: &mut [LayoutRule]) {
-    for (i, r) in rules.iter_mut().enumerate() {
-        r.desktop = (i as u32 + 2).min(MAX_LAYOUT_DESKTOPS);
+    /// Short name for the zone preview: the readable name, else the process.
+    pub fn short_label(&self) -> &str {
+        if self.name.is_empty() {
+            &self.process
+        } else {
+            &self.name
+        }
+    }
+
+    /// Launched as a packaged app (`shell:AppsFolder\<AUMID>`).
+    pub fn is_packaged(&self) -> bool {
+        self.launch.trim().get(..6).is_some_and(|s| s.eq_ignore_ascii_case("shell:"))
+    }
+
+    fn from_json(r: &Json, desktop: u32, with_show: bool) -> Option<LayoutRule> {
+        let text = |k: &str| r.get(k).and_then(Json::as_str).unwrap_or("");
+        let process = r.get("match").and_then(|m| m.get("process")).and_then(Json::as_str).unwrap_or("");
+        let rule = LayoutRule::new(desktop, text("name"), text("launch"), text("args"), process)?;
+        Some(if with_show { rule.with_show(WindowShow::from_code(text("show"))) } else { rule })
+    }
+
+    fn to_json(&self, with_show: bool) -> String {
+        let show = if with_show { format!(", \"show\": {}", quote(self.show.code())) } else { String::new() };
+        format!(
+            "{{\"name\": {}, \"launch\": {}, \"args\": {}, \"match\": {{\"process\": {}}}{show}}}",
+            quote(&self.name),
+            quote(&self.launch),
+            quote(&self.args),
+            quote(&self.process)
+        )
     }
 }
 
+/// Stable sort of a short list by a number (insertion: far less code in the exe than `sort_by_key`
+/// instantiated for each element type, and the lists hold at most a few dozen items).
+fn sorted_by<T>(items: Vec<T>, key: impl Fn(&T) -> u32) -> Vec<T> {
+    let mut out: Vec<T> = Vec::with_capacity(items.len());
+    for it in items {
+        let k = key(&it);
+        let at = out.iter().position(|x| key(x) > k).unwrap_or(out.len());
+        out.insert(at, it);
+    }
+    out
+}
+
 impl Layout {
+    /// What a list of rules of 0.2.2 and older means (`"rules"`, one app per desktop in their
+    /// order): one `Full` desktop per rule, the window state kept.
+    pub fn from_rules(rules: Vec<LayoutRule>) -> Vec<DesktopPlan> {
+        rules.into_iter().map(DesktopPlan::full).collect()
+    }
+
+    /// Every application of the profile with its desktop and zone, desktop by desktop, zones in
+    /// order (the order in which windows are matched: the n-th new window of an app fills the n-th
+    /// zone of that app).
+    pub fn rules(&self) -> Vec<LayoutRule> {
+        let mut out = Vec::new();
+        for (i, d) in self.desktops.iter().enumerate() {
+            for (z, s) in d.slots.iter().enumerate() {
+                if let Some(r) = s {
+                    let mut r = r.clone();
+                    r.desktop = (i as u32 + 2).min(MAX_LAYOUT_DESKTOPS);
+                    r.template = d.template;
+                    r.zone = z as u8;
+                    if d.template != Template::Full {
+                        r.show = WindowShow::Max;
+                    }
+                    out.push(r);
+                }
+            }
+        }
+        out
+    }
+
+    pub fn app_count(&self) -> usize {
+        self.desktops.iter().map(|d| d.apps().count()).sum()
+    }
+
     /// Rules launching an exe inside WindowsApps (its path holds the version and breaks with the
     /// next update) are switched to `shell:AppsFolder\<AUMID>` where it can be resolved.
     /// True when anything changed.
     pub fn migrate_packaged(&mut self, manifest: impl Fn(&str) -> Option<String>) -> bool {
         let mut changed = false;
-        for r in &mut self.rules {
+        for r in self.desktops.iter_mut().flat_map(|d| d.slots.iter_mut().flatten()) {
             if let Some(cmd) = packaged_launch(&r.launch, &manifest) {
                 r.launch = cmd;
                 changed = true;
@@ -259,24 +368,59 @@ impl Layout {
         changed
     }
 
-    /// Fewest desktops the list needs: desktop 1 stays the user's, every application takes the
-    /// next one (applications + 1).
+    /// Fewest desktops the list needs: desktop 1 stays the user's, every planned desktop takes the
+    /// next one (planned desktops + 1).
     pub fn min_count(&self) -> u32 {
-        (self.rules.len() as u32 + 1).clamp(1, MAX_LAYOUT_DESKTOPS)
+        (self.desktops.len() as u32 + 1).clamp(1, MAX_LAYOUT_DESKTOPS)
     }
 
-    /// Desktops the profile needs: the chosen count, raised to the highest target desktop and to
-    /// `min_count` (extra desktops beyond that stay empty).
+    /// Desktops the profile needs: the chosen count, raised to `min_count` (extra desktops beyond
+    /// that stay empty).
     pub fn count(&self) -> usize {
-        let top = self.rules.iter().map(|r| r.desktop).max().unwrap_or(1);
-        self.desktop_count.max(top).max(self.min_count()).clamp(1, MAX_LAYOUT_DESKTOPS) as usize
+        self.desktop_count.max(self.min_count()).clamp(1, MAX_LAYOUT_DESKTOPS) as usize
     }
 
-    /// Settles the list order into desktops: the order of `rules` is the order of desktops (first
-    /// application = desktop 2, second = 3 ...); `desktop_count` is raised to `min_count`.
+    /// Settles the list: the order of `desktops` is the order of desktops (first = desktop 2,
+    /// second = 3 ...); the slots learn their desktop, template and zone, slots of templates other
+    /// than `Full` lose the window state (unused there); `desktop_count` is raised to `min_count`.
     pub fn renumber(&mut self) {
-        renumber_rules(&mut self.rules);
+        self.desktops.truncate(MAX_LAYOUT_DESKTOPS as usize - 1);
+        for (i, d) in self.desktops.iter_mut().enumerate() {
+            let n = d.template.zone_count();
+            d.slots.resize(n, None);
+            for (z, s) in d.slots.iter_mut().enumerate() {
+                if let Some(r) = s {
+                    r.desktop = i as u32 + 2;
+                    r.template = d.template;
+                    r.zone = z as u8;
+                    if d.template != Template::Full {
+                        r.show = WindowShow::Max;
+                    }
+                }
+            }
+        }
         self.desktop_count = self.desktop_count.max(self.min_count()).clamp(1, MAX_LAYOUT_DESKTOPS);
+    }
+
+    /// Apps that are in more than one slot of the profile and will probably not open a second
+    /// window (plan 12.18): packaged apps (a second launch by AUMID usually just activates the running
+    /// one) and apps without launch parameters in some of their slots. Labels, in order of first
+    /// appearance. Only a warning in the dialog: the profile is saved anyway.
+    pub fn single_instance_doubles(&self) -> Vec<String> {
+        let rules = self.rules();
+        let mut out: Vec<String> = Vec::new();
+        let mut seen: Vec<&str> = Vec::new();
+        for r in &rules {
+            if seen.contains(&r.process.as_str()) {
+                continue;
+            }
+            seen.push(&r.process);
+            let same: Vec<&LayoutRule> = rules.iter().filter(|x| x.process == r.process).collect();
+            if same.len() >= 2 && same.iter().any(|x| x.is_packaged() || x.args.is_empty()) {
+                out.push(r.short_label().to_string());
+            }
+        }
+        out
     }
 
     fn from_json(j: &Json) -> Layout {
@@ -290,45 +434,69 @@ impl Layout {
         if let Some(n) = j.get("startDelayMs").and_then(Json::as_uint) {
             l.start_delay_ms = (n as u32).min(120_000);
         }
-        if let Some(Json::Arr(a)) = j.get("rules") {
+        let mut apps = 0;
+        if let Some(Json::Arr(a)) = j.get("desktops") {
+            // Format of 0.3.0 (plan 12.18): desktops with a template and slots.
+            let mut list: Vec<(u32, DesktopPlan)> = Vec::new();
+            for (i, d) in a.iter().take(MAX_LAYOUT_DESKTOPS as usize - 1).enumerate() {
+                if !matches!(d, Json::Obj(_)) {
+                    continue;
+                }
+                let t = d.get("layout").and_then(Json::as_str).and_then(Template::from_code).unwrap_or_default();
+                let num = d.get("desktop").and_then(Json::as_uint).map_or(i as u32 + 2, |n| n as u32);
+                let mut plan = DesktopPlan::new(t);
+                if let Some(Json::Arr(slots)) = d.get("slots") {
+                    for (z, s) in slots.iter().take(t.zone_count()).enumerate() {
+                        if apps >= MAX_LAYOUT_RULES || !matches!(s, Json::Obj(_)) {
+                            continue;
+                        }
+                        if let Some(r) = LayoutRule::from_json(s, num, t == Template::Full) {
+                            plan.slots[z] = Some(r);
+                            apps += 1;
+                        }
+                    }
+                }
+                list.push((num, plan));
+            }
+            // Hand-edited desktop numbers: ordered by them (stable), then renumbered.
+            l.desktops = sorted_by(list, |p| p.0).into_iter().map(|p| p.1).collect();
+        } else if let Some(Json::Arr(a)) = j.get("rules") {
+            // Format of 0.2.2 and older: one app per desktop, the order of the desktop numbers.
+            let mut rules: Vec<LayoutRule> = Vec::new();
             for r in a.iter().take(MAX_LAYOUT_RULES) {
-                let text = |k: &str| r.get(k).and_then(Json::as_str).unwrap_or("");
-                let process = r.get("match").and_then(|m| m.get("process")).and_then(Json::as_str).unwrap_or("");
                 let desktop = r.get("desktop").and_then(Json::as_uint).unwrap_or(1) as u32;
-                let show = WindowShow::from_code(text("show"));
-                if let Some(rule) = LayoutRule::new(desktop, text("name"), text("launch"), text("args"), process).map(|r| r.with_show(show)) {
-                    if !l.rules.contains(&rule) {
-                        l.rules.push(rule);
+                if let Some(rule) = LayoutRule::from_json(r, desktop, true) {
+                    if !rules.contains(&rule) {
+                        rules.push(rule);
                     }
                 }
             }
+            l.desktops = Layout::from_rules(sorted_by(rules, |r| r.desktop));
         }
-        // Files with hand-written desktop numbers: ordered by them (stable), then renumbered.
-        l.rules.sort_by_key(|r| r.desktop);
         l.renumber();
         l
     }
 
     fn to_json(&self) -> String {
-        let rules: Vec<String> = self
-            .rules
+        let desks: Vec<String> = self
+            .desktops
             .iter()
             .enumerate()
-            .map(|(i, r)| {
+            .map(|(i, d)| {
+                let full = d.template == Template::Full;
+                let slots: Vec<String> =
+                    d.slots.iter().map(|s| s.as_ref().map_or("null".to_string(), |r| r.to_json(full))).collect();
                 format!(
-                    "    {{\"desktop\": {}, \"name\": {}, \"launch\": {}, \"args\": {}, \"match\": {{\"process\": {}}}, \"show\": {}}}",
+                    "    {{\"desktop\": {}, \"layout\": {}, \"slots\": [\n      {}\n    ]}}",
                     (i as u32 + 2).min(MAX_LAYOUT_DESKTOPS),
-                    quote(&r.name),
-                    quote(&r.launch),
-                    quote(&r.args),
-                    quote(&r.process),
-                    quote(r.show.code())
+                    quote(d.template.code()),
+                    slots.join(",\n      ")
                 )
             })
             .collect();
-        let list = if rules.is_empty() { String::new() } else { format!("\n{}\n  ", rules.join(",\n")) };
+        let list = if desks.is_empty() { String::new() } else { format!("\n{}\n  ", desks.join(",\n")) };
         format!(
-            "{{\"enabled\": {}, \"desktopCount\": {}, \"startDelayMs\": {}, \"rules\": [{}]}}",
+            "{{\"enabled\": {}, \"desktopCount\": {}, \"startDelayMs\": {}, \"desktops\": [{}]}}",
             self.enabled,
             self.desktop_count.max(self.min_count()),
             self.start_delay_ms,
@@ -892,28 +1060,178 @@ mod tests {
         assert_eq!(display_label("a.exe", "A.EXE"), "a.exe");
         assert_eq!(display_label("a.exe", "App"), "App (a.exe)");
     }
+    /// The flat list of a layout: (desktop, process, template, zone).
+    fn flat(l: &Layout) -> Vec<(u32, String, Template, u8)> {
+        l.rules().into_iter().map(|r| (r.desktop, r.process, r.template, r.zone)).collect()
+    }
+
+    fn rule(p: &str) -> LayoutRule {
+        LayoutRule::new(2, "", p, "", p).unwrap()
+    }
+
+    /// A layout of one `Full` desktop per rule (the shape of 0.2.2 and older).
+    fn full_layout(rules: Vec<LayoutRule>) -> Layout {
+        let mut l = Layout { desktops: Layout::from_rules(rules), ..Layout::default() };
+        l.renumber();
+        l
+    }
+
     #[test]
     fn layout_roundtrip_and_old_files() {
         // Old file without `layout`: profile off, defaults.
         let old = Settings::from_json(r#"{"mode":"all","excluded":["a.exe"]}"#).unwrap();
         assert_eq!(old.layout, Layout::default());
-        assert!(!old.layout.enabled && old.layout.rules.is_empty());
+        assert!(!old.layout.enabled && old.layout.desktops.is_empty());
         let mut s = Settings::default();
         s.layout.enabled = true;
         s.layout.desktop_count = 4;
         s.layout.start_delay_ms = 2500;
-        s.layout.rules = vec![
-            LayoutRule::new(2, "Outlook \"new\"", r"C:\Program Files\Outlook\olk.exe", "--x y", "OLK.exe").unwrap(),
-            LayoutRule::new(3, "", "TradingView.exe", "", "").unwrap(),
+        s.layout.desktops = vec![
+            DesktopPlan::full(LayoutRule::new(2, "Outlook \"new\"", r"C:\Program Files\Outlook\olk.exe", "--x y", "OLK.exe").unwrap()),
+            DesktopPlan::full(LayoutRule::new(3, "", "TradingView.exe", "", "").unwrap()),
         ];
+        s.layout.renumber();
         let text = s.to_json();
         let back = Settings::from_json(&text).unwrap();
         assert_eq!(back, s);
-        assert_eq!(back.layout.rules[0].process, "olk.exe");
-        assert_eq!(back.layout.rules[1].process, "tradingview.exe");
-        assert_eq!(back.layout.rules[0].label(), "Outlook \"new\" (olk.exe)");
-        assert_eq!(back.layout.rules[1].label(), "tradingview.exe");
+        let rules = back.layout.rules();
+        assert_eq!(rules[0].process, "olk.exe");
+        assert_eq!(rules[1].process, "tradingview.exe");
+        assert_eq!(rules[0].label(), "Outlook \"new\" (olk.exe)");
+        assert_eq!(rules[1].label(), "tradingview.exe");
+        assert_eq!(rules[0].args, "--x y");
         assert!(text.contains("\"match\": {\"process\": \"olk.exe\"}"));
+        assert!(text.contains("\"layout\": \"full\"") && !text.contains("\"rules\""), "the new format");
+    }
+
+    #[test]
+    fn old_rules_are_migrated_to_full_screen_desktops() {
+        // The file of 0.2.2 as the user has it (Outlook normal, TradingView minimized).
+        let old = r#"{"layout": {"enabled": true, "desktopCount": 3, "startDelayMs": 5000, "rules": [
+            {"desktop": 2, "name": "Microsoft Outlook", "launch": "shell:AppsFolder\\Microsoft.OutlookForWindows_8wekyb3d8bbwe!Microsoft.OutlookforWindows", "args": "", "match": {"process": "olk.exe"}, "show": "normal"},
+            {"desktop": 3, "name": "TradingView", "launch": "shell:AppsFolder\\TradingView.Desktop_n534cwy3pjxzj!TradingView.Desktop", "args": "", "match": {"process": "tradingview.exe"}, "show": "min"}
+          ]}}"#;
+        let s = Settings::from_json(old).unwrap();
+        let l = &s.layout;
+        assert!(l.enabled);
+        assert_eq!((l.desktop_count, l.start_delay_ms, l.desktops.len()), (3, 5000, 2));
+        for d in &l.desktops {
+            assert_eq!(d.template, Template::Full);
+            assert_eq!(d.slots.len(), 1);
+        }
+        let r = l.rules();
+        assert_eq!(
+            r.iter().map(|r| (r.desktop, r.process.as_str(), r.show, r.name.as_str())).collect::<Vec<_>>(),
+            vec![(2, "olk.exe", WindowShow::Normal, "Microsoft Outlook"), (3, "tradingview.exe", WindowShow::Min, "TradingView")]
+        );
+        assert!(r[0].launch.starts_with(r"shell:AppsFolder\Microsoft.OutlookForWindows"));
+        // Saved in the new format; read again it is the same layout.
+        let text = s.to_json();
+        assert!(text.contains("\"desktops\"") && !text.contains("\"rules\""));
+        assert!(text.contains("\"show\": \"normal\"") && text.contains("\"show\": \"min\""));
+        assert_eq!(Settings::from_json(&text).unwrap(), s);
+        // `desktops` wins over a stale `rules` list in the same file.
+        let both = r#"{"layout":{"desktops":[{"layout":"halves","slots":[{"launch":"a.exe"},null]}],"rules":[{"launch":"z.exe"}]}}"#;
+        assert_eq!(flat(&Settings::from_json(both).unwrap().layout), vec![(2, "a.exe".into(), Template::Halves, 0)]);
+    }
+
+    #[test]
+    fn desktops_with_templates_and_slots_roundtrip() {
+        let mut l = Layout { enabled: true, desktop_count: 3, ..Layout::default() };
+        let mut d2 = DesktopPlan::new(Template::Halves);
+        d2.slots[0] = Some(rule("olk.exe"));
+        d2.slots[1] = Some(LayoutRule::new(2, "TradingView", r"C:\TV\TradingView.exe", "", "").unwrap());
+        let mut d3 = DesktopPlan::new(Template::Quarters);
+        for z in [0, 1, 3] {
+            d3.slots[z] = Some(LayoutRule::new(2, "", r"C:\B\chrome.exe", &format!("--new-window https://x/{z}"), "").unwrap());
+        }
+        l.desktops = vec![d2, d3, DesktopPlan::new(Template::Thirds)];
+        l.renumber();
+        assert_eq!(l.desktop_count, 4, "three planned desktops need four");
+        assert_eq!(
+            flat(&l),
+            vec![
+                (2, "olk.exe".into(), Template::Halves, 0),
+                (2, "tradingview.exe".into(), Template::Halves, 1),
+                (3, "chrome.exe".into(), Template::Quarters, 0),
+                (3, "chrome.exe".into(), Template::Quarters, 1),
+                (3, "chrome.exe".into(), Template::Quarters, 3),
+            ]
+        );
+        assert_eq!(l.app_count(), 5);
+        let s = Settings { layout: l.clone(), ..Settings::default() };
+        let text = s.to_json();
+        assert!(text.contains("\"layout\": \"quarters\"") && text.contains("null"));
+        assert!(!text.contains("\"show\""), "no window state outside full screen");
+        let back = Settings::from_json(&text).unwrap();
+        assert_eq!(back.layout, l);
+        assert_eq!(back.layout.desktops[2].slots, vec![None, None, None], "an empty desktop stays");
+        assert_eq!(back.layout.rules()[4].args, "--new-window https://x/3");
+    }
+
+    #[test]
+    fn desktops_are_tolerant() {
+        let s = Settings::from_json(
+            r#"{"layout":{"desktops":[
+                {"layout":"QUARTERS","slots":[{"launch":"a.exe"},5,{"name":"x"},{"launch":"b.exe"},{"launch":"c.exe"}]},
+                7,
+                {"layout":"hexagons","slots":[{"launch":"d.exe","show":"min"},{"launch":"e.exe"}]},
+                {"slots":"no"},
+                {"desktop":2,"layout":"halves","slots":[null,{"launch":"f.exe","show":"min"}]}]}}"#,
+        )
+        .unwrap();
+        let l = &s.layout;
+        assert_eq!(l.desktops.len(), 4, "the number 7 is skipped");
+        // The desktop numbered 2 by hand is sorted in (stable: after the first one, also number 2).
+        assert_eq!(l.desktops.iter().map(|d| d.template).collect::<Vec<_>>(), vec![
+            Template::Quarters,
+            Template::Halves,
+            Template::Full,
+            Template::Full
+        ]);
+        assert_eq!(
+            flat(l),
+            vec![
+                (2, "a.exe".into(), Template::Quarters, 0),
+                (2, "b.exe".into(), Template::Quarters, 3),
+                (3, "f.exe".into(), Template::Halves, 1),
+                (4, "d.exe".into(), Template::Full, 0),
+            ],
+            "junk slots are empty, slots beyond the zones are dropped, an unknown template is full screen"
+        );
+        let r = l.rules();
+        assert_eq!((r[0].show, r[3].show), (WindowShow::Max, WindowShow::Min), "window state only for full screen");
+        assert_eq!(l.desktop_count, 5);
+    }
+
+    #[test]
+    fn changing_the_template_keeps_the_slots_by_position() {
+        let mut d = DesktopPlan::new(Template::Quarters);
+        d.slots[0] = Some(rule("a.exe"));
+        d.slots[3] = Some(rule("b.exe"));
+        d.set_template(Template::Thirds);
+        assert_eq!(d.slots.len(), 3);
+        assert_eq!(d.apps().map(|r| r.process.as_str()).collect::<Vec<_>>(), vec!["a.exe"]);
+        d.set_template(Template::Quarters);
+        assert_eq!(d.slots.len(), 4);
+        assert!(d.slots[3].is_none());
+    }
+
+    #[test]
+    fn doubles_that_may_not_open_a_second_window_are_named() {
+        let mut l = Layout::default();
+        let mut d = DesktopPlan::new(Template::Quarters);
+        d.slots[0] = Some(LayoutRule::new(2, "Chrome", r"C:\c\chrome.exe", "--new-window a", "").unwrap());
+        d.slots[1] = Some(LayoutRule::new(2, "Chrome", r"C:\c\chrome.exe", "--new-window b", "").unwrap());
+        d.slots[2] = Some(LayoutRule::new(2, "Store", r"shell:AppsFolder\X_1!App", "--a", "x.exe").unwrap());
+        d.slots[3] = Some(LayoutRule::new(2, "Store", r"shell:AppsFolder\X_1!App", "--b", "x.exe").unwrap());
+        l.desktops.push(d);
+        // The same app twice without parameters, on two desktops.
+        l.desktops.push(DesktopPlan::full(rule("notes.exe")));
+        l.desktops.push(DesktopPlan::full(rule("notes.exe")));
+        l.desktops.push(DesktopPlan::full(rule("once.exe")));
+        l.renumber();
+        assert_eq!(l.single_instance_doubles(), vec!["Store".to_string(), "notes.exe".to_string()]);
     }
 
     #[test]
@@ -932,22 +1250,25 @@ mod tests {
         assert!(!l.enabled, "wrong type keeps the default");
         assert_eq!(l.desktop_count, 20, "clamped");
         assert_eq!(l.start_delay_ms, 5000, "negative value keeps the default");
-        let got: Vec<(u32, &str, &str)> =
-            l.rules.iter().map(|r| (r.desktop, r.process.as_str(), r.launch.as_str())).collect();
+        let got: Vec<(u32, String, String)> = l.rules().into_iter().map(|r| (r.desktop, r.process, r.launch)).collect();
         assert_eq!(
             got,
-            vec![(2, "one.exe", r"C:\a\One.exe"), (3, "two.exe", "two.exe"), (4, "one.exe", r"C:\a\One.exe")]
+            vec![
+                (2, "one.exe".into(), r"C:\a\One.exe".into()),
+                (3, "two.exe".into(), "two.exe".into()),
+                (4, "one.exe".into(), r"C:\a\One.exe".into())
+            ]
         );
         // `layout` of the wrong type is ignored altogether.
         assert_eq!(Settings::from_json(r#"{"layout":[1]}"#).unwrap().layout, Layout::default());
     }
 
     #[test]
-    fn layout_count_follows_the_highest_rule() {
+    fn layout_count_follows_the_planned_desktops() {
         let mut l = Layout::default();
         assert_eq!(l.count(), 1);
         l.desktop_count = 2;
-        l.rules.push(LayoutRule::new(5, "", "a.exe", "", "").unwrap());
+        l.desktops = (0..4).map(|_| DesktopPlan::full(rule("a.exe"))).collect();
         assert_eq!(l.count(), 5);
         assert!(LayoutRule::new(1, "x", "", "", "").is_none());
         assert_eq!(file_name_lower(r#""C:\X y\App.EXE""#), "app.exe");
@@ -962,29 +1283,28 @@ mod tests {
                 {"desktop":3,"launch":"b.exe"},{"desktop":1,"launch":"z.exe"}]}}"#,
         )
         .unwrap();
-        let got: Vec<(u32, &str)> = s.layout.rules.iter().map(|r| (r.desktop, r.process.as_str())).collect();
-        assert_eq!(got, vec![(2, "z.exe"), (3, "a.exe"), (4, "b.exe"), (5, "c.exe")]);
-        assert_eq!(s.layout.desktop_count, 5, "raised to applications + 1");
+        let got: Vec<(u32, String)> = s.layout.rules().into_iter().map(|r| (r.desktop, r.process)).collect();
+        assert_eq!(got, vec![(2, "z.exe".into()), (3, "a.exe".into()), (4, "b.exe".into()), (5, "c.exe".into())]);
+        assert_eq!(s.layout.desktop_count, 5, "raised to planned desktops + 1");
         // Reordering in the list renumbers; saving writes the numbers from the order.
         let mut l = s.layout.clone();
-        l.rules.swap(0, 3);
+        l.desktops.swap(0, 3);
         l.renumber();
-        let got: Vec<(u32, &str)> = l.rules.iter().map(|r| (r.desktop, r.process.as_str())).collect();
-        assert_eq!(got, vec![(2, "c.exe"), (3, "a.exe"), (4, "b.exe"), (5, "z.exe")]);
-        l.rules.swap(1, 2); // not renumbered in memory: the file still follows the order
+        let got: Vec<(u32, String)> = l.rules().into_iter().map(|r| (r.desktop, r.process)).collect();
+        assert_eq!(got, vec![(2, "c.exe".into()), (3, "a.exe".into()), (4, "b.exe".into()), (5, "z.exe".into())]);
+        l.desktops.swap(1, 2); // not renumbered in memory: the file still follows the order
         let text = Settings { layout: l, ..Settings::default() }.to_json();
         let back = Settings::from_json(&text).unwrap().layout;
-        let got: Vec<(u32, &str)> = back.rules.iter().map(|r| (r.desktop, r.process.as_str())).collect();
-        assert_eq!(got, vec![(2, "c.exe"), (3, "b.exe"), (4, "a.exe"), (5, "z.exe")]);
+        let got: Vec<(u32, String)> = back.rules().into_iter().map(|r| (r.desktop, r.process)).collect();
+        assert_eq!(got, vec![(2, "c.exe".into()), (3, "b.exe".into()), (4, "a.exe".into()), (5, "z.exe".into())]);
     }
 
     #[test]
     fn layout_desktop_count_has_a_minimum_but_may_be_higher() {
         let mut l = Layout::default();
         assert_eq!((l.min_count(), l.count()), (1, 1));
-        l.rules.push(LayoutRule::new(2, "", "a.exe", "", "").unwrap());
-        l.rules.push(LayoutRule::new(3, "", "b.exe", "", "").unwrap());
-        assert_eq!((l.min_count(), l.count()), (3, 3), "two apps need three desktops");
+        l.desktops = vec![DesktopPlan::full(rule("a.exe")), DesktopPlan::new(Template::Halves)];
+        assert_eq!((l.min_count(), l.count()), (3, 3), "two planned desktops need three");
         l.desktop_count = 6;
         assert_eq!(l.count(), 6, "empty desktops on top are allowed");
         l.desktop_count = 1;
@@ -1016,19 +1336,22 @@ mod tests {
             packaged_launch(OLK, read).as_deref(),
             Some(r"shell:AppsFolder\Microsoft.OutlookForWindows_8wekyb3d8bbwe!Microsoft.OutlookforWindows")
         );
-        // Old settings.json: the WindowsApps path is replaced, other rules are kept.
-        let mut l = Layout::default();
-        l.rules.push(LayoutRule::new(2, "Outlook", OLK, "", "olk.exe").unwrap());
-        l.rules.push(LayoutRule::new(3, "", r"C:\a\b.exe", "", "").unwrap());
+        // Old settings.json: the WindowsApps path is replaced, other rules are kept (also in zones).
+        let mut l = full_layout(vec![LayoutRule::new(2, "Outlook", OLK, "", "olk.exe").unwrap()]);
+        let mut d = DesktopPlan::new(Template::Halves);
+        d.slots[1] = Some(LayoutRule::new(3, "", r"C:\a\b.exe", "", "").unwrap());
+        d.slots[0] = Some(LayoutRule::new(3, "", OLK, "", "olk.exe").unwrap());
+        l.desktops.push(d);
         assert!(l.migrate_packaged(read));
-        assert_eq!(l.rules[0].launch, apps_folder("Microsoft.OutlookForWindows_8wekyb3d8bbwe!Microsoft.OutlookforWindows"));
-        assert_eq!((l.rules[0].process.as_str(), l.rules[1].launch.as_str()), ("olk.exe", r"C:\a\b.exe"));
+        let r = l.rules();
+        let want = apps_folder("Microsoft.OutlookForWindows_8wekyb3d8bbwe!Microsoft.OutlookforWindows");
+        assert_eq!((r[0].launch.as_str(), r[1].launch.as_str()), (want.as_str(), want.as_str()));
+        assert_eq!((r[0].process.as_str(), r[2].launch.as_str()), ("olk.exe", r"C:\a\b.exe"));
         assert!(!l.migrate_packaged(read), "idempotent");
         // Unreadable manifest: the path stays.
-        let mut l2 = Layout::default();
-        l2.rules.push(LayoutRule::new(2, "", OLK, "", "olk.exe").unwrap());
+        let mut l2 = full_layout(vec![LayoutRule::new(2, "", OLK, "", "olk.exe").unwrap()]);
         assert!(!l2.migrate_packaged(|_: &str| None));
-        assert_eq!(l2.rules[0].launch, OLK);
+        assert_eq!(l2.rules()[0].launch, OLK);
     }
 
     #[test]
@@ -1054,13 +1377,13 @@ mod tests {
     fn window_show_of_layout_rules_defaults_to_maximized() {
         // Files of 0.2.1 and older have no "show": maximized, as before.
         let old = Settings::from_json(r#"{"layout":{"enabled":true,"rules":[{"desktop":2,"launch":"a.exe"}]}}"#).unwrap();
-        assert_eq!(old.layout.rules[0].show, WindowShow::Max);
+        assert_eq!(old.layout.rules()[0].show, WindowShow::Max);
         let s = Settings::from_json(
             r#"{"layout":{"rules":[{"launch":"a.exe","show":"normal"},{"launch":"b.exe","show":" MIN "},
                 {"launch":"c.exe","show":"max"},{"launch":"d.exe","show":"huge"},{"launch":"e.exe","show":3}]}}"#,
         )
         .unwrap();
-        let got: Vec<WindowShow> = s.layout.rules.iter().map(|r| r.show).collect();
+        let got: Vec<WindowShow> = s.layout.rules().iter().map(|r| r.show).collect();
         assert_eq!(got, vec![WindowShow::Normal, WindowShow::Min, WindowShow::Max, WindowShow::Max, WindowShow::Max]);
         let text = s.to_json();
         assert!(text.contains(r#""show": "normal""#) && text.contains(r#""show": "min""#) && text.contains(r#""show": "max""#));
@@ -1072,7 +1395,7 @@ mod tests {
         assert_eq!(WindowShow::from_index(9), WindowShow::Max);
         // The same app twice with another state stays two rules.
         let two = Settings::from_json(r#"{"layout":{"rules":[{"launch":"a.exe"},{"launch":"a.exe","show":"min"}]}}"#).unwrap();
-        assert_eq!(two.layout.rules.len(), 2);
+        assert_eq!(two.layout.rules().len(), 2);
     }
 
     #[test]
