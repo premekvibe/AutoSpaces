@@ -472,6 +472,11 @@ pub fn registry_wallpaper(g: &Guid) -> Option<String> {
     reg_string(&desktop_key(g), "Wallpaper").filter(|p| !p.is_empty())
 }
 
+/// The one wallpaper of the session (`HKCU\Control Panel\Desktop\WallPaper`).
+pub fn global_wallpaper() -> Option<String> {
+    reg_string(r"Control Panel\Desktop", "WallPaper").filter(|p| !p.is_empty())
+}
+
 fn cache_get(key: &str) -> Option<Vec<u32>> {
     unsafe { (*std::ptr::addr_of!(WALL_CACHE)).iter().find(|e| e.0 == key).map(|e| e.1.clone()) }
 }
