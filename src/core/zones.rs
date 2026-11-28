@@ -186,8 +186,9 @@ pub fn fits(frame: Rect, zone: Rect) -> bool {
 }
 
 /// "Roughly in the zone" for recognising a layout: every edge within 1/20 of the shorter side of the
-/// work area (at least 16 px; 52 px on a 1920 x 1040 work area).
-fn near(frame: Rect, zone: Rect, work: Rect) -> bool {
+/// work area (at least 16 px; 52 px on a 1920 x 1040 work area). Also used to tell whether a
+/// window of a layout went back to its zone after being restored (plan 12.19).
+pub fn near(frame: Rect, zone: Rect, work: Rect) -> bool {
     let tol = (work.w().min(work.h()) / 20).max(16);
     (frame.left - zone.left).abs() <= tol
         && (frame.top - zone.top).abs() <= tol

@@ -63,6 +63,8 @@ const ZONE_SETTLE_MS: u64 = 3_000;
 /// profile's `startDelayMs` applies to the whole sequence instead.
 const MANUAL_START_MS: u32 = 500;
 const MAX_NOTES: usize = 512;
+/// Last known frames of normal windows kept for recognising window layouts (plan 12.19).
+const MAX_FRAMES: usize = 512;
 
 /// Pseudo window handles of the host timers (never real windows).
 pub fn layout_tick_token() -> HWND {
@@ -239,6 +241,25 @@ pub struct Orchestrator<B: DesktopBackend, W: WindowSystem> {
     overlay_ok: bool,
     /// Writes `state.json` at once (the host's file writer); None in tests that do not care.
     persist: Option<Box<dyn FnMut(String)>>,
+    /// Plan 12.19: the visible frame each app window had when it was last a normal window (kept up
+    /// to date by its location events). A maximized window's own rectangle and the normal position
+    /// of `GetWindowPlacement` (the pre-snap one for a snapped window) do not say which zone it
+    /// came from; this does.
+    last_frames: HashMap<HWND, Rect>,
+    /// `last_frames` was filled once from all windows (the ones arranged before we ran).
+    frames_seeded: bool,
+    /// Members of a window layout maximized on their desktop (plan 12.19): the zone each goes back
+    /// to when restored (only when Windows does not put it there itself).
+    stay_zones: HashMap<HWND, Rect>,
+}
+
+/// A window layout found on a desktop (plan 12.19).
+struct DeskLayout {
+    template: Template,
+    /// Windows lying in its zones.
+    windows: usize,
+    /// The zone of the window being looked at; None = not a member of the layout.
+    own_zone: Option<Rect>,
 }
 
 impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
@@ -282,6 +303,9 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
             extra: Vec::new(),
             overlay_ok: false,
             persist: None,
+            last_frames: HashMap::new(),
+            frames_seeded: false,
+            stay_zones: HashMap::new(),
         }
     }
 
@@ -445,6 +469,8 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
                 self.struck.remove(&hwnd);
                 self.shown.remove(&hwnd);
                 self.view_waits.remove(&hwnd);
+                self.last_frames.remove(&hwnd);
+                self.stay_zones.remove(&hwnd);
             }
             return None;
         }
@@ -463,6 +489,8 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
                 self.struck.remove(&hwnd);
                 self.shown.remove(&hwnd);
                 self.view_waits.remove(&hwnd);
+                self.last_frames.remove(&hwnd);
+                self.stay_zones.remove(&hwnd);
             }
             Event::Show => {
                 let now = self.ws.now();
@@ -473,6 +501,12 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
             }
             _ => {}
         }
+        // Where a normal window lies (plan 12.19); not while it is being dragged (only its end).
+        if matches!(ev, Event::LocationChange | Event::Show | Event::MoveSizeEnd)
+            && (ev == Event::MoveSizeEnd || self.dragging != Some(hwnd))
+        {
+            self.track_frame(hwnd);
+        }
         if self.layout.is_some() && !matches!(ev, Event::Destroy | Event::Hide) {
             if let Some(sch) = self.layout_event(hwnd) {
                 return sch; // a window of a profile app: placed (or about to be) by the profile
@@ -481,6 +515,8 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
         match ev {
             Event::MoveSizeStart => {
                 self.dragging = Some(hwnd);
+                // Dragged out of maximized: the user puts it somewhere, not back into its zone.
+                self.stay_zones.remove(&hwnd);
                 return None;
             }
             Event::MoveSizeEnd | Event::Destroy => {
@@ -571,10 +607,102 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
                     self.try_enter(hwnd, state, ev)
                 }
             }
-            _ => {
+            State::Minimized => {
                 self.rejected.remove(&hwnd);
+                None // a member of a layout restored later still goes back to its zone
+            }
+            State::Normal => {
+                self.rejected.remove(&hwnd);
+                self.back_to_zone(hwnd);
                 None
             }
+            _ => {
+                self.rejected.remove(&hwnd);
+                self.stay_zones.remove(&hwnd);
+                None
+            }
+        }
+    }
+
+    // ------------------------------------------------------------ window layouts of a desktop (plan 12.19)
+
+    /// Remembers the visible frame of a normal app window (cheap: a few user32 calls and one DWM
+    /// attribute per location event of a top-level window; nothing polls).
+    fn track_frame(&mut self, hwnd: HWND) {
+        self.seed_frames();
+        if self.ws.state(hwnd) != State::Normal || !self.ws.is_candidate(hwnd) {
+            return; // a maximized / minimized window keeps the frame it had as a normal one
+        }
+        let Some(f) = self.ws.frame_rect(hwnd) else { return };
+        if self.last_frames.len() >= MAX_FRAMES && !self.last_frames.contains_key(&hwnd) {
+            let ws = &self.ws;
+            self.last_frames.retain(|w, _| ws.state(*w) != State::Destroyed);
+            if self.last_frames.len() >= MAX_FRAMES {
+                self.last_frames.clear();
+            }
+        }
+        self.last_frames.insert(hwnd, f);
+    }
+
+    /// Once: the frames of all normal app windows (snapped before AutoSpaces started).
+    fn seed_frames(&mut self) {
+        if self.frames_seeded {
+            return;
+        }
+        self.frames_seeded = true;
+        for w in self.ws.app_windows() {
+            if self.ws.state(w) == State::Normal {
+                if let Some(f) = self.ws.frame_rect(w) {
+                    self.last_frames.insert(w, f);
+                }
+            }
+        }
+    }
+
+    /// The window layout the app windows of `origin` form together with `hwnd` (plan 12.19): normal
+    /// windows by their frame now, maximized ones (members maximized earlier) and `hwnd` by their
+    /// last frame as a normal window; minimized and full-screen windows do not count. Same
+    /// recognition as "Use current layout" (`zones::recognize`, primary monitor, at least two
+    /// windows in zones, never the full-screen template). `hwnd` comes first: as the window just
+    /// maximized it is the topmost one, so it takes a zone it shares with a window behind it.
+    fn desktop_layout(&mut self, hwnd: HWND, origin: Guid, cur: Guid) -> Option<DeskLayout> {
+        self.seed_frames();
+        let work = self.ws.work_area()?;
+        let mut frames: Vec<Rect> = Vec::new();
+        let own = self.last_frames.get(&hwnd).copied();
+        frames.extend(own);
+        for w in self.real_windows() {
+            if w == hwnd || self.backend.window_desktop(w) != Some(origin) || (origin == cur && self.ws.is_cloaked(w)) {
+                continue;
+            }
+            let f = match self.ws.state(w) {
+                State::Normal => self.ws.frame_rect(w),
+                State::Maximized => self.last_frames.get(&w).copied(),
+                _ => None,
+            };
+            frames.extend(f);
+        }
+        let (template, slots) = zones::recognize(&frames, work)?;
+        let own_zone = if own.is_some() {
+            slots.iter().position(|s| *s == Some(0)).and_then(|i| zones::zone(template, work, i))
+        } else {
+            None
+        };
+        Some(DeskLayout { template, windows: slots.iter().flatten().count(), own_zone })
+    }
+
+    /// A member of a layout that was maximized on its desktop is a normal window again: when
+    /// Windows did not put it back into its zone (an app restoring to the position before it was
+    /// snapped), it goes there now, once, without activation.
+    fn back_to_zone(&mut self, hwnd: HWND) {
+        let Some(z) = self.stay_zones.remove(&hwnd) else { return };
+        let Some(work) = self.ws.work_area() else { return };
+        if self.ws.frame_rect(hwnd).is_some_and(|f| zones::near(f, z, work)) {
+            return;
+        }
+        let zl = rect_label(z);
+        if self.ws.place_in_zone(hwnd, z) {
+            self.note(format!("layout: {:#x} restored: back to its zone {zl}", hwnd as usize));
         }
     }
 
@@ -907,8 +1035,33 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
         // A window gets a desktop of its own only when another maximized / full-screen window
         // is on its desktop; alone it stays (until restored and maximized again). The startup
         // arrangement decides this for the whole group beforehand (`arrange`).
+        // Plan 12.19: a desktop whose windows form a window layout is full. A member of the layout
+        // stays (maximized over the others, back into its zone when restored); any other window
+        // gets a desktop of its own.
         self.sync_list();
-        if !self.bulk && !self.always_own() && !self.shares_desktop(hwnd, origin, cur) {
+        let layout = if self.always_own() { None } else { self.desktop_layout(hwnd, origin, cur) };
+        if let Some(l) = &layout {
+            let (desk, code, k) = (self.desk_label(origin), l.template.code(), l.windows);
+            if let Some(z) = l.own_zone {
+                self.note(format!(
+                    "layout: desktop {desk} full (template {code}, {k} windows): {:#x} {process} is a member -> stay",
+                    hwnd as usize
+                ));
+                if self.stay_zones.len() >= MAX_TRACKED {
+                    self.stay_zones.clear();
+                }
+                self.stay_zones.insert(hwnd, z);
+                self.rejected.insert(hwnd);
+                return None;
+            }
+            if !self.bulk {
+                self.note(format!(
+                    "layout: desktop {desk} full (template {code}, {k} windows): {:#x} {process} is not a member -> move",
+                    hwnd as usize
+                ));
+            }
+        }
+        if layout.is_none() && !self.bulk && !self.always_own() && !self.shares_desktop(hwnd, origin, cur) {
             self.note(format!("skip {:#x} {process}: no other maximized window on its desktop; it stays", hwnd as usize));
             self.rejected.insert(hwnd);
             return None;
@@ -1630,6 +1783,7 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
         }
         let frame = self.ws.frame_rect(hwnd);
         if state == State::Normal && frame.is_some_and(|f| zones::fits(f, z)) {
+            self.last_frames.insert(hwnd, z); // a known member of its desktop's layout (plan 12.19)
             if now >= run.claimed[c].until {
                 run.claimed[c].apply = false;
                 self.note(format!("layout: {:#x} stays in its zone", hwnd as usize));
@@ -1889,7 +2043,13 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
             .layout
             .rules()
             .iter()
-            .any(|r| r.process == process && ordinary.get(r.desktop.max(1) as usize - 1) == Some(&desktop))
+            .any(|r| {
+                // A desktop with a window layout decides by its layout instead (plan 12.19): a
+                // further window of a zone app that is not in a zone gets a desktop of its own.
+                r.template == Template::Full
+                    && r.process == process
+                    && ordinary.get(r.desktop.max(1) as usize - 1) == Some(&desktop)
+            })
     }
 
     /// Current desktops and windows as a profile (plan 12.7, 12.16, 12.18): (number of desktops,
@@ -2408,6 +2568,7 @@ impl<B: DesktopBackend, W: WindowSystem> Orchestrator<B, W> {
     /// fixes the baseline B. Empty helper desktops are removed, desktops whose window lives are
     /// re-adopted. After a crash (stored spaces exist) B is the stored one, else the current count.
     pub fn adopt(&mut self, stored: Vec<ManagedSpace>, stored_baseline: Option<usize>) {
+        self.seed_frames(); // windows snapped before AutoSpaces started (plan 12.19)
         let Ok(list) = self.backend.desktops() else { return };
         self.last_list = list.clone();
         self.baseline = list.len().max(1);

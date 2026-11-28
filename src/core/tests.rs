@@ -3707,17 +3707,18 @@ fn zone_windows_trigger_no_move_and_occupy_their_desktop() {
     o.start_layout();
     settle(&w, &mut o);
     assert_eq!((w.state(1), w.state(2)), (State::Normal, State::Normal));
-    // Another window maximized next to them on desktop 2: zone windows are no maximized windows,
-    // so it stays (plan 12.1: alone among maximized windows).
+    // Another window maximized next to them on desktop 2: the desktop is full with its layout
+    // (plan 12.19), so it gets a desktop of its own, and comes back when restored.
     w.current.set(g(2));
     put(&w, 3, 2);
     w.set_state(3, State::Maximized);
     ev(&w, &mut o, 3, Loc);
-    assert!(!o.is_managed(h(3)));
-    assert_eq!(list(&w), vec![1, 2]);
-    // The app of a zone window maximizes it: it keeps its desktop (placed by the profile).
+    assert!(o.is_managed(h(3)));
+    assert_eq!((list(&w), w.desk_of(3)), (vec![1, 2, 3], g(3)));
     w.set_state(3, State::Normal);
     ev(&w, &mut o, 3, Loc);
+    assert_eq!((list(&w), w.desk_of(3), w.current.get()), (vec![1, 2], g(2), g(2)));
+    // The app of a zone window maximizes it: it keeps its desktop (placed by the profile).
     w.set_state(1, State::Maximized);
     ev(&w, &mut o, 1, Loc);
     assert!(!o.is_managed(h(1)));
@@ -3816,4 +3817,205 @@ fn capture_layout_recognizes_window_layouts() {
     let (_, desks) = o.capture_layout();
     assert_eq!(desks[0].template, Template::Full);
     assert_eq!(desks[0].slots[0].as_ref().unwrap().process, "trade.exe");
+}
+// ---------------------------------------------------------------- a desktop with a window layout is full (plan 12.19)
+
+/// Desktop 2 of 2 viewed, with normal windows `apps` (id, frame), the rule tests' orchestrator
+/// (a window gets its own desktop only when its desktop is shared) and the work area known.
+fn layout_desk(apps: &[(usize, Rect)]) -> (Rc<World>, Orch) {
+    let w = World::new(2);
+    w.work.set(Some(WORK));
+    put(&w, 90, 1);
+    for &(id, f) in apps {
+        put(&w, id, 2);
+        w.frames.borrow_mut().insert(id, f);
+    }
+    w.current.set(g(2));
+    let mut o = started(&w);
+    o.always_own_desktop = false;
+    (w, o)
+}
+
+/// The user maximizes window `id`: its frame becomes the work area (as with Windows: the last
+/// normal frame is no longer readable from the window).
+fn maximize(w: &World, o: &mut Orch, id: usize) {
+    w.set_state(id, State::Maximized);
+    w.frames.borrow_mut().insert(id, WORK);
+    ev(w, o, id, Loc);
+}
+
+#[test]
+fn layout_member_maximized_stays_and_goes_back_to_its_zone() {
+    use super::settings::Template;
+    let t = |i| zone_of(Template::Thirds, i);
+    // Outlook | WhatsApp | Signal snapped by hand into three columns.
+    let (w, mut o) = layout_desk(&[(1, t(0)), (2, t(1)), (3, t(2))]);
+    maximize(&w, &mut o, 2);
+    assert!(!o.is_managed(h(2)));
+    assert_eq!((list(&w), w.desk_of(2), w.current.get()), (vec![1, 2], g(2), g(2)));
+    assert!(logged(&mut o, "layout: desktop #2 00000002-0000-0000-0000-000000000000 full (template thirds, 3 windows): 0x2 app.exe is a member -> stay"));
+    // A second member maximized while the first one still is: it stays too.
+    maximize(&w, &mut o, 3);
+    assert!(!o.is_managed(h(3)));
+    assert_eq!((list(&w), w.desk_of(3)), (vec![1, 2], g(2)));
+    // Restored: Windows put it back into its zone, nothing to do.
+    w.set_state(3, State::Normal);
+    w.frames.borrow_mut().insert(3, t(2));
+    ev(&w, &mut o, 3, Loc);
+    assert!(w.zoned.borrow().is_empty());
+    // Restored to where it was before it was snapped: AutoSpaces puts it back into its zone, once.
+    w.set_state(2, State::Normal);
+    w.frames.borrow_mut().insert(2, Rect::new(300, 200, 900, 700));
+    ev(&w, &mut o, 2, Loc);
+    assert_eq!(*w.zoned.borrow(), vec![(2, t(1))]);
+    ev(&w, &mut o, 2, Loc);
+    assert_eq!(w.zoned.borrow().len(), 1);
+    assert_eq!(list(&w), vec![1, 2]);
+}
+
+#[test]
+fn window_not_in_the_layout_maximized_gets_its_own_desktop_and_returns() {
+    use super::settings::Template;
+    let hv = |i| zone_of(Template::Halves, i);
+    let (w, mut o) = layout_desk(&[(1, hv(0)), (2, hv(1))]);
+    // A free-floating window over the two halves (no other maximized window on the desktop).
+    put(&w, 5, 2);
+    w.frames.borrow_mut().insert(5, Rect::new(400, 300, 1200, 800));
+    ev(&w, &mut o, 5, Event::Show);
+    maximize(&w, &mut o, 5);
+    assert!(o.is_managed(h(5)));
+    assert_eq!((list(&w), w.desk_of(5), w.current.get()), (vec![1, 2, 3], g(3), g(3)));
+    assert!(logged(&mut o, "full (template halves, 2 windows): 0x5 app.exe is not a member -> move"));
+    // Restored: back on desktop 2 with the user, the helper desktop is gone.
+    w.set_state(5, State::Normal);
+    w.frames.borrow_mut().insert(5, Rect::new(400, 300, 1200, 800));
+    ev(&w, &mut o, 5, Loc);
+    assert!(!o.is_managed(h(5)));
+    assert_eq!((list(&w), w.desk_of(5), w.current.get()), (vec![1, 2], g(2), g(2)));
+    assert!(w.zoned.borrow().is_empty(), "the layout windows are left alone");
+    // Maximized again and closed there: the helper desktop goes, the user is back on desktop 2.
+    maximize(&w, &mut o, 5);
+    assert_eq!((list(&w).len(), w.desk_of(5)), (3, w.last()));
+    w.set_state(5, State::Destroyed);
+    ev(&w, &mut o, 5, Event::Destroy);
+    assert_eq!((list(&w), w.current.get()), (vec![1, 2], g(2)));
+}
+
+#[test]
+fn window_snapped_by_hand_is_a_member_and_tracked_frames_are_used() {
+    use super::settings::Template;
+    let q = |i| zone_of(Template::Quarters, i);
+    // Two quarters snapped before AutoSpaces knew the desktop (seeded), a third window snapped
+    // later by the user (its location event is seen).
+    let (w, mut o) = layout_desk(&[(1, q(0)), (2, q(1))]);
+    put(&w, 3, 2);
+    w.frames.borrow_mut().insert(3, Rect::new(500, 400, 1100, 900));
+    ev(&w, &mut o, 3, Event::Show);
+    w.frames.borrow_mut().insert(3, Rect::new(2, 522, 958, 1040)); // snapped bottom left
+    ev(&w, &mut o, 3, Loc);
+    maximize(&w, &mut o, 3);
+    assert!(!o.is_managed(h(3)));
+    assert!(logged(&mut o, "full (template quarters, 3 windows): 0x3 app.exe is a member -> stay"));
+    // Dragged out of maximized by the user: not put back into its zone.
+    ev(&w, &mut o, 3, Event::MoveSizeStart);
+    w.set_state(3, State::Normal);
+    w.frames.borrow_mut().insert(3, Rect::new(100, 100, 700, 600));
+    ev(&w, &mut o, 3, Event::MoveSizeEnd);
+    assert!(w.zoned.borrow().is_empty());
+    // A window snapped on top of a member is a member too (it takes the zone).
+    put(&w, 4, 2);
+    w.frames.borrow_mut().insert(4, q(1));
+    ev(&w, &mut o, 4, Event::Show);
+    maximize(&w, &mut o, 4);
+    assert!(!o.is_managed(h(4)));
+    assert_eq!(list(&w), vec![1, 2]);
+}
+
+#[test]
+fn full_screen_only_or_dissolved_layout_is_no_layout() {
+    use super::settings::Template;
+    let hv = |i| zone_of(Template::Halves, i);
+    // One window alone in a half and one floating: no layout, the ordinary rule (it stays).
+    let (w, mut o) = layout_desk(&[(1, hv(0)), (2, Rect::new(400, 300, 1200, 800))]);
+    maximize(&w, &mut o, 2);
+    assert!(!o.is_managed(h(2)));
+    assert!(!logged(&mut o, "layout: desktop"));
+    // A window covering the whole work area as a normal window (full-screen template) plus one
+    // floating: no layout either.
+    let (w, mut o) = layout_desk(&[(1, WORK), (2, Rect::new(400, 300, 1200, 800))]);
+    maximize(&w, &mut o, 2);
+    assert!(!o.is_managed(h(2)));
+    // Two halves, then one of them is minimized and the other closed: the layout dissolved, a
+    // floating window maximized there stays (no other maximized window).
+    let (w, mut o) = layout_desk(&[(1, hv(0)), (2, hv(1)), (3, Rect::new(400, 300, 1200, 800))]);
+    w.set_state(1, State::Minimized);
+    ev(&w, &mut o, 1, Event::MinimizeStart);
+    maximize(&w, &mut o, 3);
+    assert!(!o.is_managed(h(3)), "minimized members do not count");
+    w.set_state(3, State::Normal);
+    w.frames.borrow_mut().insert(3, Rect::new(400, 300, 1200, 800));
+    ev(&w, &mut o, 3, Loc);
+    w.set_state(1, State::Normal);
+    ev(&w, &mut o, 1, Loc);
+    vanish(&w, &mut o, 2);
+    maximize(&w, &mut o, 3);
+    assert!(!o.is_managed(h(3)), "a closed member leaves one window in a zone: no layout");
+    assert_eq!(w.desk_of(3), g(2));
+    // Moved to another desktop: does not count either. Back to two halves, then one moves away.
+    let (w, mut o) = layout_desk(&[(1, hv(0)), (2, hv(1)), (3, Rect::new(400, 300, 1200, 800))]);
+    w.wins.borrow_mut().get_mut(&2).unwrap().desktop = g(1);
+    maximize(&w, &mut o, 3);
+    assert!(!o.is_managed(h(3)));
+    // Unknown work area: no layout can be recognized, ordinary rules.
+    let (w, mut o) = layout_desk(&[(1, hv(0)), (2, hv(1)), (3, Rect::new(400, 300, 1200, 800))]);
+    w.work.set(None);
+    maximize(&w, &mut o, 3);
+    assert!(!o.is_managed(h(3)));
+}
+
+#[test]
+fn layout_placed_by_the_profile_is_full_for_other_windows_of_its_apps() {
+    use super::settings::Template;
+    let w = World::new(1);
+    w.work.set(Some(WORK));
+    for (id, p) in [(1, "mail.exe"), (2, "trade.exe")] {
+        put(&w, id, 1);
+        proc_of(&w, id, p);
+    }
+    let mut o = started(&w);
+    o.always_own_desktop = false;
+    o.apply_settings(zoned_profile(&[(Template::Halves, &[("mail.exe", ""), ("trade.exe", "")])]));
+    o.start_layout();
+    settle(&w, &mut o);
+    // A second mail.exe window (a message) opened on desktop 2 and maximized: not in a zone, so
+    // it gets a desktop of its own although its app has a zone there.
+    w.current.set(g(2));
+    put(&w, 3, 2);
+    proc_of(&w, 3, "mail.exe");
+    w.frames.borrow_mut().insert(3, Rect::new(500, 300, 1300, 900));
+    ev(&w, &mut o, 3, Event::Show);
+    maximize(&w, &mut o, 3);
+    assert!(o.is_managed(h(3)));
+    assert_eq!(w.desk_of(3), g(3));
+    // The zone window of mail.exe maximized meanwhile (Windows reports its frame maximized): a
+    // member, it stays.
+    maximize(&w, &mut o, 1);
+    assert!(!o.is_managed(h(1)));
+    assert_eq!(w.desk_of(1), g(2));
+    // A full-screen profile desktop keeps the old rule: further windows of its app stay.
+    let w = World::new(1);
+    w.work.set(Some(WORK));
+    put(&w, 1, 1);
+    proc_of(&w, 1, "mail.exe");
+    let mut o = started(&w);
+    o.always_own_desktop = false;
+    o.apply_settings(zoned_profile(&[(Template::Full, &[("mail.exe", "")])]));
+    o.start_layout();
+    settle(&w, &mut o);
+    w.current.set(g(2));
+    put(&w, 3, 2);
+    proc_of(&w, 3, "mail.exe");
+    maximize(&w, &mut o, 3);
+    assert!(!o.is_managed(h(3)));
+    assert_eq!(w.desk_of(3), g(2));
 }
