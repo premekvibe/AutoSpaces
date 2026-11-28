@@ -1,7 +1,7 @@
 # yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.28.0.schema.json
 
 PackageIdentifier: PremyslVavrousek.AutoSpaces
-PackageVersion: 0.3.0
+PackageVersion: 0.3.1
 MinimumOSVersion: 10.0.17763.0
 InstallerType: inno
 InstallModes:
@@ -10,18 +10,18 @@ InstallModes:
 - silentWithProgress
 UpgradeBehavior: install
 ProductCode: '{30AB1B41-D258-4DAA-A410-484D902466A8}_is1'
-ReleaseDate: 2026-11-27
+ReleaseDate: 2026-11-28
 Installers:
 - Architecture: x64
   Scope: user
-  InstallerUrl: https://github.com/premekvibe/AutoSpaces/releases/download/v0.3.0/AutoSpaces-Setup-0.3.0.exe
-  InstallerSha256: 65B3E7742ECA33CC7D8D18F4EB6F16FD8E06D74E46DFDEBBBBE5AA00443DA039
+  InstallerUrl: https://github.com/premekvibe/AutoSpaces/releases/download/v0.3.1/AutoSpaces-Setup-0.3.1.exe
+  InstallerSha256: 92C84C382369102111D84DF673431E269DFADBD965E6D1D26845EA69E0C73780
   InstallerSwitches:
     Custom: /CURRENTUSER
 - Architecture: x64
   Scope: machine
-  InstallerUrl: https://github.com/premekvibe/AutoSpaces/releases/download/v0.3.0/AutoSpaces-Setup-0.3.0.exe
-  InstallerSha256: 65B3E7742ECA33CC7D8D18F4EB6F16FD8E06D74E46DFDEBBBBE5AA00443DA039
+  InstallerUrl: https://github.com/premekvibe/AutoSpaces/releases/download/v0.3.1/AutoSpaces-Setup-0.3.1.exe
+  InstallerSha256: 92C84C382369102111D84DF673431E269DFADBD965E6D1D26845EA69E0C73780
   InstallerSwitches:
     Custom: /ALLUSERS
   ElevationRequirement: elevationRequired
